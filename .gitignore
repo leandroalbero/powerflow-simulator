@@ -1,0 +1,39 @@
+# bash
+.bash_history
+.local
+
+# Language: Python
+.coverage
+.cache
+.ipython
+.mypy_cache
+.pdbhistory
+.python_history
+__pycache__
+
+# MacOS
+.DS_Store
+
+# enviroment
+.env
+.env.local
+
+# virtualenv
+venv/
+
+# PyCharm editor settings
+.idea
+
+# Visual Studio Code
+/.vscode/
+/.vscode-server/
+/.gitconfig
+/.devcontainer
+
+# Logs
+*.log
+
+# local data
+db_local/messages.db
+google-service-account-file.json
+/qodana.yaml

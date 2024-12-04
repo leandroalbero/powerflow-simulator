@@ -1,0 +1,5 @@
+ruff
+mypy
+matplotlib
+pandas
+colorama
