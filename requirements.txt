@@ -3,3 +3,10 @@ mypy
 matplotlib
 pandas
 colorama
+numpy
+types-colorama
+pandas-stubs
+pydantic
+pytest
+pytest-cov
+pytz
