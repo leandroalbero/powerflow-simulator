@@ -9,7 +9,7 @@ from src.domain.battery.models import Battery
 from src.domain.energy_load.model import EnergyLoad
 from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff
+from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.model import (
     ForceChargeAtNightStrategy,
@@ -58,8 +58,8 @@ if __name__ == '__main__':
     solar_data = solar_data.tz_convert(local_tz)
     load_data = load_data.tz_convert(local_tz)
 
-    simulation_start = datetime(2024, 12, 1, 23, 00, 00, tzinfo=local_tz)
-    simulation_end = datetime(2024, 12, 2, 23, 00, 00, tzinfo=local_tz)
+    simulation_start = datetime(2024, 11, 11, 23, 00, 00, tzinfo=local_tz)
+    simulation_end = datetime(2024, 11, 12, 23, 00, 00, tzinfo=local_tz)
 
     print_header("Energy Simulation Configuration")
     print_metric("Simulation period",
@@ -78,9 +78,15 @@ if __name__ == '__main__':
     print_metric("Load data timespan", f"{load_data.index.min()} to {load_data.index.max()}", format_spec="s")
 
     tariff = PowerTariff(
-        import_rate_schedule={(0, 8): 0.085, (8, 10): 0.134, (10, 14): 0.182, (14, 18): 0.134, (18, 22): 0.182,
-                              (22, 24): 0.134},
-        export_rate_schedule={(0, 24): 0.08}
+        rate_schedule={
+            (0, 8): Rate(price=0.085, energy_direction=EnergyDirection.IMPORT),
+            (8, 10): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (10, 14): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
+            (14, 18): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (18, 22): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
+            (22, 24): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (0, 24): Rate(price=0.08, energy_direction=EnergyDirection.EXPORT)
+        }
     )
 
     battery = Battery(capacity=5.4, max_charge_rate=2.1, max_discharge_rate=2.1)

@@ -8,7 +8,7 @@ from src.domain.power_tariff.model import PowerTariff
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.model import (
     EnergyFlow,
-    EnergyStrategy,
+    BaseEnergyStrategy,
     SelfConsumeStrategy,
 )
 
@@ -31,7 +31,7 @@ class EnergySimulator:
 
     def __init__(self, battery: Battery, load: EnergyLoad, grid: Grid,
                  tariff: PowerTariff, solar: SolarGenerator,
-                 strategy: Optional[EnergyStrategy] = None):
+                 strategy: Optional[BaseEnergyStrategy] = None):
         self.battery = battery
         self.load = load
         self.grid = grid
