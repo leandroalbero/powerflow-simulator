@@ -11,7 +11,7 @@ and consumption data.
 
 > [!IMPORTANT]
 > Some metrics are yet to be validated, this is more of a proof of concept than anything else. Code is messy
-> and there are no tests, so use at your own risk. 💃
+> and there are no tests, so use at your own risk. 💃😄
 
 ## Why
 The project aims to optimize a PV installation with battery by exploring different charging strategies:
@@ -24,10 +24,10 @@ You can also explore what would happen if you increased the number of batteries,
 increases the maximum power of the battery system from 2kW to 5kW. Or what happens when export limit is changed...
 
 ## Simulation vs Ground Truth
-Inputs of the simulation are solar power and house load, outputs are battery SoC (kWh), import/export grid (kW). 
-Simulation granularity is 1 minute, and the scenario is force charging the battery at night.
+Inputs of the simulation are solar power and house load, outputs are battery SoC (kWh) and import/export grid (kW). 
+Simulation granularity is 1 minute, and the shown scenario is force charging the battery at night.
 
-Estimated metrics are also almost spot on when compared with Home Assistant's energy dashboard.
+Estimated metrics are almost spot on when compared with Home Assistant's energy dashboard.
 Some discrepancies might arise because we are not simulating battery behavior in detail, but rather a simplified model.
 End to end efficiency of solar panels, battery, and inverter isn't modeled, but rather a simplified model.
 
@@ -44,8 +44,8 @@ End to end efficiency of solar panels, battery, and inverter isn't modeled, but 
 ## Installation
 ```bash
 # Clone repository
-git clone https://github.com/leandroalbero/solar-battery-optimizer.git
-cd solar-battery-optimizer
+git clone https://github.com/leandroalbero/powerflow-simulator.git
+cd powerflow-simulator
 
 # Create virtual environment
 python -m venv .venv
