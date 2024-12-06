@@ -11,7 +11,12 @@ from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
 from src.domain.solar_generator.solar_generator import SolarGenerator
-from src.domain.strategy.model import ForceChargeAtNightStrategy, ForceChargeAtValleyStrategy, SelfConsumeStrategy
+from src.domain.strategy.model import (
+    ForceChargeAtNightStrategy,
+    ForceChargeAtValleyStrategy,
+    ForceChargeValleyAndPrePeakStrategy,
+    SelfConsumeStrategy,
+)
 
 init()
 
@@ -53,8 +58,8 @@ if __name__ == '__main__':
     solar_data = solar_data.tz_convert(local_tz)
     load_data = load_data.tz_convert(local_tz)
 
-    simulation_start = datetime(2024, 12, 4, 22, 45, 00, tzinfo=local_tz)
-    simulation_end = datetime(2024, 12, 5, 23, 22, 00, tzinfo=local_tz)
+    simulation_start = datetime(2024, 12, 1, 23, 00, 00, tzinfo=local_tz)
+    simulation_end = datetime(2024, 12, 2, 23, 00, 00, tzinfo=local_tz)
 
     print_header("Energy Simulation Configuration")
     print_metric("Simulation period",
@@ -86,11 +91,13 @@ if __name__ == '__main__':
     self_consume_strategy = SelfConsumeStrategy(battery, grid, tariff)
     charge_night_strategy = ForceChargeAtNightStrategy(battery, grid, tariff)
     force_charging_at_valleys_strategy = ForceChargeAtValleyStrategy(battery, grid, tariff)
+    force_charging_at_valleys_and_pre_peak_strategy = ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff)
 
     strategies = {
         'self_consume': self_consume_strategy,
         'charge_night': charge_night_strategy,
-        'force_valleys': force_charging_at_valleys_strategy
+        'force_valleys': force_charging_at_valleys_strategy,
+        'force_valleys_pre_peak': force_charging_at_valleys_and_pre_peak_strategy
     }
 
     results_by_strategy = {}
