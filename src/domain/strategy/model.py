@@ -71,14 +71,10 @@ class SelfConsumeStrategy(EnergyStrategy):
 class ForceChargeAtNightStrategy(EnergyStrategy):
     def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
         super().__init__(battery, grid, tariff)
-        self.off_peak_hours = {0, 1, 2, 3, 4, 5, 6, 7}
-        self.peak_hours = {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
-        self.min_rate = min(tariff.import_rate_schedule.values())
-        self.max_rate = max(tariff.import_rate_schedule.values())
         self.night_charge_power = 0.8
         self.max_charge_power = 2.05
-        self.day_discharge_hours = {9, 10, 11, 12, 13}
-        self.min_battery_level = 0.1  # Keep 10% minimum charge
+        self.min_battery_level = 0.1
+        self.min_rate = min(tariff.import_rate_schedule.values())
 
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
@@ -87,32 +83,42 @@ class ForceChargeAtNightStrategy(EnergyStrategy):
 
         flows = EnergyFlow()
         normalized_hour = hour % 24
-
-        battery_level = self.battery.current_charge / self.battery.capacity
-        is_off_peak = normalized_hour in self.off_peak_hours
-        is_peak = normalized_hour in self.peak_hours
+        current_rate = self.tariff.get_import_rate(normalized_hour)
+        is_absolute_valley = current_rate == self.min_rate
 
         flows.direct_solar = min(solar_energy, load_energy)
         flows.remaining_solar = solar_energy - flows.direct_solar
         flows.remaining_load = load_energy - flows.direct_solar
 
-        if is_off_peak and battery_level < 1:
-            target_charge_energy = self.night_charge_power * duration
-            if flows.remaining_solar > 0:
-                solar_charged = self.battery.charge(flows.remaining_solar / duration, duration)
-                flows.battery_charge = solar_charged
-                flows.remaining_solar -= solar_charged * duration
-                target_charge_energy -= solar_charged * duration
+        if is_absolute_valley:
+            battery_level = self.battery.current_charge / self.battery.capacity
 
-            if target_charge_energy > 0:
-                import_charged = self.battery.charge(target_charge_energy / duration, duration)
-                flows.battery_charge += import_charged
-                flows.grid_import = import_charged
+            if battery_level < 1:
+                target_charge_energy = self.night_charge_power * duration
+
+                if flows.remaining_solar > 0:
+                    max_solar_charge = min(flows.remaining_solar / duration, self.night_charge_power)
+                    solar_charged = self.battery.charge(max_solar_charge, duration)
+                    flows.battery_charge = solar_charged
+                    flows.remaining_solar -= solar_charged * duration
+                    target_charge_energy -= solar_charged * duration
+
+                if target_charge_energy > 0:
+                    charge_power_needed = target_charge_energy / duration
+                    imported = self.grid.import_power(charge_power_needed, duration)
+                    charged = self.battery.charge(charge_power_needed, duration)
+                    flows.battery_charge += charged
+                    flows.grid_import = imported
 
             if flows.remaining_solar > 0:
                 exported = self.grid.export_power(flows.remaining_solar / duration, duration)
                 flows.grid_export = exported
                 flows.remaining_solar -= exported
+
+            if flows.remaining_load > 0:
+                import_for_load = self.grid.import_power(flows.remaining_load / duration, duration)
+                flows.grid_import += import_for_load
+                flows.remaining_load -= import_for_load
 
         else:
             if flows.remaining_solar > 0:
@@ -125,49 +131,40 @@ class ForceChargeAtNightStrategy(EnergyStrategy):
                     flows.grid_export = exported
                     flows.remaining_solar -= exported
 
-        if flows.remaining_load > 0:
-            if is_peak:
-                available_energy = (battery_level - self.min_battery_level) * self.battery.capacity
-                max_discharge = min(
-                    flows.remaining_load / duration,
-                    self.battery.max_discharge_rate,
-                    available_energy / duration
-                )
-                discharged = self.battery.discharge(max_discharge, duration)
+            if flows.remaining_load > 0:
+                discharge_req = flows.remaining_load / duration
+                discharged = self.battery.discharge(discharge_req, duration)
                 flows.battery_discharge = discharged
                 flows.remaining_load -= discharged * duration
 
-            if flows.remaining_load > 0:
-                imported = self.grid.import_power(flows.remaining_load / duration, duration)
-                flows.grid_import += imported
-                flows.remaining_load -= imported
+                if flows.remaining_load > 0:
+                    import_req = flows.remaining_load / duration
+                    imported_kWh = self.grid.import_power(import_req, duration)
+                    flows.grid_import += imported_kWh
+                    flows.remaining_load -= imported_kWh
 
         return flows
+
 
 class ForceChargeAtValleyStrategy(EnergyStrategy):
     def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
         super().__init__(battery, grid, tariff)
-
-        rates = list(tariff.import_rate_schedule.values())
-        self.min_import_rate = min(rates)
-        self.max_import_rate = max(rates)
-
-        self.valley_rate_threshold = 0.1340
-        self.valley_charge_target = 0.95
+        self.valley_charge_target = 1.0
         self.min_battery_level = 0.1
+        self.max_manual_charge_power = 0.8
 
-        self.valley_hours = {
-            h for (start, end), rate in tariff.import_rate_schedule.items()
-            for h in range(start, end)
-            if rate <= self.valley_rate_threshold
-        }
+        unique_rates = sorted(set(tariff.import_rate_schedule.values()))
+        if len(unique_rates) >= 3:
+            self.valley_rate = unique_rates[1]
+            self.peak_rate = unique_rates[-1]
+        else:
+            raise ValueError("Tariff must have at least 3 different rates for valley strategy")
 
-        peak_rate_threshold = self.max_import_rate * 0.8
-        self.peak_hours = {
-            h for (start, end), rate in tariff.import_rate_schedule.items()
-            for h in range(start, end)
-            if rate >= peak_rate_threshold
-        }
+    def _is_before_peak(self, hour: int) -> bool:
+        current_rate = self.tariff.get_import_rate(hour)
+        next_hour = (hour + 1) % 24
+        next_rate = self.tariff.get_import_rate(next_hour)
+        return current_rate == self.valley_rate and next_rate == self.peak_rate
 
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
@@ -175,98 +172,76 @@ class ForceChargeAtValleyStrategy(EnergyStrategy):
         load_energy = load_power * duration
 
         flows = EnergyFlow()
-
-        battery_level_percent = self.battery.current_charge / self.battery.capacity
-        available_battery_discharge = max(
-            0, self.battery.current_charge - (self.battery.capacity * self.min_battery_level)
-        )
-
         normalized_hour = hour % 24
-
-        current_rate = next(
-            (rate for (start, end), rate in self.tariff.import_rate_schedule.items()
-             if start <= normalized_hour < end),
-            self.max_import_rate
-        )
-
-        is_valley = normalized_hour in self.valley_hours
-        is_peak = normalized_hour in self.peak_hours
-
-        if is_valley and battery_level_percent < self.valley_charge_target:
-            charge_needed_kWh = (self.battery.capacity * self.valley_charge_target - self.battery.current_charge)
-            max_charge_per_step = self.battery.max_charge_rate * duration
-            charge_energy = min(max_charge_per_step, charge_needed_kWh)
-
-            if charge_energy > 0:
-                total_import_needed = load_energy + charge_energy
-                import_req = total_import_needed / duration
-                imported = self.grid.import_power(import_req, duration)
-                flows.grid_import = imported
-
-                charge_req = charge_energy / duration
-                actual_charged = self.battery.charge(charge_req, duration)
-                flows.battery_charge = actual_charged
-
-                remaining_import_for_load = imported - actual_charged
-
-                flows.direct_solar = min(solar_energy, load_energy)
-                flows.remaining_solar = solar_energy - flows.direct_solar
-
-                load_after_solar = load_energy - flows.direct_solar
-                load_after_import = load_after_solar - remaining_import_for_load
-                flows.remaining_load = max(0, load_after_import)
-                return flows
+        is_pre_peak_valley = self._is_before_peak(normalized_hour)
 
         flows.direct_solar = min(solar_energy, load_energy)
         flows.remaining_solar = solar_energy - flows.direct_solar
         flows.remaining_load = load_energy - flows.direct_solar
 
-        if flows.remaining_solar > 0:
-            if is_valley:
-                export_req = flows.remaining_solar / duration
-                exported = self.grid.export_power(export_req, duration)
+        if is_pre_peak_valley:
+            battery_level = self.battery.current_charge / self.battery.capacity
+
+            if battery_level < self.valley_charge_target:
+                charge_needed_kWh = (self.battery.capacity * self.valley_charge_target - self.battery.current_charge)
+                max_charge_per_step = min(self.max_manual_charge_power * duration,
+                                          self.battery.max_charge_rate * duration)
+                charge_energy = min(max_charge_per_step, charge_needed_kWh)
+
+                if flows.remaining_solar > 0:
+                    solar_charge_req = min(charge_energy, flows.remaining_solar) / duration
+                    solar_charge_req = min(solar_charge_req, self.max_manual_charge_power)
+                    solar_charged = self.battery.charge(solar_charge_req, duration)
+                    flows.battery_charge = solar_charged
+                    flows.remaining_solar -= solar_charged * duration
+                    charge_energy -= solar_charged * duration
+
+                if charge_energy > 0:
+                    import_req = min(charge_energy / duration, self.max_manual_charge_power)
+                    imported = self.grid.import_power(import_req, duration)
+                    actual_charged = self.battery.charge(import_req, duration)
+                    flows.battery_charge += actual_charged
+                    flows.grid_import = imported
+
+            if flows.remaining_solar > 0:
+                exported = self.grid.export_power(flows.remaining_solar / duration, duration)
                 flows.grid_export = exported
                 flows.remaining_solar -= exported
 
-                if flows.remaining_solar > 0:
-                    charge_req = flows.remaining_solar / duration
-                    charged = self.battery.charge(charge_req, duration)
-                    flows.battery_charge = charged
-                    flows.remaining_solar -= charged
-            else:
-                charge_req = flows.remaining_solar / duration
-                charged = self.battery.charge(charge_req, duration)
-                flows.battery_charge = charged
-                flows.remaining_solar -= charged
+            if flows.remaining_load > 0:
+                import_for_load = self.grid.import_power(flows.remaining_load / duration, duration)
+                flows.grid_import += import_for_load
+                flows.remaining_load -= import_for_load
+
+        else:
+            if flows.remaining_solar > 0:
+                solar_charged = self.battery.charge(flows.remaining_solar / duration, duration)
+                flows.battery_charge = solar_charged
+                flows.remaining_solar -= solar_charged * duration
 
                 if flows.remaining_solar > 0:
-                    export_req = flows.remaining_solar / duration
-                    exported = self.grid.export_power(export_req, duration)
+                    exported = self.grid.export_power(flows.remaining_solar / duration, duration)
                     flows.grid_export = exported
                     flows.remaining_solar -= exported
 
-        if flows.remaining_load > 0:
-            if available_battery_discharge > 0 and (is_peak or current_rate > self.valley_rate_threshold):
-                discharge_req = min(flows.remaining_load, available_battery_discharge) / duration
-                discharged = self.battery.discharge(discharge_req, duration)
-                flows.battery_discharge = discharged
-                flows.remaining_load -= discharged
+            if flows.remaining_load > 0:
+                current_rate = self.tariff.get_import_rate(normalized_hour)
+                if current_rate == self.peak_rate:
+                    battery_level = self.battery.current_charge / self.battery.capacity
+                    available_energy = (battery_level - self.min_battery_level) * self.battery.capacity
+                    max_discharge = min(
+                        flows.remaining_load / duration,
+                        self.battery.max_discharge_rate,
+                        available_energy / duration
+                    )
+                    discharged = self.battery.discharge(max_discharge, duration)
+                    flows.battery_discharge = discharged
+                    flows.remaining_load -= discharged * duration
 
                 if flows.remaining_load > 0:
                     import_req = flows.remaining_load / duration
                     imported = self.grid.import_power(import_req, duration)
-                    flows.grid_import = imported
+                    flows.grid_import += imported
                     flows.remaining_load -= imported
-            else:
-                import_req = flows.remaining_load / duration
-                imported = self.grid.import_power(import_req, duration)
-                flows.grid_import = imported
-                flows.remaining_load -= imported
-
-                if flows.remaining_load > 0 and available_battery_discharge > 0:
-                    discharge_req = min(flows.remaining_load, available_battery_discharge) / duration
-                    discharged = self.battery.discharge(discharge_req, duration)
-                    flows.battery_discharge = discharged
-                    flows.remaining_load -= discharged
 
         return flows
