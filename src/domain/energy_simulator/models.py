@@ -79,7 +79,6 @@ class EnergySimulator:
         self.grid_imports.append(flows.grid_import)
         self.grid_exports.append(flows.grid_export)
 
-
     def _update_metrics(self, flows: EnergyFlow, hour: int, duration: float) -> None:
         self.total_solar_consumed += flows.direct_solar
         self.total_battery_in += flows.battery_charge * duration
