@@ -121,7 +121,9 @@ if __name__ == '__main__':
             'timestamp': sim.timestamps,
             'battery_level': sim.battery_levels,
             'grid_import': sim.grid_imports,
-            'grid_export': sim.grid_exports
+            'grid_export': sim.grid_exports,
+            'solar_power': sim.solar_powers,  # Add solar power to DataFrame
+            'house_consumption': sim.house_loads  # Add house consumption to DataFrame
         })
 
         summary_df = pd.DataFrame([results])
