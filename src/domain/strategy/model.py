@@ -142,8 +142,14 @@ class ForceChargeAtNightStrategy(EnergyStrategy):
                     flows.remaining_solar -= exported
 
             if flows.remaining_load > 0:
-                discharge_req = flows.remaining_load / duration
-                discharged = self.battery.discharge(discharge_req, duration)
+                battery_level = self.battery.current_charge / self.battery.capacity
+                available_energy = (battery_level - self.min_battery_level) * self.battery.capacity
+                max_discharge = min(
+                    flows.remaining_load / duration,
+                    self.battery.max_discharge_rate,
+                    available_energy / duration
+                )
+                discharged = self.battery.discharge(max_discharge, duration)
                 flows.battery_discharge = discharged
                 flows.remaining_load -= discharged * duration
 
