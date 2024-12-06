@@ -1,10 +1,17 @@
-# Solar Battery Optimization Simulator (v0.1)
+# **Powerflow** energy optimization simulator
+![Version](https://img.shields.io/badge/version-0.1-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.12-blue.svg)
+![Status](https://img.shields.io/badge/status-proof%20of%20concept-red.svg)
 
 ## Overview
 A Python-based simulator for optimizing solar PV systems with battery storage. The simulator allows testing different
 battery management strategies to maximize cost savings and efficiency by analyzing historical generation 
 and consumption data.
-Initial version, more of a proof of concept, code is ugly, and there is a lot of room for improvement.
+
+> [!IMPORTANT]
+> Some metrics are yet to be validated, this is more of a proof of concept than anything else. Code is messy
+> and there are no tests, so use at your own risk. 💃
 
 ## Why
 The project aims to optimize a PV installation with battery by exploring different charging strategies:
@@ -17,8 +24,9 @@ You can also explore what would happen if you increased the number of batteries,
 increases the maximum power of the battery system from 2kW to 5kW. Or what happens when export limit is changed...
 
 ## Simulation vs Ground Truth
-Inputs of the simulation are solar power and house load. Simulation granularity is 1 minute, and the scenario is force
-charging the battery at night.
+Inputs of the simulation are solar power and house load, outputs are battery SoC (kWh), import/export grid (kW). 
+Simulation granularity is 1 minute, and the scenario is force charging the battery at night.
+
 Estimated metrics are also almost spot on when compared with Home Assistant's energy dashboard.
 Some discrepancies might arise because we are not simulating battery behavior in detail, but rather a simplified model.
 End to end efficiency of solar panels, battery, and inverter isn't modeled, but rather a simplified model.
@@ -51,7 +59,8 @@ pip install -r requirements.txt
 1. Prepare input data:
    - Solar generation CSV with datetime index and 'state' column measured in W
    - Load consumption CSV with datetime index and 'state' column measured in W
-   - Ensure data is in the correct timezone
+   - Ensure data is in the correct timezone, you have examples in the `data` folder, 1y worth of real data! high-res version
+     is 1m resolution, low-res version is 1h resolution.
 
 2. Configure system parameters:
 ```python
@@ -63,7 +72,7 @@ tariff = PowerTariff(
 battery = Battery(capacity=5, max_charge_rate=2.0, max_discharge_rate=2.0)
 ```
 
-3. Run simulation:
+3. Run simulation (theres an example in the use_cases folder):
 ```python
 sim = EnergySimulator(battery, load, grid, tariff, solar)
 for timestamp in load_data.index:
