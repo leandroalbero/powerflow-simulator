@@ -30,6 +30,10 @@ class EnergyStrategy(ABC):
 
 
 class SelfConsumeStrategy(EnergyStrategy):
+    def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
+        super().__init__(battery, grid, tariff)
+        self.min_battery_level = 0.1
+
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
         solar_energy = solar_power * duration
@@ -54,8 +58,14 @@ class SelfConsumeStrategy(EnergyStrategy):
                 flows.remaining_solar -= exported_kWh
 
         if flows.remaining_load > 0:
-            discharge_requested = flows.remaining_load / duration
-            discharged_kWh = self.battery.discharge(discharge_requested, duration)
+            battery_level = self.battery.current_charge / self.battery.capacity
+            available_energy = (battery_level - self.min_battery_level) * self.battery.capacity
+            max_discharge = min(
+                flows.remaining_load / duration,
+                self.battery.max_discharge_rate,
+                available_energy / duration
+            )
+            discharged_kWh = self.battery.discharge(max_discharge, duration)
             flows.battery_discharge = discharged_kWh
             flows.remaining_load -= discharged_kWh
 
