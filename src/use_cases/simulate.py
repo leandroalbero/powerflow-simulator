@@ -1,9 +1,7 @@
 from datetime import datetime
-from typing import Any
 
 import pandas as pd
 import pytz
-from colorama import Fore, Style, init
 
 from src.domain.battery.models import Battery
 from src.domain.energy_load.model import EnergyLoad
@@ -17,28 +15,7 @@ from src.domain.strategy.model import (
     ForceChargeValleyAndPrePeakStrategy,
     SelfConsumeStrategy,
 )
-
-init()
-
-
-def print_header(text: str) -> None:
-    print(f"\n{Fore.CYAN}{Style.BRIGHT}{text}{Style.RESET_ALL}")
-
-
-def print_subheader(text: str) -> None:
-    print(f"{Fore.YELLOW}{text}{Style.RESET_ALL}")
-
-
-def format_value(value: Any, format_spec: str = "0.2f") -> str:
-    if isinstance(value, (int, float)):
-        return f"{value:{format_spec}}"
-    return str(value)
-
-
-def print_metric(label: str, value: str, unit: str = "", format_spec: str = "0.2f") -> None:
-    formatted_value = format_value(value, format_spec)
-    print(f"{Fore.WHITE}{label}: {Fore.GREEN}{formatted_value}{Style.RESET_ALL} {unit}")
-
+from src.use_cases.print_console import ConsoleFormatter
 
 if __name__ == '__main__':
     solar_data = pd.read_csv(
@@ -58,12 +35,11 @@ if __name__ == '__main__':
     solar_data = solar_data.tz_convert(local_tz)
     load_data = load_data.tz_convert(local_tz)
 
-    simulation_start = datetime(2024, 12, 4, 23, 00, 00, tzinfo=local_tz)
+    simulation_start = datetime(2024, 1, 4, 23, 00, 00, tzinfo=local_tz)
     simulation_end = datetime(2024, 12, 5, 23, 00, 00, tzinfo=local_tz)
 
-    print_header("Energy Simulation Configuration")
-    print_metric("Simulation period",
-                 f"{simulation_start.strftime('%Y-%m-%d')} to {simulation_end.strftime('%Y-%m-%d')}", format_spec="s")
+    formatter = ConsoleFormatter()
+    formatter.print_simulation_config(simulation_start, simulation_end)
 
     solar_data = solar_data[(solar_data.index >= simulation_start) & (solar_data.index <= simulation_end)]
     load_data = load_data[(load_data.index >= simulation_start) & (load_data.index <= simulation_end)]
@@ -71,11 +47,7 @@ if __name__ == '__main__':
     solar_data = solar_data.sort_index()
     load_data = load_data.sort_index()
 
-    print_header("Data Summary")
-    print_metric("Solar data points", str(len(solar_data)), format_spec="d")
-    print_metric("Load data points", str(len(load_data)), format_spec="d")
-    print_metric("Solar data timespan", f"{solar_data.index.min()} to {solar_data.index.max()}", format_spec="s")
-    print_metric("Load data timespan", f"{load_data.index.min()} to {load_data.index.max()}", format_spec="s")
+    formatter.print_data_summary(solar_data, load_data)
 
     tariff = PowerTariff(
         rate_schedule={
@@ -107,12 +79,10 @@ if __name__ == '__main__':
     }
 
     results_by_strategy = {}
+    file_date = simulation_start.strftime("%Y_%m")
 
     for strategy_name, strategy in strategies.items():
-        print_header(f"Strategy: {strategy_name.replace('_', ' ').title()}")
-
         sim = EnergySimulator(battery, load, grid, tariff, solar, strategy=strategy)
-
         battery.current_charge = 0.54
 
         prev_timestamp = None
@@ -128,58 +98,14 @@ if __name__ == '__main__':
             'battery_level': sim.battery_levels,
             'grid_import': sim.grid_imports,
             'grid_export': sim.grid_exports,
-            'solar_power': sim.solar_powers,  # Add solar power to DataFrame
-            'house_consumption': sim.house_loads  # Add house consumption to DataFrame
+            'solar_power': sim.solar_powers,
+            'house_consumption': sim.house_loads
         })
 
         summary_df = pd.DataFrame([results])
-        file_date = simulation_start.strftime("%Y_%m")
         summary_df.to_csv(f'output_files/simulation_summary_{strategy_name}_{file_date}.csv', index=False)
         results_df.to_csv(f'output_files/simulation_detail_{strategy_name}_{file_date}.csv', index=False)
 
-        print_subheader("Energy Metrics")
-        print_metric("Total house consumption", results['total_house_consumption'], "kWh", "0.2f")
-        print_metric("Total solar generated", results['total_solar_generated'], "kWh", "0.2f")
-        print_metric("Total solar consumed", results['total_solar_consumed'], "kWh", "0.2f")
-        print_metric("Total solar exported", results['total_solar_exported'], "kWh", "0.2f")
-        print_metric("Total grid imported", results['total_grid_imported'], "kWh", "0.2f")
-        print_metric("Total grid exported", results['total_solar_exported'], "kWh", "0.2f")
+        formatter.print_strategy_results(strategy_name, results, file_date)
 
-        print_subheader("Battery Performance")
-        print_metric("Total battery in", results['total_battery_in'], "kWh", "0.2f")
-        print_metric("Total battery out", results['total_battery_out'], "kWh", "0.2f")
-        print_metric("Final battery level", results['battery_level'], "kWh", "0.2f")
-
-        print_subheader("Financial & Efficiency Metrics")
-        print_metric("Total cost", results['total_cost'], "€", "0.2f")
-
-        if 'total_solar_generated' in results and results['total_solar_generated'] > 0:
-            self_consumption_rate = (results['total_solar_consumed'] / results['total_solar_generated']) * 100
-            print_metric("Solar self-consumption rate", self_consumption_rate, "%", "0.1f")
-
-        if 'total_house_consumption' in results and results['total_house_consumption'] > 0:
-            solar_fraction = (results['total_solar_consumed'] / results['total_house_consumption']) * 100
-            print_metric("Solar fraction", solar_fraction, "%", "0.1f")
-
-        print_subheader("Output Files")
-        print(f"📊 Summary: simulation_summary_{strategy_name}_{file_date}.csv")
-        print(f"📈 Details: simulation_detail_{strategy_name}_{file_date}.csv")
-
-    print_header("Strategy Comparison")
-    comparison_metrics = {
-        'total_cost': ('Total Cost', '€', '0.2f'),
-        'solar_fraction': ('Solar Fraction', '%', '0.1f'),
-        'self_consumption_rate': ('Self-Consumption Rate', '%', '0.1f'),
-        'total_solar_exported': ('Total Solar Exported', 'kWh', '0.2f')
-    }
-
-    for metric, (label, unit, format_spec) in comparison_metrics.items():
-        print_subheader(label)
-        for strategy_name, results in results_by_strategy.items():
-            if metric in results:
-                print_metric(
-                    strategy_name.replace('_', ' ').title(),
-                    results[metric],
-                    unit,
-                    format_spec
-                )
+    formatter.print_strategy_comparison(results_by_strategy)
