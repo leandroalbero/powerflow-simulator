@@ -211,14 +211,27 @@ class ForceChargeAtNightStrategy(BaseRateAwareStrategy):
 
         if is_valley:
             self._handle_remaining_solar(flows, duration)
-            flows.grid_import = float(self.grid.import_power(self.max_charge_power, duration))
-            flows.battery_charge = float(self.battery.charge(self.max_charge_power, duration))
+            battery_level = self.battery.current_charge / self.battery.capacity
+
+            if battery_level < self.valley_charge_target:
+                charge_needed_kwh = (self.battery.capacity * self.valley_charge_target -
+                                     self.battery.current_charge)
+                max_charge_per_step = min(
+                    self.max_charge_power * duration,
+                    self.battery.max_charge_rate * duration
+                )
+                charge_energy = min(max_charge_per_step, charge_needed_kwh)
+
+                actual_charged = self._charge_battery(charge_energy, duration)
+                flows.battery_charge += actual_charged
+                flows.grid_import += actual_charged
+
+            self._handle_remaining_load(flows, duration)
         else:
             self._handle_remaining_solar(flows, duration)
             self._handle_remaining_load(flows, duration, force_discharge=True)
 
         return flows
-
 
 class ForceChargeAtValleyStrategy(BaseRateAwareStrategy):
     def _is_before_peak(self, hour: int) -> bool:
