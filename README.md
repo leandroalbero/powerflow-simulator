@@ -96,6 +96,6 @@ print(f"Solar self-consumption rate: {results['self_consumption_rate']:.1f}%")
 4. Add support for varying solar capacity
 5. Better UX/UI for data visualization
 6. Better modeling of entities in the code, code cleanup/refactor is needed
-
+7. Track peak/valley/flat consumption rates
 ## Contributing
 Contributions are welcome! Please open an issue or submit a pull request for any improvements or bug fixes.
