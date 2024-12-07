@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, TypedDict, Optional, Tuple
+from typing import List, TypedDict
+
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection, RateType
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateType
 
 
 @dataclass
@@ -30,7 +31,7 @@ class BaseEnergyStrategy(ABC):
                                hour: int, duration: float) -> EnergyFlow:
         if duration == 0:
             raise ZeroDivisionError("Duration cannot be zero")
-        pass
+        return EnergyFlow()
 
     def _get_rate(self, hour: int, direction: EnergyDirection) -> Rate:
         return self.tariff.get_rate(hour % 24, direction)
@@ -82,8 +83,8 @@ class BaseEnergyStrategy(ABC):
 
     def _charge_battery(self, target_charge_energy: float, duration: float) -> float:
         import_req = min(target_charge_energy / duration, self.max_charge_power)
-        imported = float(self.grid.import_power(import_req, duration))
-        actual_charged = float(self.battery.charge(import_req, duration))
+        actual_imported = float(self.grid.import_power(import_req, duration))
+        actual_charged = float(self.battery.charge(actual_imported, duration))
         return actual_charged
 
 
@@ -109,8 +110,8 @@ class BaseRateAwareStrategy(BaseEnergyStrategy):
     def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
         super().__init__(battery, grid, tariff)
         self.valley_charge_target = 1.0
-        self.rate_blocks = self._build_rate_blocks()
         self._initialize_rates()
+        self.rate_blocks = self._build_rate_blocks()
 
     def _initialize_rates(self) -> None:
         import_rates = sorted(
@@ -128,32 +129,28 @@ class BaseRateAwareStrategy(BaseEnergyStrategy):
 
     def _build_rate_blocks(self) -> List[RateBlock]:
         blocks: List[RateBlock] = []
-        current_block_start: int = 0
-        current_block_rate: Optional[Rate] = None
+        current_block_start = 0
+        current_rate = self._get_rate(0, EnergyDirection.IMPORT)
 
         for hour in range(25):
             if hour == 24:
-                if current_block_rate:
-                    blocks.append(RateBlock(
-                        start=current_block_start,
-                        end=hour,
-                        rate=current_block_rate
-                    ))
+                blocks.append(RateBlock(
+                    start=current_block_start,
+                    end=hour,
+                    rate=current_rate
+                ))
                 break
 
             hour_rate = self._get_rate(hour, EnergyDirection.IMPORT)
 
-            if hour == 0:
-                current_block_rate = hour_rate
-            elif (hour_rate.price != current_block_rate.price or
-                  hour_rate.rate_type != current_block_rate.rate_type):
+            if hour_rate.price != current_rate.price or hour_rate.rate_type != current_rate.rate_type:
                 blocks.append(RateBlock(
                     start=current_block_start,
                     end=hour,
-                    rate=current_block_rate
+                    rate=current_rate
                 ))
                 current_block_start = hour
-                current_block_rate = hour_rate
+                current_rate = hour_rate
 
         return blocks
 
@@ -232,6 +229,7 @@ class ForceChargeAtNightStrategy(BaseRateAwareStrategy):
             self._handle_remaining_load(flows, duration, force_discharge=True)
 
         return flows
+
 
 class ForceChargeAtValleyStrategy(BaseRateAwareStrategy):
     def _is_before_peak(self, hour: int) -> bool:

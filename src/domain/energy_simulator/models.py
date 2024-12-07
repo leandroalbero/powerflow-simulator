@@ -7,8 +7,8 @@ from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.model import (
-    EnergyFlow,
     BaseEnergyStrategy,
+    EnergyFlow,
     SelfConsumeStrategy,
 )
 

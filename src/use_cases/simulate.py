@@ -9,7 +9,7 @@ from src.domain.battery.models import Battery
 from src.domain.energy_load.model import EnergyLoad
 from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.model import (
     ForceChargeAtNightStrategy,
@@ -58,8 +58,8 @@ if __name__ == '__main__':
     solar_data = solar_data.tz_convert(local_tz)
     load_data = load_data.tz_convert(local_tz)
 
-    simulation_start = datetime(2024, 11, 13, 23, 00, 00, tzinfo=local_tz)
-    simulation_end = datetime(2024, 11, 14, 23, 00, 00, tzinfo=local_tz)
+    simulation_start = datetime(2024, 12, 4, 23, 00, 00, tzinfo=local_tz)
+    simulation_end = datetime(2024, 12, 5, 23, 00, 00, tzinfo=local_tz)
 
     print_header("Energy Simulation Configuration")
     print_metric("Simulation period",

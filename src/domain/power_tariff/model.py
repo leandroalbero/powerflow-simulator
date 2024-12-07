@@ -22,7 +22,7 @@ class Rate:
     _rate_type: Optional[RateType] = None
 
     @property
-    def rate_type(self) -> RateType:
+    def rate_type(self) -> Optional[RateType]:
         return self._rate_type
 
     @rate_type.setter
