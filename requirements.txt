@@ -10,3 +10,4 @@ pydantic
 pytest
 pytest-cov
 pytz
+ipdb

@@ -9,9 +9,14 @@ from src.domain.battery.models import Battery
 from src.domain.energy_load.model import EnergyLoad
 from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff
+from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection
 from src.domain.solar_generator.solar_generator import SolarGenerator
-from src.domain.strategy.model import ForceChargeAtNightStrategy, ForceChargeAtValleyStrategy, SelfConsumeStrategy
+from src.domain.strategy.model import (
+    ForceChargeAtNightStrategy,
+    ForceChargeAtValleyStrategy,
+    ForceChargeValleyAndPrePeakStrategy,
+    SelfConsumeStrategy,
+)
 
 init()
 
@@ -53,8 +58,8 @@ if __name__ == '__main__':
     solar_data = solar_data.tz_convert(local_tz)
     load_data = load_data.tz_convert(local_tz)
 
-    simulation_start = datetime(2024, 12, 4, 22, 45, 00, tzinfo=local_tz)
-    simulation_end = datetime(2024, 12, 5, 23, 22, 00, tzinfo=local_tz)
+    simulation_start = datetime(2024, 11, 13, 23, 00, 00, tzinfo=local_tz)
+    simulation_end = datetime(2024, 11, 14, 23, 00, 00, tzinfo=local_tz)
 
     print_header("Energy Simulation Configuration")
     print_metric("Simulation period",
@@ -73,9 +78,15 @@ if __name__ == '__main__':
     print_metric("Load data timespan", f"{load_data.index.min()} to {load_data.index.max()}", format_spec="s")
 
     tariff = PowerTariff(
-        import_rate_schedule={(0, 8): 0.085, (8, 10): 0.134, (10, 14): 0.182, (14, 18): 0.134, (18, 22): 0.182,
-                              (22, 24): 0.134},
-        export_rate_schedule={(0, 24): 0.08}
+        rate_schedule={
+            (0, 8): Rate(price=0.085, energy_direction=EnergyDirection.IMPORT),
+            (8, 10): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (10, 14): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
+            (14, 18): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (18, 22): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
+            (22, 24): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (0, 24): Rate(price=0.08, energy_direction=EnergyDirection.EXPORT)
+        }
     )
 
     battery = Battery(capacity=5.4, max_charge_rate=2.1, max_discharge_rate=2.1)
@@ -86,11 +97,13 @@ if __name__ == '__main__':
     self_consume_strategy = SelfConsumeStrategy(battery, grid, tariff)
     charge_night_strategy = ForceChargeAtNightStrategy(battery, grid, tariff)
     force_charging_at_valleys_strategy = ForceChargeAtValleyStrategy(battery, grid, tariff)
+    force_charging_at_valleys_and_pre_peak_strategy = ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff)
 
     strategies = {
         'self_consume': self_consume_strategy,
         'charge_night': charge_night_strategy,
-        'force_valleys': force_charging_at_valleys_strategy
+        'force_valleys': force_charging_at_valleys_strategy,
+        'force_valleys_pre_peak': force_charging_at_valleys_and_pre_peak_strategy
     }
 
     results_by_strategy = {}
@@ -114,7 +127,9 @@ if __name__ == '__main__':
             'timestamp': sim.timestamps,
             'battery_level': sim.battery_levels,
             'grid_import': sim.grid_imports,
-            'grid_export': sim.grid_exports
+            'grid_export': sim.grid_exports,
+            'solar_power': sim.solar_powers,  # Add solar power to DataFrame
+            'house_consumption': sim.house_loads  # Add house consumption to DataFrame
         })
 
         summary_df = pd.DataFrame([results])

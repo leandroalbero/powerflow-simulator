@@ -8,7 +8,7 @@ from src.domain.power_tariff.model import PowerTariff
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.model import (
     EnergyFlow,
-    EnergyStrategy,
+    BaseEnergyStrategy,
     SelfConsumeStrategy,
 )
 
@@ -26,10 +26,12 @@ class EnergySimulator:
     battery_levels: list
     grid_imports: list
     grid_exports: list
+    solar_powers: list  # New list for solar power values
+    house_loads: list   # New list for house consumption values
 
     def __init__(self, battery: Battery, load: EnergyLoad, grid: Grid,
                  tariff: PowerTariff, solar: SolarGenerator,
-                 strategy: Optional[EnergyStrategy] = None):
+                 strategy: Optional[BaseEnergyStrategy] = None):
         self.battery = battery
         self.load = load
         self.grid = grid
@@ -51,6 +53,8 @@ class EnergySimulator:
         self.battery_levels = []
         self.grid_imports = []
         self.grid_exports = []
+        self.solar_powers = []    # Initialize new list
+        self.house_loads = []     # Initialize new list
 
     def step(self, timestamp: datetime, prev_timestamp: Optional[datetime] = None) -> None:
         if not timestamp.tzinfo:
@@ -78,6 +82,8 @@ class EnergySimulator:
         self.battery_levels.append(self.battery.current_charge)
         self.grid_imports.append(flows.grid_import)
         self.grid_exports.append(flows.grid_export)
+        self.solar_powers.append(solar_power)      # Store solar power
+        self.house_loads.append(load_power)        # Store house consumption
 
     def _update_metrics(self, flows: EnergyFlow, hour: int, duration: float) -> None:
         self.total_solar_consumed += flows.direct_solar
@@ -91,25 +97,30 @@ class EnergySimulator:
         self.total_cost -= flows.grid_export * duration * self.tariff.get_export_rate(hour)
 
     def get_metrics(self) -> Dict:
-        metrics = {
-            'total_cost': round(self.total_cost, 2),
-            'total_solar_generated': round(self.total_solar_generated, 2),
-            'total_solar_consumed': round(self.total_solar_consumed, 2),
-            'total_solar_exported': round(self.total_solar_exported, 2),
-            'total_grid_imported': round(self.total_grid_imported, 2),
-            'total_battery_in': round(self.total_battery_in, 2),
-            'total_battery_out': round(self.total_battery_out, 2),
-            'total_house_consumption': round(self.total_house_consumption, 2),
-            'battery_level': round(self.battery.current_charge, 2),
-            'battery_capacity': round(self.battery.capacity, 2)
-        }
+        metrics = {'total_cost': round(self.total_cost, 2),
+                   'total_solar_generated': round(self.total_solar_generated, 2),
+                   'total_solar_consumed': round(self.total_solar_consumed, 2),
+                   'total_solar_exported': round(self.total_solar_exported, 2),
+                   'total_grid_imported': round(self.total_grid_imported, 2),
+                   'total_battery_in': round(self.total_battery_in, 2),
+                   'total_battery_out': round(self.total_battery_out, 2),
+                   'total_house_consumption': round(self.total_house_consumption, 2),
+                   'battery_level': round(self.battery.current_charge, 2),
+                   'battery_capacity': round(self.battery.capacity, 2)}
 
-        if metrics['total_solar_generated'] > 0:
+        # Always include total_house_consumption even if it's 0
+
+        # Calculate rates only if denominators are positive
+        if self.total_solar_generated > 0:
             metrics['self_consumption_rate'] = round(
-                (metrics['total_solar_consumed'] / metrics['total_solar_generated']) * 100, 1)
+                (self.total_solar_consumed / self.total_solar_generated) * 100, 1)
+        else:
+            metrics['self_consumption_rate'] = 0.0
 
-        if metrics['total_house_consumption'] > 0:
+        if self.total_house_consumption > 0:
             metrics['solar_fraction'] = round(
-                (metrics['total_solar_consumed'] / metrics['total_house_consumption']) * 100, 1)
+                (self.total_solar_consumed / self.total_house_consumption) * 100, 1)
+        else:
+            metrics['solar_fraction'] = 0.0
 
         return metrics
