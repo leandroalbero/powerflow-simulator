@@ -3,9 +3,10 @@ lint:
 	mypy --disable-error-code=attr-defined .
 	ruff check --fix .
 
+# Pytest debug on fail
 .PHONY: test
 test:
-	pytest -s tests
+	pytest -s tests --pdb
 
 .PHONY: coverage
 coverage:

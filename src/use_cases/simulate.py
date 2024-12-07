@@ -58,8 +58,8 @@ if __name__ == '__main__':
     solar_data = solar_data.tz_convert(local_tz)
     load_data = load_data.tz_convert(local_tz)
 
-    simulation_start = datetime(2024, 11, 11, 23, 00, 00, tzinfo=local_tz)
-    simulation_end = datetime(2024, 11, 12, 23, 00, 00, tzinfo=local_tz)
+    simulation_start = datetime(2024, 11, 13, 23, 00, 00, tzinfo=local_tz)
+    simulation_end = datetime(2024, 11, 14, 23, 00, 00, tzinfo=local_tz)
 
     print_header("Energy Simulation Configuration")
     print_metric("Simulation period",

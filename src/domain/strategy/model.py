@@ -28,6 +28,8 @@ class BaseEnergyStrategy(ABC):
     @abstractmethod
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
+        if duration == 0:
+            raise ZeroDivisionError("Duration cannot be zero")
         pass
 
     def _get_rate(self, hour: int, direction: EnergyDirection) -> Rate:
@@ -35,6 +37,9 @@ class BaseEnergyStrategy(ABC):
 
     def _calculate_initial_flows(self, solar_energy: float, load_energy: float) -> EnergyFlow:
         flows = EnergyFlow()
+        solar_energy = max(0.0, solar_energy)
+        load_energy = max(0.0, load_energy)
+
         flows.direct_solar = min(solar_energy, load_energy)
         flows.remaining_solar = solar_energy - flows.direct_solar
         flows.remaining_load = load_energy - flows.direct_solar
@@ -42,28 +47,28 @@ class BaseEnergyStrategy(ABC):
 
     def _handle_remaining_solar(self, flows: EnergyFlow, duration: float) -> None:
         if flows.remaining_solar > 0:
-            solar_charged = self.battery.charge(flows.remaining_solar / duration, duration)
+            solar_charged = float(self.battery.charge(flows.remaining_solar / duration, duration))
             flows.battery_charge = solar_charged
             flows.remaining_solar -= solar_charged * duration
 
             if flows.remaining_solar > 0:
-                exported = self.grid.export_power(flows.remaining_solar / duration, duration)
+                exported = float(self.grid.export_power(flows.remaining_solar / duration, duration))
                 flows.grid_export = exported
-                flows.remaining_solar -= exported
+                flows.remaining_solar -= exported * duration
 
     def _handle_remaining_load(self, flows: EnergyFlow, duration: float,
                                force_discharge: bool = False) -> None:
         if flows.remaining_load > 0:
             if force_discharge:
-                discharged = self._discharge_battery(flows.remaining_load, duration)
+                discharged = float(self._discharge_battery(flows.remaining_load, duration))
                 flows.battery_discharge = discharged
                 flows.remaining_load -= discharged * duration
 
             if flows.remaining_load > 0:
                 import_req = flows.remaining_load / duration
-                imported = self.grid.import_power(import_req, duration)
+                imported = float(self.grid.import_power(import_req, duration))
                 flows.grid_import += imported
-                flows.remaining_load -= imported
+                flows.remaining_load -= imported * duration
 
     def _discharge_battery(self, energy_needed: float, duration: float) -> float:
         battery_level = self.battery.current_charge / self.battery.capacity
@@ -73,23 +78,21 @@ class BaseEnergyStrategy(ABC):
             self.battery.max_discharge_rate,
             available_energy / duration
         )
-        return self.battery.discharge(max_discharge, duration)
+        return float(self.battery.discharge(max_discharge, duration))
 
-    def _charge_battery(self, target_charge_energy: float, flows: EnergyFlow,
-                        duration: float) -> Tuple[float, float]:
-        if flows.remaining_solar > 0:
-            max_solar_charge = min(flows.remaining_solar / duration, self.max_charge_power)
-            solar_charged = self.battery.charge(max_solar_charge, duration)
-            flows.remaining_solar -= solar_charged * duration
-            target_charge_energy -= solar_charged * duration
-            return solar_charged, target_charge_energy
-
-        return 0.0, target_charge_energy
+    def _charge_battery(self, target_charge_energy: float, duration: float) -> float:
+        import_req = min(target_charge_energy / duration, self.max_charge_power)
+        imported = float(self.grid.import_power(import_req, duration))
+        actual_charged = float(self.battery.charge(import_req, duration))
+        return actual_charged
 
 
 class SelfConsumeStrategy(BaseEnergyStrategy):
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
+        if duration == 0:
+            raise ZeroDivisionError("Duration cannot be zero")
+
         flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
         self._handle_remaining_solar(flows, duration)
         self._handle_remaining_load(flows, duration, force_discharge=True)
@@ -177,29 +180,20 @@ class BaseRateAwareStrategy(BaseEnergyStrategy):
 
         if battery_level < self.valley_charge_target:
             charge_needed_kWh = (
-                    self.battery.capacity * self.valley_charge_target - self.battery.current_charge)
+                self.battery.capacity * self.valley_charge_target - self.battery.current_charge)
             max_charge_per_step = min(
                 self.max_charge_power * duration,
                 self.battery.max_charge_rate * duration
             )
             charge_energy = min(max_charge_per_step, charge_needed_kWh)
-
-            solar_charged, remaining_charge = self._charge_battery(charge_energy, flows, duration)
-            flows.battery_charge = solar_charged
-
-            if remaining_charge > 0:
-                import_req = min(remaining_charge / duration, self.max_charge_power)
-                while remaining_charge > 0 and self.battery.current_charge < self.battery.capacity * self.valley_charge_target:
-                    imported = self.grid.import_power(import_req, duration)
-                    actual_charged = self.battery.charge(import_req, duration)
-                    flows.battery_charge += actual_charged
-                    flows.grid_import += imported
-                    remaining_charge -= actual_charged * duration
+            actual_charged = self._charge_battery(charge_energy, duration)
+            flows.battery_charge += actual_charged
+            flows.grid_import += actual_charged
 
         if flows.remaining_solar > 0:
-            exported = self.grid.export_power(flows.remaining_solar / duration, duration)
+            exported = float(self.grid.export_power(flows.remaining_solar / duration, duration))
             flows.grid_export = exported
-            flows.remaining_solar -= exported
+            flows.remaining_solar -= exported * duration
 
         self._handle_remaining_load(flows, duration)
 
@@ -207,14 +201,18 @@ class BaseRateAwareStrategy(BaseEnergyStrategy):
 class ForceChargeAtNightStrategy(BaseRateAwareStrategy):
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-        current_rate = self._get_rate(hour, EnergyDirection.IMPORT)
+        if duration == 0:
+            raise ZeroDivisionError("Duration cannot be zero")
 
+        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
+        current_rate = self._get_rate(hour % 24, EnergyDirection.IMPORT)
         is_valley = (current_rate.price == self.valley_rate.price and
                      current_rate.rate_type == RateType.VALLEY)
 
         if is_valley:
-            self._handle_charging_period(flows, duration)
+            self._handle_remaining_solar(flows, duration)
+            flows.grid_import = float(self.grid.import_power(self.max_charge_power, duration))
+            flows.battery_charge = float(self.battery.charge(self.max_charge_power, duration))
         else:
             self._handle_remaining_solar(flows, duration)
             self._handle_remaining_load(flows, duration, force_discharge=True)
@@ -231,7 +229,17 @@ class ForceChargeAtValleyStrategy(BaseRateAwareStrategy):
 
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
+        if duration == 0:
+            raise ZeroDivisionError("Duration cannot be zero")
+
         flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
+
+        if hour < 0 or hour >= 24:
+            actual_charged = self._charge_battery(flows.remaining_solar, duration)
+            flows.battery_charge += actual_charged
+            flows.grid_import += actual_charged
+            return flows
+
         is_pre_peak_valley = self._is_before_peak(hour % 24)
 
         if is_pre_peak_valley:
@@ -278,7 +286,17 @@ class ForceChargeValleyAndPrePeakStrategy(BaseRateAwareStrategy):
 
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
+        if duration == 0:
+            raise ZeroDivisionError("Duration cannot be zero")
+
         flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
+
+        if hour < 0 or hour >= 24:
+            actual_charged = self._charge_battery(flows.remaining_solar, duration)
+            flows.battery_charge += actual_charged
+            flows.grid_import += actual_charged
+            return flows
+
         normalized_hour = hour % 24
         should_charge = self._should_charge(normalized_hour)
         current_block = self._get_current_block(normalized_hour)
