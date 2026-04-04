@@ -139,16 +139,27 @@ class SimulationService:
             schedule[(r.start_hour, r.end_hour)] = Rate(
                 price=r.price, energy_direction=direction
             )
-        return PowerTariff(rate_schedule=schedule)
+        weekend = None
+        if config.tariff.weekend_rate is not None:
+            wr = config.tariff.weekend_rate
+            weekend = Rate(
+                price=wr.price,
+                energy_direction=EnergyDirection.IMPORT if wr.direction == "import" else EnergyDirection.EXPORT,
+            )
+        return PowerTariff(rate_schedule=schedule, weekend_rate=weekend)
 
     def _build_battery(self, config: Optional[SystemConfig] = None) -> Battery:
         bc = (config or self.config).battery
-        return Battery(
+        battery = Battery(
             capacity=bc.capacity,
             max_charge_rate=bc.max_charge_rate,
             max_discharge_rate=bc.max_discharge_rate,
             efficiency=bc.efficiency,
         )
+        battery.current_charge = battery.capacity * bc.initial_soc
+        battery._charge_taper_start = bc.taper_start
+        battery._taper_factor = bc.taper_factor
+        return battery
 
     def _build_grid(self, config: Optional[SystemConfig] = None) -> Grid:
         gc = (config or self.config).grid
@@ -214,9 +225,6 @@ class SimulationService:
             battery = self._build_battery(config)
             grid = self._build_grid(config)
 
-            # Reset battery to 10% of capacity
-            battery.current_charge = battery.capacity * 0.1
-
             load = EnergyLoad(load_df)
             solar = SolarGenerator(solar_df)
 
@@ -225,6 +233,12 @@ class SimulationService:
                 raise ValueError(f"Unknown strategy: {strategy_id}")
 
             strategy = strategy_cls(battery, grid, tariff)
+            # Apply strategy config
+            sc = config.strategy
+            strategy.min_battery_level = sc.min_battery_level
+            strategy.max_charge_power = sc.max_charge_power
+            if hasattr(strategy, 'valley_charge_target'):
+                strategy.valley_charge_target = sc.valley_charge_target
             sim = EnergySimulator(battery, load, grid, tariff, solar, strategy=strategy)
 
             timestamps = load_df.index

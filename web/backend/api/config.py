@@ -14,6 +14,7 @@ def get_config(request: Request) -> ConfigResponse:
         battery=cfg.battery,
         grid=cfg.grid,
         tariff=cfg.tariff,
+        strategy=cfg.strategy,
         data_date_range=data_service.get_date_range(),
     )
 
@@ -27,5 +28,6 @@ def update_config(body: SystemConfig, request: Request) -> ConfigResponse:
         battery=updated.battery,
         grid=updated.grid,
         tariff=updated.tariff,
+        strategy=updated.strategy,
         data_date_range=data_service.get_date_range(),
     )
