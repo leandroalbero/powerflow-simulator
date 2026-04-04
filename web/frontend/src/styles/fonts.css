@@ -4,7 +4,7 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url('/static/fonts/ibm-plex-sans-regular.woff2') format('woff2');
+  src: url('/fonts/ibm-plex-sans-regular.woff2') format('woff2');
 }
 
 @font-face {
@@ -12,7 +12,7 @@
   font-style: normal;
   font-weight: 500;
   font-display: swap;
-  src: url('/static/fonts/ibm-plex-sans-medium.woff2') format('woff2');
+  src: url('/fonts/ibm-plex-sans-medium.woff2') format('woff2');
 }
 
 @font-face {
@@ -20,7 +20,7 @@
   font-style: normal;
   font-weight: 600;
   font-display: swap;
-  src: url('/static/fonts/ibm-plex-sans-semibold.woff2') format('woff2');
+  src: url('/fonts/ibm-plex-sans-semibold.woff2') format('woff2');
 }
 
 /* JetBrains Mono — data / monospace */
@@ -29,7 +29,7 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url('/static/fonts/jetbrains-mono-regular.woff2') format('woff2');
+  src: url('/fonts/jetbrains-mono-regular.woff2') format('woff2');
 }
 
 @font-face {
@@ -37,5 +37,5 @@
   font-style: normal;
   font-weight: 500;
   font-display: swap;
-  src: url('/static/fonts/jetbrains-mono-medium.woff2') format('woff2');
+  src: url('/fonts/jetbrains-mono-medium.woff2') format('woff2');
 }
