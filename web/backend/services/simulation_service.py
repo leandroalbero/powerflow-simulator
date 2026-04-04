@@ -127,9 +127,10 @@ class SimulationService:
 
     # --- build domain objects from config ---
 
-    def _build_tariff(self) -> PowerTariff:
+    def _build_tariff(self, config: Optional[SystemConfig] = None) -> PowerTariff:
+        config = config or self.config
         schedule = {}
-        for r in self.config.tariff.rates:
+        for r in config.tariff.rates:
             direction = (
                 EnergyDirection.IMPORT
                 if r.direction == "import"
@@ -140,8 +141,8 @@ class SimulationService:
             )
         return PowerTariff(rate_schedule=schedule)
 
-    def _build_battery(self) -> Battery:
-        bc = self.config.battery
+    def _build_battery(self, config: Optional[SystemConfig] = None) -> Battery:
+        bc = (config or self.config).battery
         return Battery(
             capacity=bc.capacity,
             max_charge_rate=bc.max_charge_rate,
@@ -149,8 +150,8 @@ class SimulationService:
             efficiency=bc.efficiency,
         )
 
-    def _build_grid(self) -> Grid:
-        gc = self.config.grid
+    def _build_grid(self, config: Optional[SystemConfig] = None) -> Grid:
+        gc = (config or self.config).grid
         return Grid(max_import=gc.max_import, max_export=gc.max_export)
 
     # --- run simulation ---
@@ -171,6 +172,9 @@ class SimulationService:
             run.strategies[sid] = StrategyRunResult(strategy_id=sid)
         self.runs[run_id] = run
 
+        # Snapshot config so threads don't race with PUT /api/config
+        config_snapshot = self.config
+
         # Fetch data once (shared across strategies — read only)
         solar_df, load_df = self.data_service.get_filtered_data(start, end)
 
@@ -181,6 +185,7 @@ class SimulationService:
                 sid,
                 solar_df,
                 load_df,
+                config_snapshot,
                 on_progress,
                 on_strategy_done,
                 on_run_done,
@@ -195,6 +200,7 @@ class SimulationService:
         strategy_id: str,
         solar_df,
         load_df,
+        config: SystemConfig,
         on_progress: Optional[ProgressCallback],
         on_strategy_done: Optional[StrategyDoneCallback],
         on_run_done: Optional[RunDoneCallback],
@@ -204,9 +210,9 @@ class SimulationService:
         result.status = "running"
 
         try:
-            tariff = self._build_tariff()
-            battery = self._build_battery()
-            grid = self._build_grid()
+            tariff = self._build_tariff(config)
+            battery = self._build_battery(config)
+            grid = self._build_grid(config)
 
             # Reset battery to 10% of capacity
             battery.current_charge = battery.capacity * 0.1
@@ -266,23 +272,22 @@ class SimulationService:
             if on_strategy_done is not None:
                 on_strategy_done(strategy_id, "failed", None)
 
-        # Check if all strategies finished
+        # Check if all strategies finished (only first thread fires callback)
+        should_fire_done = False
         with run.lock:
             all_done = all(
                 run.strategies[sid].status in ("completed", "failed")
                 for sid in all_strategy_ids
             )
-            if all_done:
-                has_failure = any(
+            if all_done and run.status == "running":
+                all_failed = all(
                     run.strategies[sid].status == "failed"
                     for sid in all_strategy_ids
                 )
-                run.status = "failed" if has_failure and all(
-                    run.strategies[sid].status == "failed"
-                    for sid in all_strategy_ids
-                ) else "completed"
+                run.status = "failed" if all_failed else "completed"
+                should_fire_done = True
 
-        if all_done and on_run_done is not None:
+        if should_fire_done and on_run_done is not None:
             on_run_done()
 
     # --- query results ---

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -95,13 +96,16 @@ def get_timeseries(
         "house_consumption": ts_data["house_consumption"],
     }
 
-    # Optional time-range filter
+    # Optional time-range filter (compare as datetimes to handle DST offsets)
     if start or end:
+        start_dt = datetime.fromisoformat(start) if start else None
+        end_dt = datetime.fromisoformat(end) if end else None
         filtered_indices = []
         for i, ts_str in enumerate(timestamps):
-            if start and ts_str < start:
+            ts_dt = datetime.fromisoformat(ts_str)
+            if start_dt and ts_dt < start_dt:
                 continue
-            if end and ts_str > end:
+            if end_dt and ts_dt > end_dt:
                 continue
             filtered_indices.append(i)
 

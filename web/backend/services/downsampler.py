@@ -27,6 +27,8 @@ def lttb_downsample(
     n = len(x)
     if threshold >= n or threshold < 2:
         return x, y
+    if threshold == 2:
+        return x[[0, n - 1]], y[[0, n - 1]]
 
     # Always keep first and last point
     indices = np.empty(threshold, dtype=np.intp)
