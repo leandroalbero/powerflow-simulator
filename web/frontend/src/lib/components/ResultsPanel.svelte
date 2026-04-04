@@ -148,9 +148,9 @@
                 <td class="metric-label">{metric.label}</td>
                 <td class="metric-value mono">
                   {#if metric.unit === '\u20ac'}
-                    {metric.unit}{metric.format(strat.metrics[metric.key] as number)}
+                    {metric.unit}{metric.format(Number(strat.metrics[metric.key]))}
                   {:else}
-                    {metric.format(strat.metrics[metric.key] as number)}{metric.unit === '%' ? '%' : ''}
+                    {metric.format(Number(strat.metrics[metric.key]))}{metric.unit === '%' ? '%' : ''}
                   {/if}
                   {#if metric.unit !== '\u20ac' && metric.unit !== '%'}
                     <span class="metric-unit">{metric.unit}</span>
@@ -189,7 +189,7 @@
                     class="metric-value mono"
                     class:best-value={isBestValue(metric, strat.metrics)}
                   >
-                    {metric.format(strat.metrics[metric.key] as number)}
+                    {metric.format(Number(strat.metrics[metric.key]))}
                   </td>
                 {/each}
               </tr>
