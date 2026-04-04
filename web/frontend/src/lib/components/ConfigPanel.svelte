@@ -7,6 +7,7 @@
   let collapsed = false;
   let applyPending = false;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let initialized = false;
 
   // Local editable copies (initialized from store)
   let batteryCapacity = 0;
@@ -17,8 +18,8 @@
   let gridMaxExport = 0;
   let tariffRates: TariffRate[] = [];
 
-  // Sync local state from store when config loads
-  $: if ($systemConfig) {
+  // Sync local state from store only on initial load (not on every store update)
+  $: if ($systemConfig && !initialized) {
     batteryCapacity = $systemConfig.battery.capacity;
     batteryMaxCharge = $systemConfig.battery.max_charge_rate;
     batteryMaxDischarge = $systemConfig.battery.max_discharge_rate;
@@ -26,6 +27,7 @@
     gridMaxImport = $systemConfig.grid.max_import;
     gridMaxExport = $systemConfig.grid.max_export;
     tariffRates = $systemConfig.tariff.rates ? [...$systemConfig.tariff.rates] : [];
+    initialized = true;
   }
 
   function debouncedStoreUpdate() {
@@ -70,6 +72,7 @@
     applyPending = true;
     try {
       const resp = await updateConfig(config);
+      initialized = false; // allow re-sync from server response
       systemConfig.set({
         battery: resp.battery,
         grid: resp.grid,

@@ -5,12 +5,14 @@
   export let collapsed = false;
 
   let scrollContainer: HTMLDivElement;
+  let prevLogCount = 0;
 
-  // Auto-scroll to bottom on new log entries
+  // Auto-scroll to bottom only when new log entries are added
   afterUpdate(() => {
-    if (scrollContainer && !collapsed) {
+    if (scrollContainer && !collapsed && $logs.length > prevLogCount) {
       scrollContainer.scrollTop = scrollContainer.scrollHeight;
     }
+    prevLogCount = $logs.length;
   });
 
   function formatTime(ts: number): string {

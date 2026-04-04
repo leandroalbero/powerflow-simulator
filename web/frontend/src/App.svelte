@@ -11,7 +11,7 @@
   import { strategies } from './lib/stores/simulation';
   import { systemConfig, dataInfo } from './lib/stores/config';
   import { addLog } from './lib/stores/simulation';
-  import { getStrategies, getConfig } from './lib/api/client';
+  import { getStrategies, getConfig, getDataInfo } from './lib/api/client';
 
   let logCollapsed = false;
 
@@ -26,7 +26,7 @@
       addLog(`Failed to load strategies: ${message}`, 'error');
     }
 
-    // Load config and data info
+    // Load config
     try {
       const configResp = await getConfig();
       systemConfig.set({
@@ -34,19 +34,20 @@
         grid: configResp.grid,
         tariff: configResp.tariff,
       });
-      if (configResp.data_date_range) {
-        dataInfo.set({
-          solar_file_loaded: true,
-          load_file_loaded: true,
-          date_range: configResp.data_date_range,
-          solar_point_count: 0,
-          load_point_count: 0,
-        });
-      }
       addLog('Config loaded');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       addLog(`Failed to load config: ${message}`, 'error');
+    }
+
+    // Load data info (point counts and date range)
+    try {
+      const info = await getDataInfo();
+      dataInfo.set(info);
+      addLog(`Data loaded: ${info.solar_point_count + info.load_point_count} points`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      addLog(`Failed to load data info: ${message}`, 'error');
     }
   });
 </script>

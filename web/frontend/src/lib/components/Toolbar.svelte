@@ -248,7 +248,7 @@
     font-size: var(--font-size-sm);
     font-weight: 500;
     letter-spacing: 0.05em;
-    color: #fff;
+    color: var(--text-primary);
     background: var(--color-selected);
     border: 1px solid var(--color-selected);
     border-radius: 2px;
