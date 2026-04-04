@@ -1,11 +1,23 @@
 <script lang="ts">
-  import { systemConfig } from '../stores/config';
+  import { createEventDispatcher } from 'svelte';
+  import { systemConfig, dataInfo } from '../stores/config';
   import { addLog } from '../stores/simulation';
-  import { updateConfig } from '../api/client';
+  import { updateConfig, uploadData, getDataInfo } from '../api/client';
   import type { SystemConfig, TariffRate } from '../types/index';
 
-  let collapsed = false;
+  export let collapsed = false;
+
+  const dispatch = createEventDispatcher();
+
   let applyPending = false;
+
+  // ---- Upload state ----
+  let solarFileInput: HTMLInputElement;
+  let loadFileInput: HTMLInputElement;
+  let solarFile: File | null = null;
+  let loadFile: File | null = null;
+  let uploading = false;
+  let uploadStatus: string | null = null;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let initialized = false;
 
@@ -90,12 +102,52 @@
   function formatHour(h: number): string {
     return String(h).padStart(2, '0') + ':00';
   }
+
+  // ---- CSV upload ----
+
+  function handleSolarSelect(e: Event) {
+    const input = e.target as HTMLInputElement;
+    solarFile = input.files?.[0] ?? null;
+    uploadStatus = null;
+  }
+
+  function handleLoadSelect(e: Event) {
+    const input = e.target as HTMLInputElement;
+    loadFile = input.files?.[0] ?? null;
+    uploadStatus = null;
+  }
+
+  async function handleUpload() {
+    if (!solarFile && !loadFile) return;
+    uploading = true;
+    uploadStatus = null;
+    try {
+      const files: { solarFile?: File; loadFile?: File } = {};
+      if (solarFile) files.solarFile = solarFile;
+      if (loadFile) files.loadFile = loadFile;
+      const info = await uploadData(files);
+      dataInfo.set(info);
+      uploadStatus = 'success';
+      addLog(`Upload complete: ${info.solar_point_count + info.load_point_count} data points`);
+      // Reset file inputs
+      solarFile = null;
+      loadFile = null;
+      if (solarFileInput) solarFileInput.value = '';
+      if (loadFileInput) loadFileInput.value = '';
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      uploadStatus = 'error';
+      addLog(`Upload failed: ${message}`, 'error');
+    } finally {
+      uploading = false;
+    }
+  }
 </script>
 
 <div class="panel-header">
   CONFIG
-  <button class="collapse-toggle" on:click={() => (collapsed = !collapsed)}>
-    {collapsed ? '\u25B6' : '\u25C0'}
+  <button class="collapse-toggle" on:click={() => dispatch('toggle')} title="Toggle config panel [">
+    &#x25C0;
   </button>
 </div>
 
@@ -206,6 +258,47 @@
       <button class="apply-btn" on:click={handleApply} disabled={applyPending}>
         {applyPending ? 'APPLYING...' : 'APPLY'}
       </button>
+    </div>
+
+    <!-- CSV Upload Section -->
+    <div class="section">
+      <div class="section-title">DATA UPLOAD</div>
+      <div class="upload-row">
+        <span class="field-label">Solar CSV</span>
+        <input
+          type="file"
+          accept=".csv"
+          class="file-input"
+          bind:this={solarFileInput}
+          on:change={handleSolarSelect}
+        />
+      </div>
+      <div class="upload-row">
+        <span class="field-label">Load CSV</span>
+        <input
+          type="file"
+          accept=".csv"
+          class="file-input"
+          bind:this={loadFileInput}
+          on:change={handleLoadSelect}
+        />
+      </div>
+      <button
+        class="apply-btn upload-btn"
+        on:click={handleUpload}
+        disabled={uploading || (!solarFile && !loadFile)}
+      >
+        {#if uploading}
+          UPLOADING...
+        {:else}
+          UPLOAD
+        {/if}
+      </button>
+      {#if uploadStatus === 'success'}
+        <div class="upload-status upload-ok">Upload successful</div>
+      {:else if uploadStatus === 'error'}
+        <div class="upload-status upload-err">Upload failed</div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -346,5 +439,59 @@
   .apply-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  /* ---- Upload ---- */
+
+  .upload-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--spacing-sm);
+    margin-bottom: var(--spacing-xs);
+  }
+
+  .file-input {
+    width: 120px;
+    font-size: 10px;
+    color: var(--text-dim);
+    border: none;
+    background: none;
+    padding: 0;
+    height: auto;
+  }
+
+  .file-input::file-selector-button {
+    font-size: 10px;
+    font-family: var(--font-ui);
+    color: var(--text-secondary);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 2px 6px;
+    cursor: pointer;
+    margin-right: 4px;
+  }
+
+  .file-input::file-selector-button:hover {
+    border-color: var(--border-active);
+  }
+
+  .upload-btn {
+    margin-top: var(--spacing-xs);
+  }
+
+  .upload-status {
+    font-size: var(--font-size-sm);
+    margin-top: var(--spacing-xs);
+    padding: 2px 0;
+  }
+
+  .upload-ok {
+    color: var(--color-success);
+  }
+
+  .upload-err {
+    color: var(--color-error);
   }
 </style>

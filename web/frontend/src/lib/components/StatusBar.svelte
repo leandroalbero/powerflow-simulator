@@ -62,6 +62,14 @@
     <span class="separator"></span>
   {/if}
 
+  <span class="shortcuts">
+    <kbd>[</kbd> config
+    <kbd>]</kbd> results
+    <kbd>\</kbd> log
+    <kbd>1-4</kbd> strategy
+    <kbd title="Ctrl+Enter or Cmd+Enter">^Enter</kbd> run
+  </span>
+
   <span class="version">v0.1</span>
 </div>
 
@@ -113,10 +121,33 @@
     font-size: var(--font-size-sm);
   }
 
-  .version {
+  .shortcuts {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+
+  .shortcuts kbd {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 0 3px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    margin: 0 1px;
+  }
+
+  .version {
+    margin-left: var(--spacing-sm);
     font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     color: var(--text-dim);
+    flex-shrink: 0;
   }
 </style>

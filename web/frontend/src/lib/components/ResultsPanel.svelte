@@ -1,6 +1,11 @@
 <script lang="ts">
+  import { createEventDispatcher } from 'svelte';
   import { currentRun, strategies } from '../stores/simulation';
   import type { StrategyMetrics, StrategyRunState } from '../types/index';
+
+  export let collapsed = false;
+
+  const dispatch = createEventDispatcher();
 
   // ---- Types ----
 
@@ -102,7 +107,12 @@
 </script>
 
 <div class="results-container">
-  <div class="panel-header">RESULTS</div>
+  <div class="panel-header">
+    RESULTS
+    <button class="collapse-toggle" on:click={() => dispatch('toggle')} title="Toggle results panel ]">
+      &#x25B6;
+    </button>
+  </div>
 
   <div class="results-body">
     {#if completedStrategies.length === 0 && runningStrategies.length === 0}
@@ -222,6 +232,18 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-panel);
     flex-shrink: 0;
+  }
+
+  .collapse-toggle {
+    all: unset;
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--text-dim);
+    padding: 0 var(--spacing-xs);
+  }
+
+  .collapse-toggle:hover {
+    color: var(--text-secondary);
   }
 
   .results-body {

@@ -10,12 +10,67 @@
   import LogPanel from './lib/components/LogPanel.svelte';
   import StatusBar from './lib/components/StatusBar.svelte';
 
-  import { strategies } from './lib/stores/simulation';
+  import { strategies, toggleStrategy } from './lib/stores/simulation';
   import { systemConfig, dataInfo } from './lib/stores/config';
   import { addLog } from './lib/stores/simulation';
   import { getStrategies, getConfig, getDataInfo } from './lib/api/client';
 
   let logCollapsed = false;
+  let configCollapsed = false;
+  let resultsCollapsed = false;
+
+  // ---- Keyboard shortcuts ----
+
+  function handleKeydown(event: KeyboardEvent) {
+    // Skip if user is typing in an input/textarea/select
+    const tag = (event.target as HTMLElement)?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+    // Ctrl+Enter / Cmd+Enter = trigger RUN
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault();
+      // Dispatch a custom event the Toolbar listens for
+      window.dispatchEvent(new CustomEvent('pf-run'));
+      return;
+    }
+
+    // Don't process single-key shortcuts when modifier keys are held
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+    switch (event.key) {
+      case '[':
+        event.preventDefault();
+        configCollapsed = !configCollapsed;
+        break;
+      case ']':
+        event.preventDefault();
+        resultsCollapsed = !resultsCollapsed;
+        break;
+      case '\\':
+        event.preventDefault();
+        logCollapsed = !logCollapsed;
+        break;
+      case '1':
+      case '2':
+      case '3':
+      case '4': {
+        event.preventDefault();
+        const idx = parseInt(event.key) - 1;
+        const strats = $strategies;
+        if (idx < strats.length) {
+          toggleStrategy(strats[idx].id);
+        }
+        break;
+      }
+    }
+  }
+
+  function errorMessage(err: unknown): string {
+    if (err instanceof TypeError && (err.message === 'Failed to fetch' || err.message.includes('NetworkError'))) {
+      return 'Network error -- is the backend running? (make web-dev)';
+    }
+    return err instanceof Error ? err.message : String(err);
+  }
 
   onMount(async () => {
     // Load strategies
@@ -24,8 +79,7 @@
       strategies.set(strats);
       addLog(`Loaded ${strats.length} strategies`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      addLog(`Failed to load strategies: ${message}`, 'error');
+      addLog(`Failed to load strategies: ${errorMessage(err)}`, 'error');
     }
 
     // Load config
@@ -38,8 +92,7 @@
       });
       addLog('Config loaded');
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      addLog(`Failed to load config: ${message}`, 'error');
+      addLog(`Failed to load config: ${errorMessage(err)}`, 'error');
     }
 
     // Load data info (point counts and date range)
@@ -48,13 +101,19 @@
       dataInfo.set(info);
       addLog(`Data loaded: ${info.solar_point_count + info.load_point_count} points`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      addLog(`Failed to load data info: ${message}`, 'error');
+      addLog(`Failed to load data info: ${errorMessage(err)}`, 'error');
     }
   });
 </script>
 
-<div class="shell" class:log-collapsed={logCollapsed}>
+<svelte:window on:keydown={handleKeydown} />
+
+<div
+  class="shell"
+  class:log-collapsed={logCollapsed}
+  class:config-collapsed={configCollapsed}
+  class:results-collapsed={resultsCollapsed}
+>
   <!-- Toolbar -->
   <header class="panel toolbar">
     <Toolbar />
@@ -62,7 +121,13 @@
 
   <!-- Config sidebar -->
   <aside class="panel config">
-    <ConfigPanel />
+    {#if configCollapsed}
+      <button class="expand-handle expand-config" on:click={() => (configCollapsed = false)} title="Expand config [">
+        &#x25B6;
+      </button>
+    {:else}
+      <ConfigPanel collapsed={configCollapsed} on:toggle={() => (configCollapsed = !configCollapsed)} />
+    {/if}
   </aside>
 
   <!-- Main canvas (charts) -->
@@ -72,7 +137,13 @@
 
   <!-- Results sidebar -->
   <aside class="panel results">
-    <ResultsPanel />
+    {#if resultsCollapsed}
+      <button class="expand-handle expand-results" on:click={() => (resultsCollapsed = false)} title="Expand results ]">
+        &#x25C0;
+      </button>
+    {:else}
+      <ResultsPanel collapsed={resultsCollapsed} on:toggle={() => (resultsCollapsed = !resultsCollapsed)} />
+    {/if}
   </aside>
 
   <!-- Log panel -->
@@ -97,10 +168,25 @@
       'config   canvas   results'
       'log      log      log'
       'status   status   status';
+    transition: grid-template-columns 0.2s ease, grid-template-rows 0.2s ease;
   }
 
   .shell.log-collapsed {
     grid-template-rows: 44px 1fr 28px 24px;
+  }
+
+  /* ---- Panel collapse grid overrides ---- */
+
+  .shell.config-collapsed {
+    grid-template-columns: 24px 1fr 260px;
+  }
+
+  .shell.results-collapsed {
+    grid-template-columns: 220px 1fr 24px;
+  }
+
+  .shell.config-collapsed.results-collapsed {
+    grid-template-columns: 24px 1fr 24px;
   }
 
   .panel {
@@ -139,6 +225,7 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
+    min-width: 0;
   }
 
   .canvas {
@@ -150,6 +237,7 @@
     grid-area: results;
     background: var(--bg-panel);
     overflow-y: auto;
+    min-width: 0;
   }
 
   .log {
@@ -169,4 +257,23 @@
     border-top: 1px solid var(--border);
   }
 
+  /* ---- Expand handles for collapsed panels ---- */
+
+  .expand-handle {
+    all: unset;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--text-dim);
+    background: var(--bg-panel);
+    transition: color 0.1s;
+  }
+
+  .expand-handle:hover {
+    color: var(--text-secondary);
+  }
 </style>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
   import {
     strategies,
     selectedStrategies,
@@ -15,6 +16,19 @@
   let dateStart = '';
   let dateEnd = '';
   let ws: RunWebSocket | null = null;
+
+  // Listen for keyboard shortcut (Ctrl+Enter) dispatched from App
+  function onPfRun() {
+    handleRun();
+  }
+
+  onMount(() => {
+    window.addEventListener('pf-run', onPfRun);
+  });
+
+  onDestroy(() => {
+    window.removeEventListener('pf-run', onPfRun);
+  });
 
   // Sync date inputs from dataInfo when it loads
   $: if ($dataInfo?.date_range && !dateStart && !dateEnd) {
@@ -105,7 +119,12 @@
         },
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      let message: string;
+      if (err instanceof TypeError && (err.message === 'Failed to fetch' || err.message.includes('NetworkError'))) {
+        message = 'Network error -- is the backend running? (make web-dev)';
+      } else {
+        message = err instanceof Error ? err.message : String(err);
+      }
       addLog(`Failed to start simulation: ${message}`, 'error');
     }
   }
