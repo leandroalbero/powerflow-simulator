@@ -13,6 +13,9 @@ export interface BatteryConfig {
   max_charge_rate: number;
   max_discharge_rate: number;
   efficiency: number;
+  initial_soc: number;
+  taper_start: number;
+  taper_factor: number;
 }
 
 export interface GridConfig {
@@ -29,12 +32,20 @@ export interface TariffRate {
 
 export interface TariffConfig {
   rates: TariffRate[];
+  weekend_rate: TariffRate | null;
+}
+
+export interface StrategyConfig {
+  min_battery_level: number;
+  max_charge_power: number;
+  valley_charge_target: number;
 }
 
 export interface SystemConfig {
   battery: BatteryConfig;
   grid: GridConfig;
   tariff: TariffConfig;
+  strategy: StrategyConfig;
 }
 
 export interface DateRange {
@@ -47,6 +58,7 @@ export interface ConfigResponse {
   battery: BatteryConfig;
   grid: GridConfig;
   tariff: TariffConfig;
+  strategy: StrategyConfig;
   data_date_range: DateRange | null;
 }
 
