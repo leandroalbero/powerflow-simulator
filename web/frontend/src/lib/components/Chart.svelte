@@ -342,7 +342,7 @@
                 max: u.scales.x.max!,
               });
               syncing = false;
-              handleZoom(u.scales.x.min!, u.scales.x.max!);
+              // handleZoom only called from power chart hook to avoid duplicate fetches
             }
           },
         ],
