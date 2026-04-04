@@ -1,19 +1,65 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import './styles/fonts.css';
   import './styles/theme.css';
 
+  import Toolbar from './lib/components/Toolbar.svelte';
+  import ConfigPanel from './lib/components/ConfigPanel.svelte';
+  import LogPanel from './lib/components/LogPanel.svelte';
+  import StatusBar from './lib/components/StatusBar.svelte';
+
+  import { strategies } from './lib/stores/simulation';
+  import { systemConfig, dataInfo } from './lib/stores/config';
+  import { addLog } from './lib/stores/simulation';
+  import { getStrategies, getConfig } from './lib/api/client';
+
   let logCollapsed = false;
+
+  onMount(async () => {
+    // Load strategies
+    try {
+      const strats = await getStrategies();
+      strategies.set(strats);
+      addLog(`Loaded ${strats.length} strategies`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      addLog(`Failed to load strategies: ${message}`, 'error');
+    }
+
+    // Load config and data info
+    try {
+      const configResp = await getConfig();
+      systemConfig.set({
+        battery: configResp.battery,
+        grid: configResp.grid,
+        tariff: configResp.tariff,
+      });
+      if (configResp.data_date_range) {
+        dataInfo.set({
+          solar_file_loaded: true,
+          load_file_loaded: true,
+          date_range: configResp.data_date_range,
+          solar_point_count: 0,
+          load_point_count: 0,
+        });
+      }
+      addLog('Config loaded');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      addLog(`Failed to load config: ${message}`, 'error');
+    }
+  });
 </script>
 
 <div class="shell" class:log-collapsed={logCollapsed}>
   <!-- Toolbar -->
   <header class="panel toolbar">
-    <span class="toolbar-title">POWERFLOW SIMULATOR</span>
+    <Toolbar />
   </header>
 
   <!-- Config sidebar -->
   <aside class="panel config">
-    <div class="panel-header">CONFIG</div>
+    <ConfigPanel />
   </aside>
 
   <!-- Main canvas (charts) -->
@@ -28,17 +74,12 @@
 
   <!-- Log panel -->
   <section class="panel log">
-    <div class="panel-header">
-      LOG
-      <button class="log-toggle" on:click={() => (logCollapsed = !logCollapsed)}>
-        {logCollapsed ? '\u25B2' : '\u25BC'}
-      </button>
-    </div>
+    <LogPanel bind:collapsed={logCollapsed} />
   </section>
 
   <!-- Status bar -->
   <footer class="panel statusbar">
-    <span class="text-dim">Ready</span>
+    <StatusBar />
   </footer>
 </div>
 
@@ -85,23 +126,16 @@
     grid-area: toolbar;
     display: flex;
     align-items: center;
-    padding: 0 var(--spacing-md);
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border);
-  }
-
-  .toolbar-title {
-    font-family: var(--font-mono);
-    font-size: var(--font-size-lg);
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    color: var(--text-primary);
   }
 
   .config {
     grid-area: config;
     background: var(--bg-panel);
     overflow-y: auto;
+    display: flex;
+    flex-direction: column;
   }
 
   .canvas {
@@ -132,15 +166,4 @@
     border-top: 1px solid var(--border);
   }
 
-  .log-toggle {
-    all: unset;
-    cursor: pointer;
-    font-size: 10px;
-    color: var(--text-dim);
-    padding: 0 var(--spacing-xs);
-  }
-
-  .log-toggle:hover {
-    color: var(--text-secondary);
-  }
 </style>
