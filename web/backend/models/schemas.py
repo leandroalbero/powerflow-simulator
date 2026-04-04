@@ -20,6 +20,9 @@ class BatteryConfig(BaseModel):
     max_charge_rate: float = Field(2.1, gt=0, description="Max charge rate in kW")
     max_discharge_rate: float = Field(2.1, gt=0, description="Max discharge rate in kW")
     efficiency: float = Field(0.95, gt=0, le=1.0, description="Round-trip efficiency")
+    initial_soc: float = Field(0.1, ge=0, le=1.0, description="Initial state of charge (0-1)")
+    taper_start: float = Field(0.9, gt=0, le=1.0, description="SoC threshold where charge tapering begins")
+    taper_factor: float = Field(0.7, ge=0, le=1.0, description="Tapering intensity (0=no taper, 1=full taper)")
 
 
 class GridConfig(BaseModel):
@@ -44,12 +47,20 @@ class TariffConfig(BaseModel):
         TariffRate(start_hour=22, end_hour=24, price=0.134, direction="import"),
         TariffRate(start_hour=0, end_hour=24, price=0.08, direction="export"),
     ])
+    weekend_rate: Optional[TariffRate] = Field(None, description="Flat override rate for weekends")
+
+
+class StrategyConfig(BaseModel):
+    min_battery_level: float = Field(0.1, ge=0, le=1.0, description="Minimum SoC before discharge stops")
+    max_charge_power: float = Field(2.05, gt=0, description="Max grid charge power in kW")
+    valley_charge_target: float = Field(1.0, gt=0, le=1.0, description="Target SoC during valley charging")
 
 
 class SystemConfig(BaseModel):
     battery: BatteryConfig = Field(default_factory=BatteryConfig)
     grid: GridConfig = Field(default_factory=GridConfig)
     tariff: TariffConfig = Field(default_factory=TariffConfig)
+    strategy: StrategyConfig = Field(default_factory=StrategyConfig)
 
 
 class DateRange(BaseModel):
@@ -61,6 +72,7 @@ class ConfigResponse(BaseModel):
     battery: BatteryConfig
     grid: GridConfig
     tariff: TariffConfig
+    strategy: StrategyConfig
     data_date_range: Optional[DateRange] = None
 
 
