@@ -26,9 +26,18 @@
   let batteryMaxCharge = 0;
   let batteryMaxDischarge = 0;
   let batteryEfficiency = 0;
+  let batteryInitialSoc = 0;
+  let batteryTaperStart = 0;
+  let batteryTaperFactor = 0;
+  let stratMinBatteryLevel = 0;
+  let stratMaxChargePower = 0;
+  let stratValleyChargeTarget = 0;
   let gridMaxImport = 0;
   let gridMaxExport = 0;
   let tariffRates: TariffRate[] = [];
+  let weekendRateEnabled = false;
+  let weekendRatePrice = 0.085;
+  let weekendRateDirection: 'import' | 'export' = 'import';
 
   // Sync local state from store only on initial load (not on every store update)
   $: if ($systemConfig && !initialized) {
@@ -36,9 +45,22 @@
     batteryMaxCharge = $systemConfig.battery.max_charge_rate;
     batteryMaxDischarge = $systemConfig.battery.max_discharge_rate;
     batteryEfficiency = $systemConfig.battery.efficiency;
+    batteryInitialSoc = $systemConfig.battery.initial_soc;
+    batteryTaperStart = $systemConfig.battery.taper_start;
+    batteryTaperFactor = $systemConfig.battery.taper_factor;
     gridMaxImport = $systemConfig.grid.max_import;
     gridMaxExport = $systemConfig.grid.max_export;
     tariffRates = $systemConfig.tariff.rates ? [...$systemConfig.tariff.rates] : [];
+    if ($systemConfig.tariff.weekend_rate) {
+      weekendRateEnabled = true;
+      weekendRatePrice = $systemConfig.tariff.weekend_rate.price;
+      weekendRateDirection = $systemConfig.tariff.weekend_rate.direction as 'import' | 'export';
+    } else {
+      weekendRateEnabled = false;
+    }
+    stratMinBatteryLevel = $systemConfig.strategy.min_battery_level;
+    stratMaxChargePower = $systemConfig.strategy.max_charge_power;
+    stratValleyChargeTarget = $systemConfig.strategy.valley_charge_target;
     initialized = true;
   }
 
@@ -51,6 +73,9 @@
           max_charge_rate: batteryMaxCharge,
           max_discharge_rate: batteryMaxDischarge,
           efficiency: batteryEfficiency,
+          initial_soc: batteryInitialSoc,
+          taper_start: batteryTaperStart,
+          taper_factor: batteryTaperFactor,
         },
         grid: {
           max_import: gridMaxImport,
@@ -58,6 +83,14 @@
         },
         tariff: {
           rates: tariffRates,
+          weekend_rate: weekendRateEnabled
+            ? { start_hour: 0, end_hour: 24, price: weekendRatePrice, direction: weekendRateDirection }
+            : null,
+        },
+        strategy: {
+          min_battery_level: stratMinBatteryLevel,
+          max_charge_power: stratMaxChargePower,
+          valley_charge_target: stratValleyChargeTarget,
         },
       };
       systemConfig.set(config);
@@ -71,6 +104,9 @@
         max_charge_rate: batteryMaxCharge,
         max_discharge_rate: batteryMaxDischarge,
         efficiency: batteryEfficiency,
+        initial_soc: batteryInitialSoc,
+        taper_start: batteryTaperStart,
+        taper_factor: batteryTaperFactor,
       },
       grid: {
         max_import: gridMaxImport,
@@ -78,6 +114,14 @@
       },
       tariff: {
         rates: tariffRates,
+        weekend_rate: weekendRateEnabled
+          ? { start_hour: 0, end_hour: 24, price: weekendRatePrice, direction: weekendRateDirection }
+          : null,
+      },
+      strategy: {
+        min_battery_level: stratMinBatteryLevel,
+        max_charge_power: stratMaxChargePower,
+        valley_charge_target: stratValleyChargeTarget,
       },
     };
 
@@ -89,6 +133,7 @@
         battery: resp.battery,
         grid: resp.grid,
         tariff: resp.tariff,
+        strategy: resp.strategy,
       });
       addLog('Config updated successfully');
     } catch (err) {
@@ -101,6 +146,16 @@
 
   function formatHour(h: number): string {
     return String(h).padStart(2, '0') + ':00';
+  }
+
+  function addRate() {
+    tariffRates = [...tariffRates, { start_hour: 0, end_hour: 24, price: 0.1, direction: 'import' }];
+    debouncedStoreUpdate();
+  }
+
+  function removeRate(index: number) {
+    tariffRates = tariffRates.filter((_, i) => i !== index);
+    debouncedStoreUpdate();
   }
 
   // ---- CSV upload ----
@@ -197,6 +252,21 @@
           on:input={debouncedStoreUpdate}
         />
       </label>
+      <label class="field">
+        <span class="field-label">Initial SoC (0-1)</span>
+        <input type="number" step="0.05" min="0" max="1"
+          bind:value={batteryInitialSoc} on:input={debouncedStoreUpdate} />
+      </label>
+      <label class="field">
+        <span class="field-label">Taper start (0-1)</span>
+        <input type="number" step="0.05" min="0" max="1"
+          bind:value={batteryTaperStart} on:input={debouncedStoreUpdate} />
+      </label>
+      <label class="field">
+        <span class="field-label">Taper factor (0-1)</span>
+        <input type="number" step="0.05" min="0" max="1"
+          bind:value={batteryTaperFactor} on:input={debouncedStoreUpdate} />
+      </label>
     </div>
 
     <!-- Grid Section -->
@@ -224,6 +294,26 @@
       </label>
     </div>
 
+    <!-- Strategy Section -->
+    <div class="section">
+      <div class="section-title">STRATEGY</div>
+      <label class="field">
+        <span class="field-label">Min battery (0-1)</span>
+        <input type="number" step="0.05" min="0" max="1"
+          bind:value={stratMinBatteryLevel} on:input={debouncedStoreUpdate} />
+      </label>
+      <label class="field">
+        <span class="field-label">Max charge (kW)</span>
+        <input type="number" step="0.05" min="0"
+          bind:value={stratMaxChargePower} on:input={debouncedStoreUpdate} />
+      </label>
+      <label class="field">
+        <span class="field-label">Valley target (0-1)</span>
+        <input type="number" step="0.05" min="0" max="1"
+          bind:value={stratValleyChargeTarget} on:input={debouncedStoreUpdate} />
+      </label>
+    </div>
+
     <!-- Tariff Section -->
     <div class="section">
       <div class="section-title">TARIFF</div>
@@ -231,26 +321,64 @@
         <table class="tariff-table">
           <thead>
             <tr>
-              <th>Hours</th>
+              <th>From</th>
+              <th>To</th>
               <th>Price</th>
               <th>Dir</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
-            {#each tariffRates as rate}
+            {#each tariffRates as rate, i}
               <tr>
-                <td class="mono">{formatHour(rate.start_hour)}-{formatHour(rate.end_hour)}</td>
-                <td class="mono numeric">{rate.price.toFixed(2)}</td>
-                <td class:import-dir={rate.direction === 'import'} class:export-dir={rate.direction === 'export'}>
-                  {rate.direction}
+                <td>
+                  <input type="number" class="tariff-input mono" min="0" max="23" step="1"
+                    bind:value={tariffRates[i].start_hour} on:input={debouncedStoreUpdate} />
+                </td>
+                <td>
+                  <input type="number" class="tariff-input mono" min="1" max="24" step="1"
+                    bind:value={tariffRates[i].end_hour} on:input={debouncedStoreUpdate} />
+                </td>
+                <td>
+                  <input type="number" class="tariff-input tariff-price mono" min="0" step="0.001"
+                    bind:value={tariffRates[i].price} on:input={debouncedStoreUpdate} />
+                </td>
+                <td>
+                  <select class="tariff-select" bind:value={tariffRates[i].direction} on:change={debouncedStoreUpdate}>
+                    <option value="import">imp</option>
+                    <option value="export">exp</option>
+                  </select>
+                </td>
+                <td>
+                  <button class="row-btn remove-btn" on:click={() => removeRate(i)} title="Remove rate">&times;</button>
                 </td>
               </tr>
             {/each}
           </tbody>
         </table>
-      {:else}
-        <div class="no-data">No tariff rates</div>
       {/if}
+      <button class="row-btn add-btn" on:click={addRate}>+ Add rate</button>
+      <div class="weekend-section">
+        <label class="field">
+          <span class="field-label">Weekend override</span>
+          <input type="checkbox" class="checkbox-input"
+            bind:checked={weekendRateEnabled} on:change={debouncedStoreUpdate} />
+        </label>
+        {#if weekendRateEnabled}
+          <label class="field">
+            <span class="field-label">Weekend price</span>
+            <input type="number" step="0.001" min="0"
+              bind:value={weekendRatePrice} on:input={debouncedStoreUpdate} />
+          </label>
+          <label class="field">
+            <span class="field-label">Direction</span>
+            <select class="tariff-select" bind:value={weekendRateDirection} on:change={debouncedStoreUpdate}>
+              <option value="import">import</option>
+              <option value="export">export</option>
+            </select>
+          </label>
+        {/if}
+      </div>
     </div>
 
     <!-- Apply button -->
@@ -493,5 +621,77 @@
 
   .upload-err {
     color: var(--color-error);
+  }
+
+  .tariff-input {
+    width: 48px;
+    height: 22px;
+    font-size: var(--font-size-sm);
+    font-family: var(--font-mono);
+    text-align: right;
+    padding: 0 2px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+  }
+
+  .tariff-input:focus {
+    border-color: var(--border-active);
+  }
+
+  .tariff-price {
+    width: 56px;
+  }
+
+  .tariff-select {
+    height: 22px;
+    font-size: 10px;
+    font-family: var(--font-ui);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0 2px;
+  }
+
+  .row-btn {
+    all: unset;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+    color: var(--text-dim);
+    padding: 0 4px;
+  }
+
+  .row-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .remove-btn {
+    font-size: 14px;
+    color: var(--color-error);
+  }
+
+  .remove-btn:hover {
+    opacity: 0.8;
+  }
+
+  .add-btn {
+    font-size: var(--font-size-sm);
+    color: var(--text-dim);
+    margin-top: var(--spacing-xs);
+    display: block;
+  }
+
+  .weekend-section {
+    margin-top: var(--spacing-sm);
+    padding-top: var(--spacing-xs);
+    border-top: 1px solid var(--border);
+  }
+
+  .checkbox-input {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--color-selected);
   }
 </style>
