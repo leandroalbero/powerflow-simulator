@@ -5,6 +5,8 @@
 
   import Toolbar from './lib/components/Toolbar.svelte';
   import ConfigPanel from './lib/components/ConfigPanel.svelte';
+  import Chart from './lib/components/Chart.svelte';
+  import ResultsPanel from './lib/components/ResultsPanel.svelte';
   import LogPanel from './lib/components/LogPanel.svelte';
   import StatusBar from './lib/components/StatusBar.svelte';
 
@@ -65,12 +67,12 @@
 
   <!-- Main canvas (charts) -->
   <main class="panel canvas">
-    <div class="panel-header">CANVAS</div>
+    <Chart />
   </main>
 
   <!-- Results sidebar -->
   <aside class="panel results">
-    <div class="panel-header">RESULTS</div>
+    <ResultsPanel />
   </aside>
 
   <!-- Log panel -->
