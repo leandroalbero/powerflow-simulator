@@ -105,8 +105,6 @@ def downsample_timeseries(
             best_var = v
             ref_y = arr
 
-    _, _ = lttb_downsample(x, ref_y, max_points)
-    # Re-run to get indices (we need the indices, not the values)
     x_down, _ = lttb_downsample(x, ref_y, max_points)
     indices = x_down.astype(int)
 

@@ -2,9 +2,11 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from web.backend.api import config, data, simulation, strategies
 from web.backend.services.data_service import DataService
@@ -63,3 +65,9 @@ app.include_router(data.router)
 @app.get("/api/health")
 def health_check() -> dict:
     return {"status": "ok"}
+
+
+# Serve built frontend assets (production mode)
+_frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _frontend_dist.is_dir():
+    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="static")

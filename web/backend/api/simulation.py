@@ -110,8 +110,10 @@ def get_timeseries(
             k: [v[i] for i in filtered_indices] for k, v in columns.items()
         }
 
-    # Downsample if needed
-    timestamps, columns = downsample_timeseries(timestamps, columns, max_points)
+    # Skip downsampling for single-day windows (~1440 points at 1-min resolution)
+    is_single_day = len(timestamps) <= 1500
+    if not is_single_day:
+        timestamps, columns = downsample_timeseries(timestamps, columns, max_points)
 
     return TimeseriesResponse(
         timestamps=timestamps,
