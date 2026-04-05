@@ -1,0 +1,8 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    # Mount your full data directory to override sample data:
+    # volumes:
+    #   - ./data:/app/data
