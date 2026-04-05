@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 import json
 import urllib.error
+import pandas as pd
 
 # We'll test the module's functions directly
 import importlib.util
@@ -161,3 +162,61 @@ class TestShouldSkipMonth:
         csv_path = tmp_path / "2024-01.csv"
         csv_path.write_text("timestamp,ghi\n2024-01-01T00:00,0.0\n")
         assert m.should_skip_month(csv_path, date(2024, 1, 1), today=date(2024, 3, 15), force=True) is False
+
+
+class TestRunIngestion:
+    def test_writes_csv_files(self, tmp_path):
+        m = _load_module()
+
+        fake_response = {
+            "hourly": {
+                "time": [f"2024-01-01T{h:02d}:00" for h in range(24)],
+                "shortwave_radiation": [0.0] * 24,
+                "shortwave_radiation_previous_day1": [0.0] * 24,
+                "direct_radiation": [0.0] * 24,
+                "direct_radiation_previous_day1": [0.0] * 24,
+                "direct_normal_irradiance": [0.0] * 24,
+                "direct_normal_irradiance_previous_day1": [0.0] * 24,
+            }
+        }
+        response_bytes = json.dumps(fake_response).encode()
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_bytes
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            m.run_ingestion(
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 31),
+                output_dir=tmp_path,
+                force=False,
+            )
+
+        csv_file = tmp_path / "2024-01.csv"
+        assert csv_file.exists()
+        df = pd.read_csv(csv_file, index_col="timestamp")
+        assert len(df) == 24
+        assert "ghi" in df.columns
+        assert "ghi_forecast" in df.columns
+
+    def test_skips_existing_complete_month(self, tmp_path):
+        m = _load_module()
+
+        csv_file = tmp_path / "2024-01.csv"
+        csv_file.write_text("timestamp,ghi\nexisting,data\n")
+
+        with patch("urllib.request.urlopen") as mock_open:
+            m.run_ingestion(
+                start=date(2024, 1, 1),
+                end=date(2024, 1, 31),
+                output_dir=tmp_path,
+                force=False,
+                today=date(2024, 3, 1),
+            )
+
+        # Should not have made any API calls
+        mock_open.assert_not_called()
+        # Original file should be untouched
+        assert csv_file.read_text() == "timestamp,ghi\nexisting,data\n"

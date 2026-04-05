@@ -125,3 +125,88 @@ def should_skip_month(
     if is_current_month:
         return False
     return True
+
+
+ARCHIVE_START = date(2024, 1, 1)
+
+
+def run_ingestion(
+    start: date | None = None,
+    end: date | None = None,
+    output_dir: Path | None = None,
+    force: bool = False,
+    today: date | None = None,
+) -> None:
+    """Fetch irradiance data for each month in range and write CSVs."""
+    if today is None:
+        today = date.today()
+    if start is None:
+        start = ARCHIVE_START
+    if end is None:
+        end = today
+    if output_dir is None:
+        output_dir = DATA_DIR
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    months = generate_months(start, end)
+
+    fetched = 0
+    skipped = 0
+    errors = 0
+
+    for month_start, month_end in months:
+        label = month_start.strftime("%Y-%m")
+        csv_path = output_dir / f"{label}.csv"
+
+        if should_skip_month(csv_path, month_start, today=today, force=force):
+            print(f"  {label}: skipped (already exists)")
+            skipped += 1
+            continue
+
+        print(f"  {label}: fetching...", end=" ", flush=True)
+        try:
+            df = fetch_month_data(
+                month_start.isoformat(),
+                month_end.isoformat(),
+            )
+            df.to_csv(csv_path)
+            print(f"{len(df)} rows written")
+            fetched += 1
+        except Exception as e:
+            print(f"ERROR: {e}")
+            errors += 1
+
+    print(f"\nDone: {fetched} fetched, {skipped} skipped, {errors} errors")
+
+
+def parse_month(s: str) -> date:
+    """Parse 'YYYY-MM' string to first day of that month."""
+    return datetime.strptime(s, "%Y-%m").date()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch solar irradiance forecasts from Open-Meteo"
+    )
+    parser.add_argument(
+        "--start", type=parse_month, default=None,
+        help="Start month (YYYY-MM), default: 2024-01",
+    )
+    parser.add_argument(
+        "--end", type=parse_month, default=None,
+        help="End month (YYYY-MM), default: current month",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-fetch all months even if CSVs exist",
+    )
+    args = parser.parse_args()
+
+    print(f"Fetching irradiance data for Villena ({LATITUDE}, {LONGITUDE})")
+    print(f"Output: {DATA_DIR}\n")
+
+    run_ingestion(start=args.start, end=args.end, force=args.force)
+
+
+if __name__ == "__main__":
+    main()
