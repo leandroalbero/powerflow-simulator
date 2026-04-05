@@ -30,7 +30,8 @@ Simulation granularity is 1 minute, and the shown scenario is force charging the
 Estimated metrics are almost spot on when compared with Home Assistant's energy dashboard.
 Some discrepancies might arise because we are not simulating battery behavior in detail, but rather a simplified model.
 End to end efficiency of solar panels, battery, and inverter isn't modeled, but rather a simplified model.
-
+### WebUI
+<img width="1628" height="1042" alt="image" src="https://github.com/user-attachments/assets/d3be7185-0fe5-4bad-869d-97c6f637980f" />
 ### Simulation
 ![img](media/simulation.png)
 ### Ground Truth
