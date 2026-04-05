@@ -45,9 +45,9 @@
     batteryMaxCharge = $systemConfig.battery.max_charge_rate;
     batteryMaxDischarge = $systemConfig.battery.max_discharge_rate;
     batteryEfficiency = $systemConfig.battery.efficiency;
-    batteryInitialSoc = $systemConfig.battery.initial_soc;
-    batteryTaperStart = $systemConfig.battery.taper_start;
-    batteryTaperFactor = $systemConfig.battery.taper_factor;
+    batteryInitialSoc = $systemConfig.battery.initial_soc ?? 0.1;
+    batteryTaperStart = $systemConfig.battery.taper_start ?? 0.9;
+    batteryTaperFactor = $systemConfig.battery.taper_factor ?? 0.7;
     gridMaxImport = $systemConfig.grid.max_import;
     gridMaxExport = $systemConfig.grid.max_export;
     tariffRates = $systemConfig.tariff.rates ? [...$systemConfig.tariff.rates] : [];
@@ -58,9 +58,10 @@
     } else {
       weekendRateEnabled = false;
     }
-    stratMinBatteryLevel = $systemConfig.strategy.min_battery_level;
-    stratMaxChargePower = $systemConfig.strategy.max_charge_power;
-    stratValleyChargeTarget = $systemConfig.strategy.valley_charge_target;
+    const strat = $systemConfig.strategy ?? { min_battery_level: 0.1, max_charge_power: 2.05, valley_charge_target: 1.0 };
+    stratMinBatteryLevel = strat.min_battery_level;
+    stratMaxChargePower = strat.max_charge_power;
+    stratValleyChargeTarget = strat.valley_charge_target;
     initialized = true;
   }
 
@@ -133,7 +134,7 @@
         battery: resp.battery,
         grid: resp.grid,
         tariff: resp.tariff,
-        strategy: resp.strategy,
+        strategy: resp.strategy ?? { min_battery_level: 0.1, max_charge_power: 2.05, valley_charge_target: 1.0 },
       });
       addLog('Config updated successfully');
     } catch (err) {

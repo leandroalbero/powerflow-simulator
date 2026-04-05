@@ -130,21 +130,22 @@ button:active {
   background: var(--border-active);
 }
 
-/* ---- Tables ---- */
+/* ---- Tables (scoped to avoid affecting uPlot legend) ---- */
 
-table {
+table:not(.u-legend) {
   width: 100%;
   border-collapse: collapse;
   font-size: var(--font-size-sm);
 }
 
-th, td {
+table:not(.u-legend) th,
+table:not(.u-legend) td {
   padding: var(--spacing-xs) var(--spacing-sm);
   border-bottom: 1px solid var(--border);
   text-align: left;
 }
 
-th {
+table:not(.u-legend) th {
   color: var(--text-secondary);
   font-weight: 500;
   font-size: var(--font-size-sm);

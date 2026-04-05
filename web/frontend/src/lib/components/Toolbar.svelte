@@ -30,10 +30,18 @@
     window.removeEventListener('pf-run', onPfRun);
   });
 
+  // Extract YYYY-MM-DD from ISO datetime (e.g. "2024-01-01T00:00:00+01:00" -> "2024-01-01")
+  function toDateStr(iso: string): string {
+    return iso.slice(0, 10);
+  }
+
+  $: dataStart = $dataInfo?.date_range ? toDateStr($dataInfo.date_range.start) : '';
+  $: dataEnd = $dataInfo?.date_range ? toDateStr($dataInfo.date_range.end) : '';
+
   // Sync date inputs from dataInfo when it loads
-  $: if ($dataInfo?.date_range && !dateStart && !dateEnd) {
-    dateStart = $dataInfo.date_range.start;
-    dateEnd = $dataInfo.date_range.end;
+  $: if (dataStart && dataEnd && !dateStart && !dateEnd) {
+    dateStart = dataStart;
+    dateEnd = dataEnd;
   }
 
   $: isRunning = $currentRun?.status === 'running';
@@ -151,10 +159,15 @@
   <div class="separator"></div>
 
   <div class="date-group">
+    {#if dataStart}
+      <span class="date-hint">Data: {dataStart} &ndash; {dataEnd}</span>
+    {/if}
     <input
       type="date"
       class="date-input"
       bind:value={dateStart}
+      min={dataStart}
+      max={dataEnd}
       on:change={() => selectedDateRange.set(buildDateRange() || null)}
     />
     <span class="date-dash">&ndash;</span>
@@ -162,6 +175,8 @@
       type="date"
       class="date-input"
       bind:value={dateEnd}
+      min={dataStart}
+      max={dataEnd}
       on:change={() => selectedDateRange.set(buildDateRange() || null)}
     />
   </div>
@@ -253,6 +268,13 @@
 
   .date-input:focus {
     border-color: var(--border-active);
+  }
+
+  .date-hint {
+    font-size: 10px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    white-space: nowrap;
   }
 
   .date-dash {

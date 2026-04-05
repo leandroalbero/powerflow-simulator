@@ -89,6 +89,7 @@
         battery: configResp.battery,
         grid: configResp.grid,
         tariff: configResp.tariff,
+        strategy: configResp.strategy ?? { min_battery_level: 0.1, max_charge_power: 2.05, valley_charge_target: 1.0 },
       });
       addLog('Config loaded');
     } catch (err) {
