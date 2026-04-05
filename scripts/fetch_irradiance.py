@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import calendar
 import json
 import time
 import urllib.request
@@ -88,3 +89,39 @@ def fetch_month_data(start_date: str, end_date: str) -> pd.DataFrame:
     })
     df = df.set_index("timestamp")
     return df
+
+
+def generate_months(start: date, end: date) -> list[tuple[date, date]]:
+    """Generate (first_day, last_day) pairs for each month in the range."""
+    months = []
+    cursor = start.replace(day=1)
+    end_month = end.replace(day=1)
+    while cursor <= end_month:
+        last_day = cursor.replace(day=calendar.monthrange(cursor.year, cursor.month)[1])
+        months.append((cursor, last_day))
+        # Advance to next month
+        if cursor.month == 12:
+            cursor = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            cursor = cursor.replace(month=cursor.month + 1)
+    return months
+
+
+def should_skip_month(
+    csv_path: Path,
+    month_start: date,
+    today: date | None = None,
+    force: bool = False,
+) -> bool:
+    """Return True if this month's CSV already exists and doesn't need re-fetching."""
+    if force:
+        return False
+    if not csv_path.exists():
+        return False
+    if today is None:
+        today = date.today()
+    # Current month always re-fetched (still accumulating data)
+    is_current_month = (month_start.year == today.year and month_start.month == today.month)
+    if is_current_month:
+        return False
+    return True

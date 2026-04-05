@@ -116,3 +116,48 @@ class TestFetchMonthData:
             with patch("time.sleep"):
                 with pytest.raises(urllib.error.HTTPError):
                     m.fetch_month_data("2024-01-01", "2024-01-31")
+
+
+from datetime import date
+
+
+class TestMonthHelpers:
+    def test_generate_months_full_range(self):
+        m = _load_module()
+        months = m.generate_months(date(2024, 1, 1), date(2024, 4, 1))
+        assert months == [
+            (date(2024, 1, 1), date(2024, 1, 31)),
+            (date(2024, 2, 1), date(2024, 2, 29)),
+            (date(2024, 3, 1), date(2024, 3, 31)),
+            (date(2024, 4, 1), date(2024, 4, 30)),
+        ]
+
+    def test_month_end_date_december(self):
+        m = _load_module()
+        months = m.generate_months(date(2024, 12, 1), date(2024, 12, 1))
+        assert months == [(date(2024, 12, 1), date(2024, 12, 31))]
+
+
+class TestShouldSkipMonth:
+    def test_skip_complete_past_month(self, tmp_path):
+        m = _load_module()
+        csv_path = tmp_path / "2024-01.csv"
+        csv_path.write_text("timestamp,ghi\n2024-01-01T00:00,0.0\n")
+        assert m.should_skip_month(csv_path, date(2024, 1, 1), today=date(2024, 3, 15)) is True
+
+    def test_do_not_skip_current_month(self, tmp_path):
+        m = _load_module()
+        csv_path = tmp_path / "2024-03.csv"
+        csv_path.write_text("timestamp,ghi\n2024-03-01T00:00,0.0\n")
+        assert m.should_skip_month(csv_path, date(2024, 3, 1), today=date(2024, 3, 15)) is False
+
+    def test_do_not_skip_missing_file(self, tmp_path):
+        m = _load_module()
+        csv_path = tmp_path / "2024-01.csv"
+        assert m.should_skip_month(csv_path, date(2024, 1, 1), today=date(2024, 3, 15)) is False
+
+    def test_skip_when_forced_is_false(self, tmp_path):
+        m = _load_module()
+        csv_path = tmp_path / "2024-01.csv"
+        csv_path.write_text("timestamp,ghi\n2024-01-01T00:00,0.0\n")
+        assert m.should_skip_month(csv_path, date(2024, 1, 1), today=date(2024, 3, 15), force=True) is False
