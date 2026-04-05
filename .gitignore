@@ -37,3 +37,6 @@ venv/
 db_local/messages.db
 google-service-account-file.json
 /qodana.yaml
+
+# fetched data (regenerable via scripts/)
+data/irradiance/

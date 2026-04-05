@@ -163,11 +163,14 @@ def run_ingestion(
             skipped += 1
             continue
 
+        # Cap end date to today for the current/future month
+        effective_end = min(month_end, today)
+
         print(f"  {label}: fetching...", end=" ", flush=True)
         try:
             df = fetch_month_data(
                 month_start.isoformat(),
-                month_end.isoformat(),
+                effective_end.isoformat(),
             )
             df.to_csv(csv_path)
             print(f"{len(df)} rows written")
