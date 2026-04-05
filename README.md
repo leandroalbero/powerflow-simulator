@@ -41,28 +41,46 @@ End to end efficiency of solar panels, battery, and inverter isn't modeled, but 
 | ![img](media/simulation_report.png) | ![Ground Truth](media/ground_truth_report.png) |
 
 
-## Installation
+## Quick Start (Docker)
 ```bash
-# Clone repository
 git clone https://github.com/leandroalbero/powerflow-simulator.git
 cd powerflow-simulator
+docker compose up --build
+```
+Open http://localhost:8000 — the image includes one month of sample data (January 2024, 1-minute resolution).
 
+To use your own full dataset, uncomment the volume mount in `docker-compose.yml`:
+```yaml
+volumes:
+  - ./data:/app/data
+```
+
+## Local Development
+```bash
 # Create virtual environment
 python -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Install frontend dependencies
+cd web/frontend && npm install && cd ../..
+
+# Start backend + frontend dev servers
+make web-dev
 ```
+Backend runs on http://localhost:8000, frontend dev server on http://localhost:5173.
 
-## Usage
-1. Prepare input data:
-   - Solar generation CSV with datetime index and 'state' column measured in W
-   - Load consumption CSV with datetime index and 'state' column measured in W
-   - Ensure data is in the correct timezone, you have examples in the `data` folder, 1y worth of real data! high-res version
-     is 1m resolution, low-res version is 1h resolution.
+## Data
+Input CSVs need a `last_changed` datetime index and a `state` column (values in Watts):
+```csv
+"last_changed","state"
+"2024-01-01T00:00:00.000+01:00","1424.67"
+```
+The `data/` folder contains real data — high-res (1-minute) and low-res (1-hour) versions. The `data/sample/` folder has a January 2024 subset used by the Docker image.
 
-2. Configure system parameters:
+## Programmatic Usage
 ```python
 tariff = PowerTariff(
     import_rate_schedule={(0, 8): 0.085, (8, 10): 0.134, ...},
@@ -70,20 +88,12 @@ tariff = PowerTariff(
 )
 
 battery = Battery(capacity=5, max_charge_rate=2.0, max_discharge_rate=2.0)
-```
 
-3. Run simulation (theres an example in the use_cases folder):
-```python
 sim = EnergySimulator(battery, load, grid, tariff, solar)
 for timestamp in load_data.index:
     sim.step(timestamp, prev_timestamp, strategy='self_consume')
-```
 
-4. Analyze results:
-```python
 results = sim.get_metrics()
-print(f"Total cost: {results['total_cost']:,.2f}€")
-print(f"Solar self-consumption rate: {results['self_consumption_rate']:.1f}%")
 ```
 
 ## Future Plans (with no particular order)

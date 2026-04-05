@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.claude
+__pycache__
+*.pyc
+node_modules
+web/frontend/dist
+output_files
+media
+scripts
+.python-version
+*.pkl
+*.pt
