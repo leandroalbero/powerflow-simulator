@@ -58,3 +58,33 @@ def build_api_url(start_date: str, end_date: str) -> str:
         f"&end_date={end_date}"
     )
     return f"{BASE_URL}?{params}"
+
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = [1, 3, 10]  # seconds
+
+
+def fetch_month_data(start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch irradiance data for a date range from Open-Meteo. Returns a DataFrame."""
+    url = build_api_url(start_date, end_date)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(url) as resp:
+                data = json.loads(resp.read())
+            break
+        except urllib.error.HTTPError as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_BACKOFF[attempt]
+                print(f"  HTTP {e.code}, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+
+    hourly = data["hourly"]
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(hourly["time"]),
+        **{COLUMN_RENAME[var]: hourly[var] for var in HOURLY_VARS},
+    })
+    df = df.set_index("timestamp")
+    return df

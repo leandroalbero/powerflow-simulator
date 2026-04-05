@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 import json
+import urllib.error
 
 # We'll test the module's functions directly
 import importlib.util
@@ -35,3 +36,83 @@ class TestBuildApiUrl:
         assert "direct_radiation_previous_day1" in url
         assert "direct_normal_irradiance" in url
         assert "direct_normal_irradiance_previous_day1" in url
+
+
+class TestFetchMonthData:
+    def test_parses_api_response_into_dataframe(self):
+        m = _load_module()
+
+        fake_response = {
+            "hourly": {
+                "time": ["2024-01-01T00:00", "2024-01-01T01:00", "2024-01-01T02:00"],
+                "shortwave_radiation": [0.0, 0.0, 10.5],
+                "shortwave_radiation_previous_day1": [0.0, 0.0, 8.2],
+                "direct_radiation": [0.0, 0.0, 7.3],
+                "direct_radiation_previous_day1": [0.0, 0.0, 5.1],
+                "direct_normal_irradiance": [0.0, 0.0, 12.0],
+                "direct_normal_irradiance_previous_day1": [0.0, 0.0, 9.8],
+            }
+        }
+        response_bytes = json.dumps(fake_response).encode()
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_bytes
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            df = m.fetch_month_data("2024-01-01", "2024-01-31")
+
+        assert len(df) == 3
+        assert list(df.columns) == [
+            "ghi", "ghi_forecast",
+            "direct_radiation", "direct_radiation_forecast",
+            "dni", "dni_forecast",
+        ]
+        assert df.index.name == "timestamp"
+        assert df["ghi"].iloc[2] == 10.5
+        assert df["ghi_forecast"].iloc[2] == 8.2
+
+    def test_retries_on_http_error(self):
+        m = _load_module()
+
+        fake_response = {
+            "hourly": {
+                "time": ["2024-01-01T00:00"],
+                "shortwave_radiation": [0.0],
+                "shortwave_radiation_previous_day1": [0.0],
+                "direct_radiation": [0.0],
+                "direct_radiation_previous_day1": [0.0],
+                "direct_normal_irradiance": [0.0],
+                "direct_normal_irradiance_previous_day1": [0.0],
+            }
+        }
+        response_bytes = json.dumps(fake_response).encode()
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_bytes
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        error = urllib.error.HTTPError(
+            url="http://test", code=500, msg="Server Error", hdrs={}, fp=None
+        )
+
+        with patch("urllib.request.urlopen", side_effect=[error, mock_resp]) as mock_open:
+            with patch("time.sleep"):  # skip actual sleep
+                df = m.fetch_month_data("2024-01-01", "2024-01-31")
+
+        assert mock_open.call_count == 2
+        assert len(df) == 1
+
+    def test_raises_after_max_retries(self):
+        m = _load_module()
+
+        error = urllib.error.HTTPError(
+            url="http://test", code=500, msg="Server Error", hdrs={}, fp=None
+        )
+
+        with patch("urllib.request.urlopen", side_effect=error):
+            with patch("time.sleep"):
+                with pytest.raises(urllib.error.HTTPError):
+                    m.fetch_month_data("2024-01-01", "2024-01-31")
