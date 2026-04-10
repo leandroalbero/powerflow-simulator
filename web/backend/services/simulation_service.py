@@ -26,6 +26,12 @@ from src.domain.strategy.model import (
     SmartDischargeStrategy,
     ValleyChargePeakDischargeStrategy,
 )
+from src.domain.strategy.mpc import (
+    LoadForecaster,
+    MpcStrategy,
+    SolarForecaster,
+    load_hourly_ghi_forecasts,
+)
 from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
     StrategyInfo,
@@ -86,6 +92,12 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         description="Computes the theoretical minimum cost using linear programming with "
         "perfect foresight. Not deployable — serves as a benchmark.",
     ),
+    StrategyInfo(
+        id="mpc",
+        name="Model Predictive Control",
+        description="Rolling 24h LP with solar forecasts and learned load profiles. "
+        "Re-solves every 15 minutes. Deployable in real-time.",
+    ),
 ]
 
 STRATEGY_MAP = {s.id: s for s in STRATEGY_REGISTRY}
@@ -100,6 +112,7 @@ _STRATEGY_CLASSES = {
     "smart_discharge": SmartDischargeStrategy,
     "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
     "oracle": OracleStrategy,
+    "mpc": MpcStrategy,
 }
 
 
@@ -223,6 +236,9 @@ class SimulationService:
         daily_forecasts = (
             load_daily_forecasts() if "forecast_charge" in strategy_ids else None
         )
+        hourly_ghi_forecasts = (
+            load_hourly_ghi_forecasts() if "mpc" in strategy_ids else None
+        )
 
         for sid in strategy_ids:
             self._executor.submit(
@@ -237,6 +253,7 @@ class SimulationService:
                 on_run_done,
                 strategy_ids,
                 daily_forecasts,
+                hourly_ghi_forecasts,
             )
 
         return run_id
@@ -253,6 +270,7 @@ class SimulationService:
         on_run_done: Optional[RunDoneCallback],
         all_strategy_ids: List[str],
         daily_forecasts: Optional[Dict] = None,
+        hourly_ghi_forecasts: Optional[Dict] = None,
     ) -> None:
         result = run.strategies[strategy_id]
         result.status = "running"
@@ -271,6 +289,14 @@ class SimulationService:
 
             if strategy_id == "forecast_charge":
                 strategy = strategy_cls(battery, grid, tariff, daily_forecasts)
+            elif strategy_id == "mpc":
+                load_forecaster = LoadForecaster(load_df)
+                solar_forecaster = SolarForecaster(hourly_ghi_forecasts or {})
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                )
             elif strategy_id == "oracle":
                 # Resample to 5-min (inverter granularity) for tight LP
                 solar_5m = solar_df.resample("5min").mean().fillna(0.0)
@@ -303,6 +329,8 @@ class SimulationService:
             for i, timestamp in enumerate(timestamps):
                 if hasattr(strategy, 'current_date'):
                     strategy.current_date = timestamp.date()
+                if hasattr(strategy, 'set_timestamp'):
+                    strategy.set_timestamp(timestamp)
                 sim.step(timestamp, prev_timestamp)
                 prev_timestamp = timestamp
 
