@@ -126,10 +126,15 @@ def solve_oracle_lp(
         np.zeros(n),                          # grid_export >= 0
         np.full(n, min_soc),                  # soc >= min_soc
     ])
+    # Grid import must cover any net load that exceeds battery discharge.
+    # Use max(grid_cap, peak_net_load) to ensure feasibility.
+    min_grid_needed = np.maximum(load - solar - max_discharge_rate, 0)
+    effective_grid_import = np.maximum(max_grid_import, min_grid_needed)
+
     ub = np.concatenate([
         np.full(n, max_charge_rate),          # charge <= max_charge_rate
         np.full(n, max_discharge_rate),       # discharge <= max_discharge_rate
-        np.full(n, max_grid_import),          # grid_import <= grid cap
+        effective_grid_import,                # grid_import <= max(cap, needed)
         np.full(n, max_grid_export),          # grid_export <= grid cap
         np.full(n, battery_capacity),         # soc <= capacity
     ])
