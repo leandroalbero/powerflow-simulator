@@ -32,7 +32,7 @@ def solve_oracle_lp(
     load: np.ndarray,
     import_rates: np.ndarray,
     export_rates: np.ndarray,
-    dt: float,
+    dt: "float | np.ndarray",
     battery_capacity: float,
     max_charge_rate: float,
     max_discharge_rate: float,
@@ -47,7 +47,7 @@ def solve_oracle_lp(
         load: House load power per step (kW).
         import_rates: Grid import price per step (EUR/kWh).
         export_rates: Grid export price per step (EUR/kWh).
-        dt: Duration of each timestep (hours).
+        dt: Duration of each timestep (hours). Scalar or per-step array.
         battery_capacity: Battery capacity (kWh).
         max_charge_rate: Max charge power (kW).
         max_discharge_rate: Max discharge power (kW).
@@ -67,6 +67,9 @@ def solve_oracle_lp(
             soc=np.array([]),
         )
 
+    # Support both scalar and per-step dt
+    dt_arr = np.broadcast_to(np.asarray(dt, dtype=float), n)
+
     # Variable layout: [charge(n), discharge(n), grid_import(n), grid_export(n), soc(n)]
     nc = 5 * n
     idx_ch = slice(0, n)
@@ -75,32 +78,32 @@ def solve_oracle_lp(
     idx_exp = slice(3 * n, 4 * n)
     idx_soc = slice(4 * n, 5 * n)
 
-    # Objective: min Σ (grid_import * rate_import - grid_export * rate_export) * dt
+    # Objective: min Σ (grid_import[t] * rate_import[t] - grid_export[t] * rate_export[t]) * dt[t]
     c = np.zeros(nc)
-    c[idx_imp] = import_rates * dt
-    c[idx_exp] = -export_rates * dt
+    c[idx_imp] = import_rates * dt_arr
+    c[idx_exp] = -export_rates * dt_arr
 
     # Equality constraints built with sparse diagonal ops (vectorized, no Python loop).
     #
     # Row block 1 (energy balance, n rows):
     #   -charge + discharge + grid_import - grid_export = load - solar
     # Row block 2 (battery dynamics, n rows):
-    #   soc[t] - soc[t-1] - charge[t]*eff*dt + discharge[t]/eff*dt = 0
-    #   For t=0: soc[0] - charge[0]*eff*dt + discharge[0]/eff*dt = initial_soc_kwh
+    #   soc[t] - soc[t-1] - charge[t]*eff*dt[t] + discharge[t]/eff*dt[t] = 0
+    #   For t=0: soc[0] - charge[0]*eff*dt[0] + discharge[0]/eff*dt[0] = initial_soc_kwh
 
     I = speye(n, format="csr")  # noqa: E741
     Z = speye(n, format="csr") * 0  # zero block
+    D = diags(dt_arr, 0, format="csr")  # per-step duration diagonal
 
     # Energy balance: [-I, +I, +I, -I, 0] @ [ch, dis, imp, exp, soc] = load - solar
     A_bal = hstack([-I, I, I, -I, Z], format="csr")
     b_bal = load - solar
 
-    # Battery dynamics: soc[t] - soc[t-1] - charge*eff*dt + discharge/eff*dt = 0
-    # soc block: I - shift_down(I) = I + diags([-1], [-1])
+    # Battery dynamics with per-step durations
     soc_block = speye(n, format="csr") + diags([-1.0], [-1], shape=(n, n), format="csr")
     A_dyn = hstack([
-        -efficiency * dt * I,      # charge
-        (dt / efficiency) * I,     # discharge
+        -efficiency * D,           # charge * eff * dt[t]
+        (1.0 / efficiency) * D,    # discharge / eff * dt[t]
         Z, Z,                      # grid_import, grid_export (zero)
         soc_block,                 # soc
     ], format="csr")
@@ -181,14 +184,12 @@ class OracleStrategy(BaseEnergyStrategy):
             tariff.get_export_rate(int(h) % 24) for h in hours
         ])
 
-        dt = float(durations[0]) if len(durations) > 0 else 1.0 / 60.0
-
         self.lp_result = solve_oracle_lp(
             solar=solar,
             load=load,
             import_rates=import_rates,
             export_rates=export_rates,
-            dt=dt,
+            dt=durations,
             battery_capacity=battery.capacity,
             max_charge_rate=min(battery.max_charge_rate, self.max_charge_power),
             max_discharge_rate=battery.max_discharge_rate,

@@ -274,10 +274,12 @@ class SimulationService:
             elif strategy_id == "oracle":
                 timestamps = load_df.index
                 solar_kw = np.array([
-                    solar_df["state"].get(ts, 0.0) / 1000.0 for ts in timestamps
+                    solar.get_generation_safe(ts, default=0.0) / 1000.0
+                    for ts in timestamps
                 ])
                 load_kw = np.array([
-                    load_df["state"].get(ts, 0.0) / 1000.0 for ts in timestamps
+                    load.get_load_safe(ts, default=0.0) / 1000.0
+                    for ts in timestamps
                 ])
                 hours = np.array([ts.hour for ts in timestamps])
                 diffs = pd.Series(timestamps).diff().dt.total_seconds() / 3600.0
