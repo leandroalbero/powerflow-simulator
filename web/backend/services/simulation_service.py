@@ -7,6 +7,8 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
+import numpy as np
+import pandas as pd
 import pytz
 
 from src.domain.battery.models import Battery
@@ -15,12 +17,17 @@ from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.solar_generator.solar_generator import SolarGenerator
+from src.domain.strategy.forecast_loader import load_daily_forecasts
 from src.domain.strategy.model import (
+    ForecastChargeStrategy,
     ForceChargeAtNightStrategy,
     ForceChargeAtValleyStrategy,
     ForceChargeValleyAndPrePeakStrategy,
     SelfConsumeStrategy,
+    SmartDischargeStrategy,
+    ValleyChargePeakDischargeStrategy,
 )
+from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
     BatteryConfig,
     GridConfig,
@@ -60,6 +67,30 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         description="Charge battery during valley and pre-peak shoulder windows. "
         "Discharge during peak hours for maximum savings.",
     ),
+    StrategyInfo(
+        id="forecast_charge",
+        name="Forecast Charge",
+        description="Uses day-ahead solar irradiance forecasts to set night charge target. "
+        "Skips charging on sunny days, charges fully on cloudy days.",
+    ),
+    StrategyInfo(
+        id="smart_discharge",
+        name="Smart Discharge",
+        description="Charge at valley, discharge morning shoulder + evening peak. "
+        "Morning discharge creates room for solar; holds battery for evening when solar is gone.",
+    ),
+    StrategyInfo(
+        id="valley_charge_peak_discharge",
+        name="Valley Charge, Peak Discharge",
+        description="Charge at cheapest valley rate, discharge only during peak-rate hours. "
+        "Preserves battery for highest-value periods instead of wasting on shoulder.",
+    ),
+    StrategyInfo(
+        id="oracle",
+        name="Oracle Optimizer",
+        description="Computes the theoretical minimum cost using linear programming with "
+        "perfect foresight. Not deployable — serves as a benchmark.",
+    ),
 ]
 
 STRATEGY_MAP = {s.id: s for s in STRATEGY_REGISTRY}
@@ -70,6 +101,10 @@ _STRATEGY_CLASSES = {
     "charge_night": ForceChargeAtNightStrategy,
     "force_valleys": ForceChargeAtValleyStrategy,
     "force_valleys_pre_peak": ForceChargeValleyAndPrePeakStrategy,
+    "forecast_charge": ForecastChargeStrategy,
+    "smart_discharge": SmartDischargeStrategy,
+    "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
+    "oracle": OracleStrategy,
 }
 
 
@@ -189,6 +224,11 @@ class SimulationService:
         # Fetch data once (shared across strategies — read only)
         solar_df, load_df = self.data_service.get_filtered_data(start, end)
 
+        # Load forecasts once if needed (shared across threads)
+        daily_forecasts = (
+            load_daily_forecasts() if "forecast_charge" in strategy_ids else None
+        )
+
         for sid in strategy_ids:
             self._executor.submit(
                 self._run_strategy,
@@ -201,6 +241,7 @@ class SimulationService:
                 on_strategy_done,
                 on_run_done,
                 strategy_ids,
+                daily_forecasts,
             )
 
         return run_id
@@ -216,6 +257,7 @@ class SimulationService:
         on_strategy_done: Optional[StrategyDoneCallback],
         on_run_done: Optional[RunDoneCallback],
         all_strategy_ids: List[str],
+        daily_forecasts: Optional[Dict] = None,
     ) -> None:
         result = run.strategies[strategy_id]
         result.status = "running"
@@ -232,7 +274,27 @@ class SimulationService:
             if strategy_cls is None:
                 raise ValueError(f"Unknown strategy: {strategy_id}")
 
-            strategy = strategy_cls(battery, grid, tariff)
+            if strategy_id == "forecast_charge":
+                strategy = strategy_cls(battery, grid, tariff, daily_forecasts)
+            elif strategy_id == "oracle":
+                timestamps = load_df.index
+                solar_kw = np.array([
+                    solar_df["state"].get(ts, 0.0) / 1000.0 for ts in timestamps
+                ])
+                load_kw = np.array([
+                    load_df["state"].get(ts, 0.0) / 1000.0 for ts in timestamps
+                ])
+                hours = np.array([ts.hour for ts in timestamps])
+                diffs = pd.Series(timestamps).diff().dt.total_seconds() / 3600.0
+                diffs.iloc[0] = 1.0 / 60.0
+                durations = diffs.values
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    solar=solar_kw, load=load_kw,
+                    hours=hours, durations=durations,
+                )
+            else:
+                strategy = strategy_cls(battery, grid, tariff)
             # Apply strategy config
             sc = config.strategy
             strategy.min_battery_level = sc.min_battery_level
@@ -247,6 +309,8 @@ class SimulationService:
             last_reported = -1
 
             for i, timestamp in enumerate(timestamps):
+                if hasattr(strategy, 'current_date'):
+                    strategy.current_date = timestamp.date()
                 sim.step(timestamp, prev_timestamp)
                 prev_timestamp = timestamp
 
