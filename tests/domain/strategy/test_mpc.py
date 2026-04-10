@@ -98,3 +98,100 @@ class TestLoadHourlyGhiForecasts:
         d = date(2024, 6, 15)
         if d in forecasts:
             assert forecasts[d].get(12, 0.0) > 0
+
+
+from datetime import timedelta
+from src.domain.battery.models import Battery
+from src.domain.grid.model import Grid
+from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection
+from src.domain.strategy.model import EnergyFlow
+from src.domain.strategy.mpc import MpcStrategy, SolarForecaster
+
+
+class TestMpcStrategy:
+    @pytest.fixture
+    def tariff(self):
+        schedule = {
+            (0, 8): Rate(price=0.085, energy_direction=EnergyDirection.IMPORT),
+            (8, 10): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (10, 14): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
+            (14, 18): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (18, 22): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
+            (22, 24): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
+            (0, 24): Rate(price=0.08, energy_direction=EnergyDirection.EXPORT),
+        }
+        return PowerTariff(rate_schedule=schedule)
+
+    @pytest.fixture
+    def battery(self):
+        return Battery(capacity=15.0, max_charge_rate=4.8, max_discharge_rate=4.8, efficiency=0.95)
+
+    @pytest.fixture
+    def grid(self):
+        return Grid(max_import=5.0, max_export=5.0)
+
+    @pytest.fixture
+    def load_forecaster(self):
+        idx = pd.date_range("2024-06-01", periods=28 * 24, freq="h", tz=LOCAL_TZ)
+        df = pd.DataFrame({"state": [1500.0] * len(idx)}, index=idx)
+        return LoadForecaster(df)
+
+    @pytest.fixture
+    def solar_forecaster(self):
+        from datetime import date as date_cls
+        forecasts = {}
+        for day_offset in range(60):
+            d = date_cls(2024, 6, 1) + timedelta(days=day_offset)
+            hourly = {}
+            for h in range(24):
+                if 8 <= h <= 16:
+                    ghi = max(0, 600 - abs(h - 12) * 100)
+                else:
+                    ghi = 0.0
+                hourly[h] = ghi
+            forecasts[d] = hourly
+        return SolarForecaster(forecasts)
+
+    def test_returns_valid_flow(self, battery, grid, tariff, load_forecaster, solar_forecaster):
+        strategy = MpcStrategy(
+            battery=battery, grid=grid, tariff=tariff,
+            load_forecaster=load_forecaster,
+            solar_forecaster=solar_forecaster,
+        )
+        ts = pd.Timestamp("2024-06-15 10:00", tz=LOCAL_TZ)
+        strategy.set_timestamp(ts)
+        flows = strategy.calculate_energy_flows(3.0, 1.5, 10, 1.0 / 60.0)
+        assert isinstance(flows, EnergyFlow)
+
+    def test_resolves_at_15min_intervals(self, battery, grid, tariff, load_forecaster, solar_forecaster):
+        strategy = MpcStrategy(
+            battery=battery, grid=grid, tariff=tariff,
+            load_forecaster=load_forecaster,
+            solar_forecaster=solar_forecaster,
+        )
+        ts1 = pd.Timestamp("2024-06-15 10:00", tz=LOCAL_TZ)
+        strategy.set_timestamp(ts1)
+        strategy.calculate_energy_flows(3.0, 1.5, 10, 1.0 / 60.0)
+        solves_after_first = strategy._solve_count
+
+        for i in range(1, 14):
+            ts = ts1 + timedelta(minutes=i)
+            strategy.set_timestamp(ts)
+            strategy.calculate_energy_flows(3.0, 1.5, 10, 1.0 / 60.0)
+        assert strategy._solve_count == solves_after_first
+
+        ts2 = ts1 + timedelta(minutes=15)
+        strategy.set_timestamp(ts2)
+        strategy.calculate_energy_flows(3.0, 1.5, 10, 1.0 / 60.0)
+        assert strategy._solve_count == solves_after_first + 1
+
+    def test_charges_during_valley(self, battery, grid, tariff, load_forecaster, solar_forecaster):
+        strategy = MpcStrategy(
+            battery=battery, grid=grid, tariff=tariff,
+            load_forecaster=load_forecaster,
+            solar_forecaster=solar_forecaster,
+        )
+        ts = pd.Timestamp("2024-06-15 03:00", tz=LOCAL_TZ)
+        strategy.set_timestamp(ts)
+        flows = strategy.calculate_energy_flows(0.0, 1.5, 3, 1.0 / 60.0)
+        assert flows.battery_charge > 0 or flows.grid_import > 0
