@@ -32,6 +32,8 @@ from src.domain.strategy.mpc import (
     SolarForecaster,
     load_hourly_ghi_forecasts,
 )
+from src.domain.strategy.dqn.agent import DqnAgent
+from src.domain.strategy.dqn_strategy import DqnStrategy
 from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
     StrategyInfo,
@@ -98,6 +100,12 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         description="Rolling 24h LP with solar forecasts and learned load profiles. "
         "Re-solves every 15 minutes. Deployable in real-time.",
     ),
+    StrategyInfo(
+        id="dqn_agent",
+        name="DQN Agent",
+        description="Deep Q-Network reinforcement learning agent trained on historical data. "
+        "Uses learned policy for charge/discharge decisions.",
+    ),
 ]
 
 STRATEGY_MAP = {s.id: s for s in STRATEGY_REGISTRY}
@@ -113,6 +121,7 @@ _STRATEGY_CLASSES = {
     "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
     "oracle": OracleStrategy,
     "mpc": MpcStrategy,
+    "dqn_agent": DqnStrategy,
 }
 
 
@@ -297,6 +306,13 @@ class SimulationService:
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
                 )
+            elif strategy_id == "dqn_agent":
+                import os
+                agent = DqnAgent(state_dim=16, action_dim=9)
+                model_path = "output_files/dqn_policy.pt"
+                if os.path.exists(model_path):
+                    agent.load(model_path)
+                strategy = strategy_cls(battery, grid, tariff, agent=agent)
             elif strategy_id == "oracle":
                 # Resample to 5-min (inverter granularity) for tight LP
                 solar_5m = solar_df.resample("5min").mean().fillna(0.0)
