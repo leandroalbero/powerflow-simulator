@@ -175,7 +175,8 @@ class OracleStrategy(BaseEnergyStrategy):
         durations: np.ndarray,
     ):
         super().__init__(battery, grid, tariff)
-        self._step = 0
+        self._elapsed_hours = 0.0
+        self._n_lp = len(solar)
 
         import_rates = np.array([
             tariff.get_import_rate(int(h) % 24) for h in hours
@@ -198,8 +199,8 @@ class OracleStrategy(BaseEnergyStrategy):
             min_soc_frac=self.min_battery_level,
         )
 
-        self._solar = solar
-        self._load = load
+        # Precompute cumulative hours for LP step lookup
+        self._lp_cum_hours = np.cumsum(durations)
 
     def calculate_energy_flows(
         self, solar_power: float, load_power: float, hour: int, duration: float,
@@ -207,14 +208,15 @@ class OracleStrategy(BaseEnergyStrategy):
         if duration == 0:
             raise ZeroDivisionError("Duration cannot be zero")
 
-        t = self._step
-        n = len(self._solar)
+        # Map simulator's minute-resolution calls to the correct LP hourly step
+        t = int(np.searchsorted(self._lp_cum_hours, self._elapsed_hours, side="right"))
+        t = min(t, self._n_lp - 1)
+        self._elapsed_hours += duration
 
-        if t >= n or not self.lp_result.success:
+        if t >= self._n_lp or not self.lp_result.success:
             flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
             self._handle_remaining_solar(flows, duration)
             self._handle_remaining_load(flows, duration)
-            self._step += 1
             return flows
 
         lp = self.lp_result
@@ -224,9 +226,9 @@ class OracleStrategy(BaseEnergyStrategy):
         load_energy = load_power * duration
         flows.direct_solar = min(solar_energy, load_energy)
 
-        # Replay LP decisions directly — bypass Battery/Grid objects to avoid
-        # divergence between LP's linear model and the real battery's nonlinear
-        # tapering. The LP already accounts for efficiency in its constraints.
+        # Replay LP decisions — power levels from LP, scaled to this sub-step duration.
+        # LP decided charge/discharge at power level X (kW) for the full hour.
+        # We apply the same power level for this sub-step.
         flows.battery_charge = float(lp.charge[t])
         flows.battery_discharge = float(lp.discharge[t])
         flows.grid_import = float(lp.grid_import[t])
@@ -235,5 +237,4 @@ class OracleStrategy(BaseEnergyStrategy):
         # Keep battery SoC in sync for timeseries tracking
         self.battery.current_charge = float(lp.soc[t])
 
-        self._step += 1
         return flows
