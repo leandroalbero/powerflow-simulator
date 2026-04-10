@@ -32,8 +32,6 @@ from src.domain.strategy.mpc import (
     SolarForecaster,
     load_hourly_ghi_forecasts,
 )
-from src.domain.strategy.dqn.agent import DqnAgent
-from src.domain.strategy.dqn_strategy import DqnStrategy
 from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
     StrategyInfo,
@@ -121,7 +119,7 @@ _STRATEGY_CLASSES = {
     "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
     "oracle": OracleStrategy,
     "mpc": MpcStrategy,
-    "dqn_agent": DqnStrategy,
+    # dqn_agent: lazy-imported in _run_strategy to avoid torch import at startup
 }
 
 
@@ -293,7 +291,7 @@ class SimulationService:
             solar = SolarGenerator(solar_df)
 
             strategy_cls = _STRATEGY_CLASSES.get(strategy_id)
-            if strategy_cls is None:
+            if strategy_cls is None and strategy_id != "dqn_agent":
                 raise ValueError(f"Unknown strategy: {strategy_id}")
 
             if strategy_id == "forecast_charge":
@@ -308,11 +306,13 @@ class SimulationService:
                 )
             elif strategy_id == "dqn_agent":
                 import os
+                from src.domain.strategy.dqn.agent import DqnAgent
+                from src.domain.strategy.dqn_strategy import DqnStrategy as DqnStrategyCls
                 agent = DqnAgent(state_dim=16, action_dim=9)
                 model_path = "output_files/dqn_policy.pt"
                 if os.path.exists(model_path):
                     agent.load(model_path)
-                strategy = strategy_cls(battery, grid, tariff, agent=agent)
+                strategy = DqnStrategyCls(battery, grid, tariff, agent=agent)
             elif strategy_id == "oracle":
                 # Resample to 5-min (inverter granularity) for tight LP
                 solar_5m = solar_df.resample("5min").mean().fillna(0.0)
