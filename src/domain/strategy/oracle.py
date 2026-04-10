@@ -5,7 +5,8 @@ from typing import Optional
 
 import numpy as np
 from scipy.optimize import linprog  # type: ignore[import-untyped]
-from scipy.sparse import lil_matrix  # type: ignore[import-untyped]
+from scipy.sparse import diags, hstack, vstack  # type: ignore[import-untyped]
+from scipy.sparse import eye as speye  # type: ignore[import-untyped]
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
@@ -79,51 +80,53 @@ def solve_oracle_lp(
     c[idx_imp] = import_rates * dt
     c[idx_exp] = -export_rates * dt
 
-    # Equality constraints (sparse):
-    # 1. Energy balance: -charge + discharge + grid_import - grid_export = load - solar
-    # 2. Battery dynamics: soc[t] - soc[t-1] - charge[t]*eff*dt + discharge[t]/eff*dt = 0
-    #    For t=0: soc[0] - charge[0]*eff*dt + discharge[0]/eff*dt = initial_soc_kwh
+    # Equality constraints built with sparse diagonal ops (vectorized, no Python loop).
+    #
+    # Row block 1 (energy balance, n rows):
+    #   -charge + discharge + grid_import - grid_export = load - solar
+    # Row block 2 (battery dynamics, n rows):
+    #   soc[t] - soc[t-1] - charge[t]*eff*dt + discharge[t]/eff*dt = 0
+    #   For t=0: soc[0] - charge[0]*eff*dt + discharge[0]/eff*dt = initial_soc_kwh
 
-    n_eq = 2 * n
-    A_eq = lil_matrix((n_eq, nc))
-    b_eq = np.zeros(n_eq)
+    I = speye(n, format="csr")  # noqa: E741
+    Z = speye(n, format="csr") * 0  # zero block
 
-    for t in range(n):
-        # Energy balance row
-        row = t
-        A_eq[row, t] = -1.0               # charge
-        A_eq[row, n + t] = 1.0            # discharge
-        A_eq[row, 2 * n + t] = 1.0        # grid_import
-        A_eq[row, 3 * n + t] = -1.0       # grid_export
-        b_eq[row] = load[t] - solar[t]
+    # Energy balance: [-I, +I, +I, -I, 0] @ [ch, dis, imp, exp, soc] = load - solar
+    A_bal = hstack([-I, I, I, -I, Z], format="csr")
+    b_bal = load - solar
 
-        # Battery dynamics row
-        row = n + t
-        A_eq[row, 4 * n + t] = 1.0        # soc[t]
-        if t > 0:
-            A_eq[row, 4 * n + t - 1] = -1.0  # -soc[t-1]
-        A_eq[row, t] = -efficiency * dt          # -charge * eff * dt
-        A_eq[row, n + t] = dt / efficiency       # +discharge / eff * dt
-        if t == 0:
-            b_eq[row] = initial_soc * battery_capacity
-        else:
-            b_eq[row] = 0.0
+    # Battery dynamics: soc[t] - soc[t-1] - charge*eff*dt + discharge/eff*dt = 0
+    # soc block: I - shift_down(I) = I + diags([-1], [-1])
+    soc_block = speye(n, format="csr") + diags([-1.0], [-1], shape=(n, n), format="csr")
+    A_dyn = hstack([
+        -efficiency * dt * I,      # charge
+        (dt / efficiency) * I,     # discharge
+        Z, Z,                      # grid_import, grid_export (zero)
+        soc_block,                 # soc
+    ], format="csr")
+    b_dyn = np.zeros(n)
+    b_dyn[0] = initial_soc * battery_capacity
 
-    A_eq_csr = A_eq.tocsr()
+    A_eq_csr = vstack([A_bal, A_dyn], format="csr")
+    b_eq = np.concatenate([b_bal, b_dyn])
 
-    # Bounds
-    bounds: list[tuple[float, Optional[float]]] = []
-    for t in range(n):
-        bounds.append((0, max_charge_rate))      # charge
-    for t in range(n):
-        bounds.append((0, max_discharge_rate))   # discharge
-    for t in range(n):
-        bounds.append((0, None))                 # grid_import
-    for t in range(n):
-        bounds.append((0, None))                 # grid_export
-    for t in range(n):
-        min_soc = min_soc_frac * battery_capacity
-        bounds.append((min_soc, battery_capacity))  # soc
+    # Bounds (vectorized)
+    min_soc = min_soc_frac * battery_capacity
+    lb = np.concatenate([
+        np.zeros(n),                          # charge >= 0
+        np.zeros(n),                          # discharge >= 0
+        np.zeros(n),                          # grid_import >= 0
+        np.zeros(n),                          # grid_export >= 0
+        np.full(n, min_soc),                  # soc >= min_soc
+    ])
+    ub = np.concatenate([
+        np.full(n, max_charge_rate),          # charge <= max_charge_rate
+        np.full(n, max_discharge_rate),       # discharge <= max_discharge_rate
+        np.full(n, np.inf),                   # grid_import (unbounded)
+        np.full(n, np.inf),                   # grid_export (unbounded)
+        np.full(n, battery_capacity),         # soc <= capacity
+    ])
+    bounds = list(zip(lb, ub))
 
     result = linprog(
         c, A_eq=A_eq_csr, b_eq=b_eq, bounds=bounds,
@@ -220,27 +223,16 @@ class OracleStrategy(BaseEnergyStrategy):
         load_energy = load_power * duration
         flows.direct_solar = min(solar_energy, load_energy)
 
-        charge_power = lp.charge[t]
-        discharge_power = lp.discharge[t]
+        # Replay LP decisions directly — bypass Battery/Grid objects to avoid
+        # divergence between LP's linear model and the real battery's nonlinear
+        # tapering. The LP already accounts for efficiency in its constraints.
+        flows.battery_charge = float(lp.charge[t])
+        flows.battery_discharge = float(lp.discharge[t])
+        flows.grid_import = float(lp.grid_import[t])
+        flows.grid_export = float(lp.grid_export[t])
 
-        if charge_power > 1e-6:
-            actual_charged = float(self.battery.charge(charge_power, duration))
-            flows.battery_charge = actual_charged
-            flows.grid_import += actual_charged
-
-        if discharge_power > 1e-6:
-            actual_discharged = float(self.battery.discharge(discharge_power, duration))
-            flows.battery_discharge = actual_discharged
-
-        remaining_load = load_energy - flows.direct_solar - flows.battery_discharge * duration
-        if remaining_load > 1e-6:
-            imported = float(self.grid.import_power(remaining_load / duration, duration))
-            flows.grid_import += imported
-
-        remaining_solar = solar_energy - flows.direct_solar - flows.battery_charge * duration
-        if remaining_solar > 1e-6:
-            exported = float(self.grid.export_power(remaining_solar / duration, duration))
-            flows.grid_export = exported
+        # Keep battery SoC in sync for timeseries tracking
+        self.battery.current_charge = float(lp.soc[t])
 
         self._step += 1
         return flows
