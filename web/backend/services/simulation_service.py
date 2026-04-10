@@ -272,23 +272,19 @@ class SimulationService:
             if strategy_id == "forecast_charge":
                 strategy = strategy_cls(battery, grid, tariff, daily_forecasts)
             elif strategy_id == "oracle":
-                timestamps = load_df.index
-                solar_kw = np.array([
-                    solar.get_generation_safe(ts, default=0.0) / 1000.0
-                    for ts in timestamps
-                ])
-                load_kw = np.array([
-                    load.get_load_safe(ts, default=0.0) / 1000.0
-                    for ts in timestamps
-                ])
-                hours = np.array([ts.hour for ts in timestamps])
-                diffs = pd.Series(timestamps).diff().dt.total_seconds() / 3600.0
-                diffs.iloc[0] = 1.0 / 60.0
-                durations = diffs.values
+                # Resample to hourly for tractable LP (800K steps -> ~20K)
+                solar_hourly = solar_df.resample("1h").mean().fillna(0.0)
+                load_hourly = load_df.resample("1h").mean().fillna(0.0)
+                # Align to common index
+                common_idx = solar_hourly.index.intersection(load_hourly.index)
+                solar_kw = solar_hourly.loc[common_idx, "state"].values / 1000.0
+                load_kw = load_hourly.loc[common_idx, "state"].values / 1000.0
+                hours_arr = np.array([ts.hour for ts in common_idx])
+                durations = np.ones(len(common_idx))  # 1 hour each
                 strategy = strategy_cls(
                     battery, grid, tariff,
                     solar=solar_kw, load=load_kw,
-                    hours=hours, durations=durations,
+                    hours=hours_arr, durations=durations,
                 )
             else:
                 strategy = strategy_cls(battery, grid, tariff)
