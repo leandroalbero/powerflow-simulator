@@ -62,6 +62,28 @@ class SolarForecaster:
         return forecast
 
 
+class PerfectSolarForecaster:
+    """Uses actual solar data for backtesting — perfect foresight solar forecast."""
+
+    def __init__(self, solar_df: pd.DataFrame) -> None:
+        # Resample to 15-min mean, convert W -> kW
+        resampled = solar_df[["state"]].resample("15min").mean().fillna(0.0)
+        self._solar_kw = resampled["state"] / 1000.0  # Series, W -> kW
+
+    def forecast_24h(
+        self, start: pd.Timestamp, steps: int = 96, step_minutes: int = 15,
+    ) -> np.ndarray:
+        forecast = np.zeros(steps)
+        start_rounded = start.floor("15min")
+        for i in range(steps):
+            idx_pos = self._solar_kw.index.get_indexer(
+                [start_rounded + timedelta(minutes=i * step_minutes)], method="nearest"
+            )
+            if idx_pos[0] >= 0:
+                forecast[i] = float(self._solar_kw.iloc[idx_pos[0]])
+        return forecast
+
+
 IRRADIANCE_DIR = Path("data/irradiance")
 
 

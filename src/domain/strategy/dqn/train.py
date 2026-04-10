@@ -68,27 +68,43 @@ def build_monthly_episodes(
     return episodes
 
 
+REWARD_SCALE = 10.0  # Amplify reward signal (hourly costs are tiny: 0.01-0.18 EUR)
+
+
 def train(episodes: int = 200, output: str = "output_files/dqn_policy.pt") -> None:
-    print("Loading data...")
+    import random
+
+    print("Loading data...", flush=True)
     solar_df, load_df = load_data()
     episode_data = build_monthly_episodes(solar_df, load_df)
-    print(f"Built {len(episode_data)} monthly episodes")
+    print(f"Built {len(episode_data)} monthly episodes", flush=True)
 
-    agent = DqnAgent(state_dim=16, action_dim=9, device="cpu")
+    agent = DqnAgent(
+        state_dim=16, action_dim=9, device="cpu",
+        lr=1e-3, batch_size=128, buffer_size=200_000,
+        target_update_freq=500,
+    )
 
     epsilon = 1.0
     epsilon_min = 0.05
-    epsilon_decay = (epsilon - epsilon_min) / min(episodes, 100)
-    best_reward = -float("inf")
+    epsilon_decay = (epsilon - epsilon_min) / min(episodes, 150)
+    best_avg_reward = -float("inf")
+
+    # Track rolling average over last 10 episodes for stable model selection
+    recent_rewards: list[float] = []
 
     for ep in range(episodes):
-        ep_data = episode_data[ep % len(episode_data)]
+        ep_data = random.choice(episode_data)
+
+        # Randomize initial SoC for generalization
+        init_soc = random.uniform(0.1, 0.5)
+
         env = BatteryEnv(
             solar=ep_data["solar"], load=ep_data["load"],
             hours=ep_data["hours"], import_rates=ep_data["import_rates"],
             export_rate=0.08, battery_capacity=15.0,
             max_charge_rate=4.8, max_discharge_rate=4.8,
-            efficiency=0.95, initial_soc=0.1, min_soc_frac=0.1, dt=1.0,
+            efficiency=0.95, initial_soc=init_soc, min_soc_frac=0.1, dt=1.0,
         )
 
         state = env.reset()
@@ -99,12 +115,15 @@ def train(episodes: int = 200, output: str = "output_files/dqn_policy.pt") -> No
         while True:
             action = agent.select_action(state, epsilon)
             next_state, reward, done, _ = env.step(action)
-            agent.store_transition(state, action, reward, next_state, done)
+            # Scale reward for better gradient signal
+            agent.store_transition(state, action, reward * REWARD_SCALE, next_state, done)
 
-            loss = agent.train_step()
-            if loss is not None:
-                total_loss += loss
-                loss_count += 1
+            # Multiple training steps per env step for faster learning
+            for _ in range(4):
+                loss = agent.train_step()
+                if loss is not None:
+                    total_loss += loss
+                    loss_count += 1
 
             total_reward += reward
             state = next_state
@@ -114,21 +133,31 @@ def train(episodes: int = 200, output: str = "output_files/dqn_policy.pt") -> No
         epsilon = max(epsilon_min, epsilon - epsilon_decay)
         avg_loss = total_loss / max(loss_count, 1)
 
-        if total_reward > best_reward:
-            best_reward = total_reward
+        # Rolling average for stable model selection
+        recent_rewards.append(total_reward)
+        if len(recent_rewards) > 10:
+            recent_rewards.pop(0)
+        avg_recent = np.mean(recent_rewards)
+
+        if len(recent_rewards) >= 10 and avg_recent > best_avg_reward:
+            best_avg_reward = avg_recent
             agent.save(output)
 
-        if (ep + 1) % 10 == 0:
+        if (ep + 1) % 20 == 0:
             print(
                 f"Episode {ep+1}/{episodes} | "
                 f"Reward: {total_reward:.2f} | "
-                f"Best: {best_reward:.2f} | "
-                f"Loss: {avg_loss:.4f} | "
-                f"Epsilon: {epsilon:.3f}"
+                f"Avg10: {avg_recent:.2f} | "
+                f"Best Avg: {best_avg_reward:.2f} | "
+                f"Loss: {avg_loss:.6f} | "
+                f"Eps: {epsilon:.3f}",
+                flush=True,
             )
 
-    print(f"\nTraining complete. Best reward: {best_reward:.2f}")
-    print(f"Model saved to {output}")
+    # Final save
+    agent.save(output)
+    print(f"\nTraining complete. Best avg reward: {best_avg_reward:.2f}", flush=True)
+    print(f"Model saved to {output}", flush=True)
 
 
 if __name__ == "__main__":

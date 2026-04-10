@@ -29,6 +29,7 @@ from src.domain.strategy.model import (
 from src.domain.strategy.mpc import (
     LoadForecaster,
     MpcStrategy,
+    PerfectSolarForecaster,
     SolarForecaster,
     load_hourly_ghi_forecasts,
 )
@@ -99,6 +100,12 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         "Re-solves every 15 minutes. Deployable in real-time.",
     ),
     StrategyInfo(
+        id="mpc_perfect",
+        name="MPC (Perfect Solar)",
+        description="MPC with perfect solar foresight — uses actual solar data instead of "
+        "GHI forecast. Shows MPC ceiling without forecast error.",
+    ),
+    StrategyInfo(
         id="dqn_agent",
         name="DQN Agent",
         description="Deep Q-Network reinforcement learning agent trained on historical data. "
@@ -119,6 +126,7 @@ _STRATEGY_CLASSES = {
     "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
     "oracle": OracleStrategy,
     "mpc": MpcStrategy,
+    "mpc_perfect": MpcStrategy,
     # dqn_agent: lazy-imported in _run_strategy to avoid torch import at startup
 }
 
@@ -299,6 +307,14 @@ class SimulationService:
             elif strategy_id == "mpc":
                 load_forecaster = LoadForecaster(load_df)
                 solar_forecaster = SolarForecaster(hourly_ghi_forecasts or {})
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                )
+            elif strategy_id == "mpc_perfect":
+                load_forecaster = LoadForecaster(load_df)
+                solar_forecaster = PerfectSolarForecaster(solar_df)
                 strategy = strategy_cls(
                     battery, grid, tariff,
                     load_forecaster=load_forecaster,
