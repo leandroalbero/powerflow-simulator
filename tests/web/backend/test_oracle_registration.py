@@ -1,6 +1,5 @@
-import pytest
 
-from web.backend.services.simulation_service import STRATEGY_MAP, _STRATEGY_CLASSES
+from web.backend.services.simulation_service import _STRATEGY_CLASSES, STRATEGY_MAP
 
 
 class TestOracleRegistration:

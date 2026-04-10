@@ -3,7 +3,7 @@ import pytest
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.strategy.model import EnergyFlow
 from src.domain.strategy.oracle import OracleStrategy, solve_oracle_lp
 
@@ -114,9 +114,8 @@ class TestSolveOracleLp:
 
         assert result.success
         if result.charge[0] > 0.01 and result.discharge[1] > 0.01:
-            energy_in = result.charge[0] * 0.95 * dt
             energy_out = result.discharge[1] / 0.95 * dt
-            assert energy_out > result.discharge[1] * dt * 0.99
+            assert energy_out > result.discharge[1] * dt * 0.99  # round-trip loss
 
     def test_min_soc_respected(self):
         """Battery should not discharge below min_soc."""
@@ -239,7 +238,6 @@ class TestOracleStrategy:
 
         for i in range(4):
             flows = strategy.calculate_energy_flows(solar[i], load[i], hours[i], durations[i])
-            solar_energy = solar[i] * durations[i]
             load_energy = load[i] * durations[i]
             supply = flows.direct_solar + flows.grid_import * durations[i] + flows.battery_discharge * durations[i]
             demand = load_energy

@@ -1,10 +1,11 @@
 """Oracle strategy: LP-based optimal battery scheduling with perfect foresight."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
-from scipy.optimize import linprog
-from scipy.sparse import lil_matrix
+from scipy.optimize import linprog  # type: ignore[import-untyped]
+from scipy.sparse import lil_matrix  # type: ignore[import-untyped]
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
@@ -111,7 +112,7 @@ def solve_oracle_lp(
     A_eq_csr = A_eq.tocsr()
 
     # Bounds
-    bounds = []
+    bounds: list[tuple[float, Optional[float]]] = []
     for t in range(n):
         bounds.append((0, max_charge_rate))      # charge
     for t in range(n):

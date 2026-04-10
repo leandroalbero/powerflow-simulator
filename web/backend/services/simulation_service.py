@@ -3,7 +3,6 @@
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
@@ -19,22 +18,18 @@ from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.forecast_loader import load_daily_forecasts
 from src.domain.strategy.model import (
-    ForecastChargeStrategy,
     ForceChargeAtNightStrategy,
     ForceChargeAtValleyStrategy,
     ForceChargeValleyAndPrePeakStrategy,
+    ForecastChargeStrategy,
     SelfConsumeStrategy,
     SmartDischargeStrategy,
     ValleyChargePeakDischargeStrategy,
 )
 from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
-    BatteryConfig,
-    GridConfig,
     StrategyInfo,
-    StrategyMetrics,
     SystemConfig,
-    TariffConfig,
 )
 from web.backend.services.data_service import DataService
 
@@ -250,8 +245,8 @@ class SimulationService:
         self,
         run: SimulationRun,
         strategy_id: str,
-        solar_df,
-        load_df,
+        solar_df: pd.DataFrame,
+        load_df: pd.DataFrame,
         config: SystemConfig,
         on_progress: Optional[ProgressCallback],
         on_strategy_done: Optional[StrategyDoneCallback],
