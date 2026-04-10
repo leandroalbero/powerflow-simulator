@@ -66,21 +66,30 @@ class PerfectSolarForecaster:
     """Uses actual solar data for backtesting — perfect foresight solar forecast."""
 
     def __init__(self, solar_df: pd.DataFrame) -> None:
-        # Resample to 15-min mean, convert W -> kW
+        # Resample to 15-min mean, convert W -> kW. Pre-index for fast lookup.
         resampled = solar_df[["state"]].resample("15min").mean().fillna(0.0)
-        self._solar_kw = resampled["state"] / 1000.0  # Series, W -> kW
+        self._solar_kw = (resampled["state"] / 1000.0).values  # numpy array
+        self._start_ts = resampled.index[0] if len(resampled) > 0 else None
+        self._n = len(self._solar_kw)
 
     def forecast_24h(
         self, start: pd.Timestamp, steps: int = 96, step_minutes: int = 15,
     ) -> np.ndarray:
+        if self._start_ts is None or self._n == 0:
+            return np.zeros(steps)
+        # Fast integer index: compute offset from series start
+        offset_min = (start - self._start_ts).total_seconds() / 60.0
+        start_idx = int(round(offset_min / 15.0))
+        end_idx = start_idx + steps
+        if start_idx < 0:
+            start_idx = 0
+        if end_idx > self._n:
+            end_idx = self._n
+        valid = end_idx - start_idx
+        if valid <= 0:
+            return np.zeros(steps)
         forecast = np.zeros(steps)
-        start_rounded = start.floor("15min")
-        for i in range(steps):
-            idx_pos = self._solar_kw.index.get_indexer(
-                [start_rounded + timedelta(minutes=i * step_minutes)], method="nearest"
-            )
-            if idx_pos[0] >= 0:
-                forecast[i] = float(self._solar_kw.iloc[idx_pos[0]])
+        forecast[:valid] = self._solar_kw[start_idx:end_idx]
         return forecast
 
 
