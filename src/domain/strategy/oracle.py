@@ -39,6 +39,8 @@ def solve_oracle_lp(
     efficiency: float,
     initial_soc: float,
     min_soc_frac: float,
+    max_grid_import: float = 5.0,
+    max_grid_export: float = 5.0,
 ) -> OracleLpResult:
     """Solve for the cost-minimizing battery schedule with perfect foresight.
 
@@ -49,11 +51,13 @@ def solve_oracle_lp(
         export_rates: Grid export price per step (EUR/kWh).
         dt: Duration of each timestep (hours). Scalar or per-step array.
         battery_capacity: Battery capacity (kWh).
-        max_charge_rate: Max charge power (kW).
+        max_charge_rate: Max charge power from grid (kW).
         max_discharge_rate: Max discharge power (kW).
         efficiency: One-way battery efficiency (0-1).
         initial_soc: Initial state of charge as fraction (0-1).
         min_soc_frac: Minimum SoC as fraction of capacity.
+        max_grid_import: Grid import power limit (kW).
+        max_grid_export: Grid export power limit (kW).
 
     Returns:
         OracleLpResult with optimal schedule and cost.
@@ -113,7 +117,7 @@ def solve_oracle_lp(
     A_eq_csr = vstack([A_bal, A_dyn], format="csr")
     b_eq = np.concatenate([b_bal, b_dyn])
 
-    # Bounds (vectorized)
+    # Bounds (vectorized) — includes grid import/export caps
     min_soc = min_soc_frac * battery_capacity
     lb = np.concatenate([
         np.zeros(n),                          # charge >= 0
@@ -125,8 +129,8 @@ def solve_oracle_lp(
     ub = np.concatenate([
         np.full(n, max_charge_rate),          # charge <= max_charge_rate
         np.full(n, max_discharge_rate),       # discharge <= max_discharge_rate
-        np.full(n, np.inf),                   # grid_import (unbounded)
-        np.full(n, np.inf),                   # grid_export (unbounded)
+        np.full(n, max_grid_import),          # grid_import <= grid cap
+        np.full(n, max_grid_export),          # grid_export <= grid cap
         np.full(n, battery_capacity),         # soc <= capacity
     ])
     bounds = list(zip(lb, ub))
@@ -192,11 +196,13 @@ class OracleStrategy(BaseEnergyStrategy):
             export_rates=export_rates,
             dt=durations,
             battery_capacity=battery.capacity,
-            max_charge_rate=min(battery.max_charge_rate, self.max_charge_power),
+            max_charge_rate=battery.max_charge_rate,
             max_discharge_rate=battery.max_discharge_rate,
             efficiency=battery.efficiency,
             initial_soc=battery.current_charge / battery.capacity,
             min_soc_frac=self.min_battery_level,
+            max_grid_import=grid.max_import,
+            max_grid_export=grid.max_export,
         )
 
         # Precompute cumulative hours for LP step lookup
