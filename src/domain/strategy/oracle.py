@@ -6,6 +6,11 @@ import numpy as np
 from scipy.optimize import linprog
 from scipy.sparse import lil_matrix
 
+from src.domain.battery.models import Battery
+from src.domain.grid.model import Grid
+from src.domain.power_tariff.model import PowerTariff
+from src.domain.strategy.model import BaseEnergyStrategy, EnergyFlow
+
 
 @dataclass
 class OracleLpResult:
@@ -142,3 +147,99 @@ def solve_oracle_lp(
         grid_export=x[idx_exp],
         soc=x[idx_soc],
     )
+
+
+class OracleStrategy(BaseEnergyStrategy):
+    """Strategy that replays LP-optimal decisions step by step.
+
+    Unlike other strategies, this requires the full simulation timeseries
+    upfront. It solves the LP at construction time and then replays the
+    precomputed schedule on each call to calculate_energy_flows().
+    """
+
+    def __init__(
+        self,
+        battery: Battery,
+        grid: Grid,
+        tariff: PowerTariff,
+        solar: np.ndarray,
+        load: np.ndarray,
+        hours: np.ndarray,
+        durations: np.ndarray,
+    ):
+        super().__init__(battery, grid, tariff)
+        self._step = 0
+
+        import_rates = np.array([
+            tariff.get_import_rate(int(h) % 24) for h in hours
+        ])
+        export_rates = np.array([
+            tariff.get_export_rate(int(h) % 24) for h in hours
+        ])
+
+        dt = float(durations[0]) if len(durations) > 0 else 1.0 / 60.0
+
+        self.lp_result = solve_oracle_lp(
+            solar=solar,
+            load=load,
+            import_rates=import_rates,
+            export_rates=export_rates,
+            dt=dt,
+            battery_capacity=battery.capacity,
+            max_charge_rate=min(battery.max_charge_rate, self.max_charge_power),
+            max_discharge_rate=battery.max_discharge_rate,
+            efficiency=battery.efficiency,
+            initial_soc=battery.current_charge / battery.capacity,
+            min_soc_frac=self.min_battery_level,
+        )
+
+        self._solar = solar
+        self._load = load
+
+    def calculate_energy_flows(
+        self, solar_power: float, load_power: float, hour: int, duration: float,
+    ) -> EnergyFlow:
+        if duration == 0:
+            raise ZeroDivisionError("Duration cannot be zero")
+
+        t = self._step
+        n = len(self._solar)
+
+        if t >= n or not self.lp_result.success:
+            flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
+            self._handle_remaining_solar(flows, duration)
+            self._handle_remaining_load(flows, duration)
+            self._step += 1
+            return flows
+
+        lp = self.lp_result
+        flows = EnergyFlow()
+
+        solar_energy = solar_power * duration
+        load_energy = load_power * duration
+        flows.direct_solar = min(solar_energy, load_energy)
+
+        charge_power = lp.charge[t]
+        discharge_power = lp.discharge[t]
+
+        if charge_power > 1e-6:
+            actual_charged = float(self.battery.charge(charge_power, duration))
+            flows.battery_charge = actual_charged
+            flows.grid_import += actual_charged
+
+        if discharge_power > 1e-6:
+            actual_discharged = float(self.battery.discharge(discharge_power, duration))
+            flows.battery_discharge = actual_discharged
+
+        remaining_load = load_energy - flows.direct_solar - flows.battery_discharge * duration
+        if remaining_load > 1e-6:
+            imported = float(self.grid.import_power(remaining_load / duration, duration))
+            flows.grid_import += imported
+
+        remaining_solar = solar_energy - flows.direct_solar - flows.battery_charge * duration
+        if remaining_solar > 1e-6:
+            exported = float(self.grid.export_power(remaining_solar / duration, duration))
+            flows.grid_export = exported
+
+        self._step += 1
+        return flows
