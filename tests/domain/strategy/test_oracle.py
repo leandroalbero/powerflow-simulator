@@ -244,3 +244,65 @@ class TestOracleStrategy:
             supply = flows.direct_solar + flows.grid_import * durations[i] + flows.battery_discharge * durations[i]
             demand = load_energy
             assert supply >= demand - 1e-6, f"Step {i}: supply {supply:.4f} < demand {demand:.4f}"
+
+
+class TestOracleEndToEnd:
+    """Realistic scenario: one day with solar curve and varying load."""
+
+    def test_one_day_24_hours(self):
+        """Oracle over a 24h period should produce lower cost than naive grid import."""
+        n = 24
+        dt = 1.0
+        # Bell-curve solar: peaks at noon
+        solar = np.array([
+            0, 0, 0, 0, 0, 0,        # 00-05: night
+            0.1, 0.5, 1.5, 3.0,      # 06-09: sunrise
+            4.0, 4.5, 4.5, 4.0,      # 10-13: peak sun
+            3.0, 1.5, 0.5, 0.1,      # 14-17: sunset
+            0, 0, 0, 0, 0, 0,        # 18-23: night
+        ])
+        # Typical household: morning + evening peaks
+        load = np.array([
+            0.3, 0.3, 0.3, 0.3, 0.3, 0.5,   # 00-05
+            0.8, 1.2, 1.5, 1.0,               # 06-09
+            0.8, 0.8, 1.0, 0.8,               # 10-13
+            0.8, 1.0, 1.5, 2.0,               # 14-17
+            2.5, 2.0, 1.5, 1.0, 0.5, 0.3,    # 18-23
+        ])
+        import_rates = np.array([
+            0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085,  # valley
+            0.134, 0.134,                                              # shoulder
+            0.182, 0.182, 0.182, 0.182,                                # peak
+            0.134, 0.134, 0.134, 0.134,                                # shoulder
+            0.182, 0.182, 0.182, 0.182,                                # peak
+            0.134, 0.134,                                              # shoulder
+        ])
+        export_rates = np.full(n, 0.08)
+
+        result = solve_oracle_lp(
+            solar=solar, load=load,
+            import_rates=import_rates, export_rates=export_rates,
+            dt=dt,
+            battery_capacity=15.0,
+            max_charge_rate=4.8,
+            max_discharge_rate=4.8,
+            efficiency=0.95,
+            initial_soc=0.1,
+            min_soc_frac=0.1,
+        )
+
+        assert result.success
+
+        # Naive cost: import everything from grid, no battery
+        naive_cost = sum(load[t] * import_rates[t] * dt for t in range(n))
+        # Subtract export revenue for excess solar
+        excess = np.maximum(solar - load, 0)
+        naive_cost -= sum(excess[t] * export_rates[t] * dt for t in range(n))
+
+        assert result.total_cost < naive_cost, (
+            f"Oracle ({result.total_cost:.4f}) should beat naive ({naive_cost:.4f})"
+        )
+
+        # Verify SoC stays within bounds
+        assert all(s >= 15.0 * 0.1 - 1e-6 for s in result.soc)
+        assert all(s <= 15.0 + 1e-6 for s in result.soc)
