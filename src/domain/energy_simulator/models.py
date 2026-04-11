@@ -60,6 +60,7 @@ class EnergySimulator:
         if not timestamp.tzinfo:
             raise ValueError("Timestamp must be timezone-aware")
 
+        self.tariff.update_datetime(timestamp)
         hour = timestamp.hour
 
         if prev_timestamp is not None:

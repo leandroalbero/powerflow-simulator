@@ -58,7 +58,8 @@ if __name__ == '__main__':
             (18, 22): Rate(price=0.182, energy_direction=EnergyDirection.IMPORT),
             (22, 24): Rate(price=0.134, energy_direction=EnergyDirection.IMPORT),
             (0, 24): Rate(price=0.08, energy_direction=EnergyDirection.EXPORT)
-        }
+        },
+        weekend_rate=Rate(price=0.085, energy_direction=EnergyDirection.IMPORT),
     )
 
     battery = Battery(capacity=5.4, max_charge_rate=2.1, max_discharge_rate=2.1)

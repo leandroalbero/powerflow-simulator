@@ -182,17 +182,27 @@ class OracleStrategy(BaseEnergyStrategy):
         load: np.ndarray,
         hours: np.ndarray,
         durations: np.ndarray,
+        timestamps: list | None = None,
     ):
         super().__init__(battery, grid, tariff)
         self._elapsed_hours = 0.0
         self._n_lp = len(solar)
 
-        import_rates = np.array([
-            tariff.get_import_rate(int(h) % 24) for h in hours
-        ])
-        export_rates = np.array([
-            tariff.get_export_rate(int(h) % 24) for h in hours
-        ])
+        # Build rates with weekend awareness if timestamps provided
+        if timestamps is not None:
+            import_rates = np.empty(len(hours))
+            export_rates = np.empty(len(hours))
+            for i, ts in enumerate(timestamps):
+                tariff.update_datetime(ts)
+                import_rates[i] = tariff.get_import_rate(int(hours[i]) % 24)
+                export_rates[i] = tariff.get_export_rate(int(hours[i]) % 24)
+        else:
+            import_rates = np.array([
+                tariff.get_import_rate(int(h) % 24) for h in hours
+            ])
+            export_rates = np.array([
+                tariff.get_export_rate(int(h) % 24) for h in hours
+            ])
 
         self.lp_result = solve_oracle_lp(
             solar=solar,

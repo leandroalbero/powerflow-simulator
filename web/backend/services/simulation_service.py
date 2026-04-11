@@ -27,10 +27,12 @@ from src.domain.strategy.model import (
     ValleyChargePeakDischargeStrategy,
 )
 from src.domain.strategy.mpc import (
+    CalibratedSolarForecaster,
     LoadForecaster,
     MpcStrategy,
     PerfectSolarForecaster,
     SolarForecaster,
+    learn_monthly_ghi_factors,
     load_hourly_ghi_forecasts,
 )
 from src.domain.strategy.oracle import OracleStrategy
@@ -100,6 +102,24 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         "Re-solves every 15 minutes. Deployable in real-time.",
     ),
     StrategyInfo(
+        id="mpc_calibrated",
+        name="MPC (Calibrated Solar)",
+        description="MPC with monthly-calibrated GHI forecast. Learns seasonal correction "
+        "factors from historical actual-vs-forecast data to fix systematic bias.",
+    ),
+    StrategyInfo(
+        id="mpc_5min",
+        name="MPC 5-min (Calibrated)",
+        description="MPC at 5-min resolution with calibrated solar forecast. "
+        "Finer battery control and faster re-solving for better load tracking.",
+    ),
+    StrategyInfo(
+        id="mpc_5min_perfect",
+        name="MPC 5-min (Perfect Solar)",
+        description="MPC at 5-min resolution with perfect solar foresight. "
+        "Shows the ceiling for high-resolution MPC.",
+    ),
+    StrategyInfo(
         id="mpc_perfect",
         name="MPC (Perfect Solar)",
         description="MPC with perfect solar foresight — uses actual solar data instead of "
@@ -126,6 +146,9 @@ _STRATEGY_CLASSES = {
     "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
     "oracle": OracleStrategy,
     "mpc": MpcStrategy,
+    "mpc_calibrated": MpcStrategy,
+    "mpc_5min": MpcStrategy,
+    "mpc_5min_perfect": MpcStrategy,
     "mpc_perfect": MpcStrategy,
     # dqn_agent: lazy-imported in _run_strategy to avoid torch import at startup
 }
@@ -252,7 +275,9 @@ class SimulationService:
             load_daily_forecasts() if "forecast_charge" in strategy_ids else None
         )
         hourly_ghi_forecasts = (
-            load_hourly_ghi_forecasts() if "mpc" in strategy_ids else None
+            load_hourly_ghi_forecasts()
+            if any(s in strategy_ids for s in ("mpc", "mpc_calibrated", "mpc_5min"))
+            else None
         )
 
         for sid in strategy_ids:
@@ -312,6 +337,36 @@ class SimulationService:
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
                 )
+            elif strategy_id == "mpc_calibrated":
+                load_forecaster = LoadForecaster(load_df)
+                ghi_fc = hourly_ghi_forecasts or {}
+                monthly_factors = learn_monthly_ghi_factors(solar_df, ghi_fc)
+                solar_forecaster = CalibratedSolarForecaster(ghi_fc, monthly_factors)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                )
+            elif strategy_id == "mpc_5min":
+                load_forecaster = LoadForecaster(load_df)
+                ghi_fc = hourly_ghi_forecasts or {}
+                monthly_factors = learn_monthly_ghi_factors(solar_df, ghi_fc)
+                solar_forecaster = CalibratedSolarForecaster(ghi_fc, monthly_factors)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                    step_minutes=5, resolve_minutes=5,
+                )
+            elif strategy_id == "mpc_5min_perfect":
+                load_forecaster = LoadForecaster(load_df)
+                solar_forecaster = PerfectSolarForecaster(solar_df)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                    step_minutes=5, resolve_minutes=5,
+                )
             elif strategy_id == "mpc_perfect":
                 load_forecaster = LoadForecaster(load_df)
                 solar_forecaster = PerfectSolarForecaster(solar_df)
@@ -342,6 +397,7 @@ class SimulationService:
                     battery, grid, tariff,
                     solar=solar_kw, load=load_kw,
                     hours=hours_arr, durations=durations,
+                    timestamps=list(common_idx),
                 )
             else:
                 strategy = strategy_cls(battery, grid, tariff)

@@ -62,34 +62,107 @@ class SolarForecaster:
         return forecast
 
 
-class PerfectSolarForecaster:
-    """Uses actual solar data for backtesting — perfect foresight solar forecast."""
+def learn_monthly_ghi_factors(
+    solar_df: pd.DataFrame,
+    hourly_forecasts: dict[date_type, dict[int, float]],
+) -> dict[int, float]:
+    """Learn monthly correction factors: actual_pv / (ghi_forecast * GHI_TO_PV_FACTOR).
 
-    def __init__(self, solar_df: pd.DataFrame) -> None:
-        # Resample to 15-min mean, convert W -> kW. Pre-index for fast lookup.
-        resampled = solar_df[["state"]].resample("15min").mean().fillna(0.0)
-        self._solar_kw = (resampled["state"] / 1000.0).values  # numpy array
-        self._start_ts = resampled.index[0] if len(resampled) > 0 else None
-        self._n = len(self._solar_kw)
+    Returns dict mapping month (1-12) -> correction multiplier.
+    """
+    solar_h = solar_df[["state"]].resample("1h").mean().fillna(0.0)
+    monthly_actual: dict[int, float] = {}
+    monthly_predicted: dict[int, float] = {}
+
+    for ts in solar_h.index:
+        day_fc = hourly_forecasts.get(ts.date())
+        if day_fc is None:
+            continue
+        ghi = day_fc.get(ts.hour, 0.0)
+        predicted_pv = ghi * GHI_TO_PV_FACTOR
+        actual_pv = float(solar_h.loc[ts, "state"])
+        if predicted_pv < 10 and actual_pv < 10:
+            continue  # skip nighttime
+        m = ts.month
+        monthly_actual[m] = monthly_actual.get(m, 0.0) + actual_pv
+        monthly_predicted[m] = monthly_predicted.get(m, 0.0) + predicted_pv
+
+    factors: dict[int, float] = {}
+    for m in range(1, 13):
+        pred = monthly_predicted.get(m, 0.0)
+        if pred > 0:
+            factors[m] = monthly_actual.get(m, 0.0) / pred
+        else:
+            factors[m] = 1.0
+    return factors
+
+
+class CalibratedSolarForecaster:
+    """GHI forecast with monthly correction factors learned from historical data.
+
+    Corrects the systematic seasonal bias in the fixed GHI_TO_PV_FACTOR
+    (winter underestimate ~1.4-1.7x, summer overestimate ~0.84-0.93x).
+    """
+
+    def __init__(
+        self,
+        hourly_forecasts: dict[date_type, dict[int, float]],
+        monthly_factors: dict[int, float],
+    ) -> None:
+        self._forecasts = hourly_forecasts
+        self._factors = monthly_factors
 
     def forecast_24h(
         self, start: pd.Timestamp, steps: int = 96, step_minutes: int = 15,
     ) -> np.ndarray:
-        if self._start_ts is None or self._n == 0:
+        forecast = np.zeros(steps)
+        for i in range(steps):
+            ts = start + timedelta(minutes=i * step_minutes)
+            day_forecast = self._forecasts.get(ts.date())
+            if day_forecast is None:
+                continue
+            ghi = day_forecast.get(ts.hour, 0.0)
+            factor = self._factors.get(ts.month, 1.0)
+            forecast[i] = ghi * GHI_TO_PV_FACTOR * factor / 1000.0  # W -> kW
+        return forecast
+
+
+class PerfectSolarForecaster:
+    """Uses actual solar data for backtesting — perfect foresight solar forecast.
+
+    Resamples to the requested step resolution on first use of that resolution.
+    """
+
+    def __init__(self, solar_df: pd.DataFrame) -> None:
+        self._solar_df = solar_df
+        self._cache: dict[int, tuple[np.ndarray, pd.Timestamp]] = {}
+
+    def _get_resampled(self, step_minutes: int) -> tuple[np.ndarray, pd.Timestamp]:
+        if step_minutes not in self._cache:
+            resampled = self._solar_df[["state"]].resample(f"{step_minutes}min").mean().fillna(0.0)
+            arr = (resampled["state"] / 1000.0).values
+            start = resampled.index[0] if len(resampled) > 0 else None
+            self._cache[step_minutes] = (arr, start)
+        return self._cache[step_minutes]
+
+    def forecast_24h(
+        self, start: pd.Timestamp, steps: int = 96, step_minutes: int = 15,
+    ) -> np.ndarray:
+        arr, start_ts = self._get_resampled(step_minutes)
+        if start_ts is None or len(arr) == 0:
             return np.zeros(steps)
-        # Fast integer index: compute offset from series start
-        offset_min = (start - self._start_ts).total_seconds() / 60.0
-        start_idx = int(round(offset_min / 15.0))
+        offset_min = (start - start_ts).total_seconds() / 60.0
+        start_idx = int(round(offset_min / step_minutes))
         end_idx = start_idx + steps
         if start_idx < 0:
             start_idx = 0
-        if end_idx > self._n:
-            end_idx = self._n
+        if end_idx > len(arr):
+            end_idx = len(arr)
         valid = end_idx - start_idx
         if valid <= 0:
             return np.zeros(steps)
         forecast = np.zeros(steps)
-        forecast[:valid] = self._solar_kw[start_idx:end_idx]
+        forecast[:valid] = arr[start_idx:end_idx]
         return forecast
 
 
@@ -126,7 +199,7 @@ MPC_RESOLVE_MINUTES = 15
 class MpcStrategy(BaseEnergyStrategy):
     """Rolling-horizon LP strategy with forecast-based planning.
 
-    Every 15 minutes, solves a 24h LP using solar/load forecasts.
+    Re-solves a 24h LP at configurable intervals using solar/load forecasts.
     Between solves, replays the cached plan.
     """
 
@@ -137,10 +210,16 @@ class MpcStrategy(BaseEnergyStrategy):
         tariff: PowerTariff,
         load_forecaster: LoadForecaster,
         solar_forecaster: SolarForecaster,
+        step_minutes: int = 15,
+        resolve_minutes: int = 15,
+        horizon_hours: int = 24,
     ) -> None:
         super().__init__(battery, grid, tariff)
         self._load_forecaster = load_forecaster
         self._solar_forecaster = solar_forecaster
+        self._step_minutes = step_minutes
+        self._resolve_minutes = resolve_minutes
+        self._horizon_steps = horizon_hours * 60 // step_minutes
         self._cached_plan: dict[str, np.ndarray] | None = None
         self._plan_start: pd.Timestamp | None = None
         self._current_ts: pd.Timestamp | None = None
@@ -154,25 +233,27 @@ class MpcStrategy(BaseEnergyStrategy):
         if self._cached_plan is None or self._plan_start is None:
             return True
         elapsed = (self._current_ts - self._plan_start).total_seconds() / 60.0
-        return elapsed >= MPC_RESOLVE_MINUTES
+        return elapsed >= self._resolve_minutes
 
     def _solve_horizon(self) -> None:
         ts = self._current_ts
-        solar_fc = self._solar_forecaster.forecast_24h(ts, MPC_HORIZON_STEPS, MPC_STEP_MINUTES)
-        load_fc = self._load_forecaster.forecast_24h(ts, MPC_HORIZON_STEPS, MPC_STEP_MINUTES)
+        n = self._horizon_steps
+        sm = self._step_minutes
+        solar_fc = self._solar_forecaster.forecast_24h(ts, n, sm)
+        load_fc = self._load_forecaster.forecast_24h(ts, n, sm)
 
-        hours = np.array([
-            (ts + timedelta(minutes=i * MPC_STEP_MINUTES)).hour
-            for i in range(MPC_HORIZON_STEPS)
-        ])
-        import_rates = np.array([
-            self.tariff.get_import_rate(int(h) % 24) for h in hours
-        ])
-        export_rates = np.array([
-            self.tariff.get_export_rate(int(h) % 24) for h in hours
-        ])
+        step_times = [ts + timedelta(minutes=i * sm) for i in range(n)]
+        hours = np.array([t.hour for t in step_times])
 
-        dt = MPC_STEP_MINUTES / 60.0
+        # Build rates with weekend awareness (Spain 2.0TD: valley all day on weekends)
+        import_rates = np.empty(n)
+        export_rates = np.empty(n)
+        for i, t in enumerate(step_times):
+            self.tariff.update_datetime(t)
+            import_rates[i] = self.tariff.get_import_rate(t.hour)
+            export_rates[i] = self.tariff.get_export_rate(t.hour)
+
+        dt = sm / 60.0
 
         result = solve_oracle_lp(
             solar=solar_fc,
@@ -205,7 +286,7 @@ class MpcStrategy(BaseEnergyStrategy):
         if self._plan_start is None:
             return 0
         elapsed_min = (self._current_ts - self._plan_start).total_seconds() / 60.0
-        return min(int(elapsed_min / MPC_STEP_MINUTES), MPC_HORIZON_STEPS - 1)
+        return min(int(elapsed_min / self._step_minutes), self._horizon_steps - 1)
 
     def calculate_energy_flows(
         self, solar_power: float, load_power: float, hour: int, duration: float,
