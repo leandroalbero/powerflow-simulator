@@ -211,12 +211,12 @@
             </div>
 
             <div class="strat-numbers">
-              <span class="strat-cost mono">{formatEur(cost)}<span class="unit">\u20ac</span></span>
+              <span class="strat-cost mono">{formatEur(cost)}€</span>
               {#if perYear}
-                <span class="strat-per-year mono">{formatEur(perYear)}/yr</span>
+                <span class="strat-per-year mono">{formatEur(perYear)}€/yr</span>
               {/if}
               {#if savings > 0}
-                <span class="strat-savings mono positive">+{formatEur(savings)}</span>
+                <span class="strat-savings mono positive">+{formatEur(savings)}€</span>
               {:else}
                 <span class="strat-savings mono baseline">base</span>
               {/if}
@@ -558,10 +558,8 @@
     font-weight: 500;
   }
 
-  .strat-cost .unit {
-    font-weight: 400;
-    font-size: 10px;
-    color: var(--text-dim);
+  .strat-cost {
+    min-width: 55px;
   }
 
   .strat-per-year {
