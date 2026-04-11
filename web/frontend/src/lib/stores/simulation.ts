@@ -23,6 +23,20 @@ export const selectedDateRange = writable<DateRange | null>(null);
 /** Active or most-recent simulation run state. */
 export const currentRun = writable<CurrentRun | null>(null);
 
+/** Which strategies are visible on the chart (null = show all completed). */
+export const chartVisibleStrategies = writable<Set<string> | null>(null);
+
+/** Toggle a strategy's chart visibility. */
+export function toggleChartVisibility(id: string): void {
+  chartVisibleStrategies.update((current) => {
+    if (current === null) return current;
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+}
+
 /** Application log buffer shown in the log panel. */
 export const logs = writable<LogEntry[]>([]);
 

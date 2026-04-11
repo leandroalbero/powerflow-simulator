@@ -3,7 +3,7 @@
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
 
-  import { currentRun, strategies, addLog } from '../stores/simulation';
+  import { currentRun, strategies, addLog, chartVisibleStrategies } from '../stores/simulation';
   import { systemConfig } from '../stores/config';
   import { getTimeseries } from '../api/client';
   import type { TimeseriesResponse, StrategyRunState } from '../types/index';
@@ -97,10 +97,11 @@
     }
   }
 
-  // ---- Reactive: rebuild charts when data changes ----
+  // ---- Reactive: rebuild charts when data or visibility changes ----
 
   $: loadedKeys = [...loadedData.keys()].sort().join(',');
-  $: if (loadedKeys && powerChartEl && batteryChartEl) {
+  $: visibleKeys = $chartVisibleStrategies ? [...$chartVisibleStrategies].sort().join(',') : loadedKeys;
+  $: if (loadedKeys && powerChartEl && batteryChartEl && visibleKeys !== undefined) {
     rebuildCharts();
   }
 
@@ -246,10 +247,16 @@
     }
   }
 
+  function getVisibleStrategyIds(): string[] {
+    const all = [...loadedData.keys()];
+    if ($chartVisibleStrategies === null) return all;
+    return all.filter(id => $chartVisibleStrategies!.has(id));
+  }
+
   function rebuildCharts() {
     destroyCharts();
 
-    const strategyIds = [...loadedData.keys()];
+    const strategyIds = getVisibleStrategyIds();
     if (strategyIds.length === 0) return;
 
     const firstData = loadedData.get(strategyIds[0])!;
@@ -475,9 +482,9 @@
   /** Track whether current data is zoomed (filtered) so we can detect zoom-out. */
   let isZoomed = false;
 
-  /** Build uPlot-ready data arrays from loadedData. */
+  /** Build uPlot-ready data arrays from loadedData (visible strategies only). */
   function buildChartArrays() {
-    const strategyIds = [...loadedData.keys()];
+    const strategyIds = getVisibleStrategyIds();
     if (strategyIds.length === 0) return null;
 
     const firstData = loadedData.get(strategyIds[0])!;
@@ -570,6 +577,7 @@
       firstLoadedStrategy = null;
       isZoomed = false;
       lastZoomRange = '';
+      chartVisibleStrategies.set(null);
       destroyCharts();
     }
   }
