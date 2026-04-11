@@ -45,7 +45,7 @@
   }
 
   $: isRunning = $currentRun?.status === 'running';
-  $: canRun = $selectedStrategies.size > 0 && !isRunning;
+  $: canRun = $selectedStrategies.size > 0;
 
   function buildDateRange(): DateRange | undefined {
     if (dateStart && dateEnd) {
@@ -124,6 +124,12 @@
         },
         onClose() {
           addLog('WebSocket closed', 'info');
+          // If the run is still marked as 'running' when WS closes, mark it completed
+          // so it doesn't block the UI
+          currentRun.update((run) => {
+            if (!run || run.status !== 'running') return run;
+            return { ...run, status: 'completed' };
+          });
         },
       });
     } catch (err) {
@@ -183,7 +189,7 @@
 
   <button class="run-btn" disabled={!canRun} on:click={handleRun}>
     {#if isRunning}
-      RUNNING...
+      RERUN
     {:else}
       RUN
     {/if}

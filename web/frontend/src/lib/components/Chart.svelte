@@ -77,6 +77,10 @@
   /** Prevent re-fetch for the same zoom range. */
   let lastZoomRange = '';
 
+  /** Full data x-range for zoom reset. */
+  let fullXMin: number | null = null;
+  let fullXMax: number | null = null;
+
   // ---- Reactive: watch for completed strategies ----
 
   $: runResults = $currentRun?.results ?? new Map<string, StrategyRunState>();
@@ -216,6 +220,32 @@
     return containerEl.clientWidth - 2; // account for border
   }
 
+  function resetZoom() {
+    if (!powerChart || !batteryChart || fullXMin == null || fullXMax == null) return;
+
+    // Reset scale to full range
+    syncing = true;
+    powerChart.setScale('x', { min: fullXMin, max: fullXMax });
+    batteryChart.setScale('x', { min: fullXMin, max: fullXMax });
+    syncing = false;
+
+    // Reload full-resolution data if we were zoomed in
+    if (isZoomed && runId) {
+      lastZoomRange = '';
+      isZoomed = false;
+      const promises = [...loadedData.keys()].map(stratId =>
+        loadTimeseries(runId!, stratId, { maxPoints: DEFAULT_MAX_POINTS })
+      );
+      Promise.all(promises).then(() => {
+        const arrays = buildChartArrays();
+        if (arrays && powerChart && batteryChart) {
+          powerChart.setData(arrays.powerData);
+          batteryChart.setData(arrays.batteryData);
+        }
+      });
+    }
+  }
+
   function rebuildCharts() {
     destroyCharts();
 
@@ -224,6 +254,10 @@
 
     const firstData = loadedData.get(strategyIds[0])!;
     const timestamps = parseTimestamps(firstData.timestamps);
+
+    // Store full range for zoom reset
+    fullXMin = timestamps[0];
+    fullXMax = timestamps[timestamps.length - 1];
 
     const tariffZones = getTariffZones();
     const drawHook = buildTariffDrawHook(tariffZones);
@@ -542,6 +576,10 @@
 
   // ---- Lifecycle ----
 
+  function handleDblClick() {
+    resetZoom();
+  }
+
   onMount(() => {
     // Observe container resizes
     resizeObserver = new ResizeObserver(() => {
@@ -566,11 +604,15 @@
 
     if (containerEl) {
       resizeObserver.observe(containerEl);
+      containerEl.addEventListener('dblclick', handleDblClick);
     }
   });
 
   onDestroy(() => {
     destroyCharts();
+    if (containerEl) {
+      containerEl.removeEventListener('dblclick', handleDblClick);
+    }
     if (resizeObserver) {
       resizeObserver.disconnect();
       resizeObserver = null;
@@ -587,6 +629,10 @@
     {#if loadedData.size > 0}
       <span class="chart-info">
         {loadedData.size} strateg{loadedData.size === 1 ? 'y' : 'ies'}
+        {#if isZoomed}
+          &middot; <button class="reset-zoom-btn" on:click={resetZoom}>Reset Zoom</button>
+          <span class="zoom-hint">(or double-click)</span>
+        {/if}
       </span>
     {/if}
   </div>
@@ -638,6 +684,31 @@
     text-transform: none;
     letter-spacing: normal;
     font-family: var(--font-mono);
+  }
+
+  .reset-zoom-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 1px 6px;
+    border-radius: 2px;
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
+  .reset-zoom-btn:hover {
+    border-color: var(--border-active);
+    color: var(--text-primary);
+  }
+
+  .zoom-hint {
+    font-size: 9px;
+    color: var(--text-dim);
+    text-transform: none;
+    letter-spacing: normal;
   }
 
   .chart-placeholder {
