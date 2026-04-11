@@ -111,16 +111,21 @@ class EnergySimulator:
 
         # Always include total_house_consumption even if it's 0
 
-        # Calculate rates only if denominators are positive
+        # Self-consumption: fraction of solar generation used on-site (not exported).
+        # This differs per strategy because battery strategies reduce exports.
         if self.total_solar_generated > 0:
+            solar_self_consumed = self.total_solar_generated - self.total_solar_exported
             metrics['self_consumption_rate'] = round(
-                (self.total_solar_consumed / self.total_solar_generated) * 100, 1)
+                (solar_self_consumed / self.total_solar_generated) * 100, 1)
         else:
             metrics['self_consumption_rate'] = 0.0
 
+        # Solar fraction: share of house consumption NOT covered by grid imports.
+        # Higher = more of the house runs on solar (directly + via battery).
         if self.total_house_consumption > 0:
+            solar_coverage = self.total_house_consumption - self.total_grid_imported
             metrics['solar_fraction'] = round(
-                (self.total_solar_consumed / self.total_house_consumption) * 100, 1)
+                max(0, solar_coverage / self.total_house_consumption) * 100, 1)
         else:
             metrics['solar_fraction'] = 0.0
 

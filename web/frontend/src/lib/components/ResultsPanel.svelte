@@ -42,25 +42,7 @@
   $: isComparison = completedStrategies.length > 1;
   $: isSingle = completedStrategies.length === 1;
 
-  // Initialize chart visibility when strategies complete
-  $: {
-    const ids = completedStrategies.map(s => s.id);
-    if (ids.length > 0 && $chartVisibleStrategies === null) {
-      chartVisibleStrategies.set(new Set(ids));
-    }
-    // Add newly completed strategies
-    if ($chartVisibleStrategies !== null) {
-      let changed = false;
-      const next = new Set($chartVisibleStrategies);
-      for (const id of ids) {
-        if (!next.has(id)) {
-          next.add(id);
-          changed = true;
-        }
-      }
-      if (changed) chartVisibleStrategies.set(next);
-    }
-  }
+  // Chart visibility is managed by Chart.svelte via addChartVisibility()
 
   // ---- Comparison helpers ----
 
@@ -85,7 +67,7 @@
   $: costRange = baselineCost - bestCost;
 
   function isVisible(id: string): boolean {
-    return $chartVisibleStrategies === null || $chartVisibleStrategies.has(id);
+    return $chartVisibleStrategies.has(id);
   }
 
   // ---- Running strategies ----

@@ -3,7 +3,7 @@
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
 
-  import { currentRun, strategies, addLog, chartVisibleStrategies } from '../stores/simulation';
+  import { currentRun, strategies, addLog, chartVisibleStrategies, addChartVisibility } from '../stores/simulation';
   import { systemConfig } from '../stores/config';
   import { getTimeseries } from '../api/client';
   import type { TimeseriesResponse, StrategyRunState } from '../types/index';
@@ -100,7 +100,7 @@
   // ---- Reactive: rebuild charts when data or visibility changes ----
 
   $: loadedKeys = [...loadedData.keys()].sort().join(',');
-  $: visibleKeys = $chartVisibleStrategies ? [...$chartVisibleStrategies].sort().join(',') : loadedKeys;
+  $: visibleKeys = [...$chartVisibleStrategies].sort().join(',');
   $: if (loadedKeys && powerChartEl && batteryChartEl && visibleKeys !== undefined) {
     rebuildCharts();
   }
@@ -145,6 +145,7 @@
 
       loadedData.set(strategyId, data);
       loadedData = new Map(loadedData); // trigger reactivity
+      addChartVisibility(strategyId);
 
       if (!firstLoadedStrategy) {
         firstLoadedStrategy = strategyId;
@@ -249,8 +250,7 @@
 
   function getVisibleStrategyIds(): string[] {
     const all = [...loadedData.keys()];
-    if ($chartVisibleStrategies === null) return all;
-    return all.filter(id => $chartVisibleStrategies!.has(id));
+    return all.filter(id => $chartVisibleStrategies.has(id));
   }
 
   function rebuildCharts() {
@@ -577,7 +577,7 @@
       firstLoadedStrategy = null;
       isZoomed = false;
       lastZoomRange = '';
-      chartVisibleStrategies.set(null);
+      chartVisibleStrategies.set(new Set());
       destroyCharts();
     }
   }
