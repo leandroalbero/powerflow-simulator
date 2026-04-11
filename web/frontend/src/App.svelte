@@ -89,6 +89,7 @@
         battery: configResp.battery,
         grid: configResp.grid,
         tariff: configResp.tariff,
+        strategy: configResp.strategy ?? { min_battery_level: 0.1, max_charge_power: 2.05, valley_charge_target: 1.0 },
       });
       addLog('Config loaded');
     } catch (err) {
@@ -161,7 +162,7 @@
   .shell {
     height: 100%;
     display: grid;
-    grid-template-columns: 220px 1fr 260px;
+    grid-template-columns: 220px 1fr 320px;
     grid-template-rows: 44px 1fr 100px 24px;
     grid-template-areas:
       'toolbar  toolbar  toolbar'
@@ -178,7 +179,7 @@
   /* ---- Panel collapse grid overrides ---- */
 
   .shell.config-collapsed {
-    grid-template-columns: 24px 1fr 260px;
+    grid-template-columns: 24px 1fr 320px;
   }
 
   .shell.results-collapsed {

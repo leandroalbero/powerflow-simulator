@@ -49,9 +49,9 @@ git clone https://github.com/leandroalbero/powerflow-simulator.git
 cd powerflow-simulator
 docker compose up --build
 ```
-Open http://localhost:8000 — the image includes one month of sample data (January 2024, 1-minute resolution).
+Open http://localhost:8000 — the image includes the full dataset (~2 years of 1-minute resolution data).
 
-To use your own full dataset, uncomment the volume mount in `docker-compose.yml`:
+To use your own dataset, mount a volume in `docker-compose.yml`:
 ```yaml
 volumes:
   - ./data:/app/data
@@ -80,7 +80,7 @@ Input CSVs need a `last_changed` datetime index and a `state` column (values in 
 "last_changed","state"
 "2024-01-01T00:00:00.000+01:00","1424.67"
 ```
-The `data/` folder contains real data — high-res (1-minute) and low-res (1-hour) versions. The `data/sample/` folder has a January 2024 subset used by the Docker image.
+The `data/` folder contains real data — high-res (1-minute) and low-res (1-hour) versions.
 
 ## Programmatic Usage
 ```python

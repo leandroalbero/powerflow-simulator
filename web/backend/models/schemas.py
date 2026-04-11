@@ -40,14 +40,17 @@ class TariffRate(BaseModel):
 class TariffConfig(BaseModel):
     rates: List[TariffRate] = Field(default_factory=lambda: [
         TariffRate(start_hour=0, end_hour=8, price=0.085, direction="import"),
-        TariffRate(start_hour=8, end_hour=10, price=0.134, direction="import"),
-        TariffRate(start_hour=10, end_hour=14, price=0.182, direction="import"),
-        TariffRate(start_hour=14, end_hour=18, price=0.134, direction="import"),
-        TariffRate(start_hour=18, end_hour=22, price=0.182, direction="import"),
-        TariffRate(start_hour=22, end_hour=24, price=0.134, direction="import"),
+        TariffRate(start_hour=8, end_hour=10, price=0.135, direction="import"),
+        TariffRate(start_hour=10, end_hour=14, price=0.197, direction="import"),
+        TariffRate(start_hour=14, end_hour=18, price=0.135, direction="import"),
+        TariffRate(start_hour=18, end_hour=22, price=0.197, direction="import"),
+        TariffRate(start_hour=22, end_hour=24, price=0.135, direction="import"),
         TariffRate(start_hour=0, end_hour=24, price=0.08, direction="export"),
     ])
-    weekend_rate: Optional[TariffRate] = Field(None, description="Flat override rate for weekends")
+    weekend_rate: Optional[TariffRate] = Field(
+        default_factory=lambda: TariffRate(start_hour=0, end_hour=24, price=0.085, direction="import"),
+        description="Flat override rate for weekends (Spain 2.0TD: valley all day)",
+    )
 
 
 class StrategyConfig(BaseModel):

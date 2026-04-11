@@ -24,8 +24,8 @@ COPY web/backend/ ./web/backend/
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/web/frontend/dist ./web/frontend/dist
 
-# Copy sample data (1 month of 1-minute resolution data)
-COPY data/sample/ ./data/
+# Copy data
+COPY data/*.csv ./data/
 
 EXPOSE 8000
 

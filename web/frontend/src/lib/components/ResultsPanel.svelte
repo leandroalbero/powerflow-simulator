@@ -1,64 +1,26 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
-  import { currentRun, strategies } from '../stores/simulation';
+  import { currentRun, strategies, chartVisibleStrategies, toggleChartVisibility } from '../stores/simulation';
+  import { dataInfo } from '../stores/config';
   import type { StrategyMetrics, StrategyRunState } from '../types/index';
 
   export let collapsed = false;
 
   const dispatch = createEventDispatcher();
 
-  // ---- Types ----
-
-  interface MetricDef {
-    key: keyof StrategyMetrics;
-    label: string;
-    unit: string;
-    format: (v: number) => string;
-    /** For comparison: 'low' means lowest is best, 'high' means highest is best. */
-    best: 'low' | 'high';
-  }
-
-  // ---- Metric definitions ----
-
-  const METRICS: MetricDef[] = [
-    { key: 'total_cost', label: 'Total Cost', unit: '\u20ac', format: v => v.toFixed(2), best: 'low' },
-    { key: 'total_grid_imported', label: 'Grid Import', unit: 'kWh', format: v => formatInt(v), best: 'low' },
-    { key: 'total_solar_generated', label: 'Solar Gen.', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-    { key: 'total_solar_consumed', label: 'Solar Cons.', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-    { key: 'total_solar_exported', label: 'Solar Exp.', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-    { key: 'self_consumption_rate', label: 'Self Cons.', unit: '%', format: v => (v * 100).toFixed(1), best: 'high' },
-    { key: 'solar_fraction', label: 'Solar Frac.', unit: '%', format: v => (v * 100).toFixed(1), best: 'high' },
-    { key: 'total_battery_in', label: 'Battery In', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-    { key: 'total_battery_out', label: 'Battery Out', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-  ];
-
-  /** Shorter list for comparison mode to fit the narrow sidebar. */
-  const COMPARISON_METRICS: MetricDef[] = [
-    { key: 'total_cost', label: 'Cost', unit: '\u20ac', format: v => v.toFixed(0), best: 'low' },
-    { key: 'solar_fraction', label: 'Solar', unit: '%', format: v => (v * 100).toFixed(1), best: 'high' },
-    { key: 'self_consumption_rate', label: 'Self', unit: '%', format: v => (v * 100).toFixed(1), best: 'high' },
-    { key: 'total_grid_imported', label: 'Grid', unit: 'kWh', format: v => formatInt(v), best: 'low' },
-    { key: 'total_solar_exported', label: 'Export', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-    { key: 'total_battery_in', label: 'Bat In', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-    { key: 'total_battery_out', label: 'Bat Out', unit: 'kWh', format: v => formatInt(v), best: 'high' },
-  ];
-
   // ---- Helpers ----
-
-  function formatInt(v: number): string {
-    return Math.round(v).toLocaleString('en-US');
-  }
 
   function getStrategyName(id: string): string {
     const s = $strategies.find(st => st.id === id);
     return s ? s.name : id;
   }
 
-  function getStrategyAbbrev(id: string): string {
-    const name = getStrategyName(id);
-    const words = name.split(/[\s_-]+/);
-    if (words.length === 1) return name.substring(0, 4).toUpperCase();
-    return words.map(w => w[0]).join('').toUpperCase();
+  function formatEur(v: number): string {
+    return v.toFixed(0);
+  }
+
+  function formatKwh(v: number): string {
+    return Math.round(v).toLocaleString('en-US');
   }
 
   // ---- Reactive data ----
@@ -72,25 +34,40 @@
         completed.push({ id, metrics: state.metrics });
       }
     }
+    // Sort by total cost ascending (best first)
+    completed.sort((a, b) => a.metrics.total_cost - b.metrics.total_cost);
     return completed;
   })();
 
   $: isComparison = completedStrategies.length > 1;
   $: isSingle = completedStrategies.length === 1;
 
-  // ---- Best value detection for comparison mode ----
+  // Chart visibility is managed by Chart.svelte via addChartVisibility()
 
-  function isBestValue(metric: MetricDef, strategyMetrics: StrategyMetrics): boolean {
-    if (completedStrategies.length < 2) return false;
+  // ---- Comparison helpers ----
 
-    const currentVal = strategyMetrics[metric.key] as number;
-    const allVals = completedStrategies.map(s => s.metrics[metric.key] as number);
+  /** Compute simulation period in years from data info. */
+  $: periodYears = (() => {
+    if (!$dataInfo?.date_range) return null;
+    const start = new Date($dataInfo.date_range.start);
+    const end = new Date($dataInfo.date_range.end);
+    const days = (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
+    return days / 365.25;
+  })();
 
-    if (metric.best === 'low') {
-      return currentVal <= Math.min(...allVals);
-    } else {
-      return currentVal >= Math.max(...allVals);
-    }
+  /** Use the most expensive strategy as baseline for savings calculation. */
+  $: baselineCost = completedStrategies.length > 0
+    ? Math.max(...completedStrategies.map(s => s.metrics.total_cost))
+    : 0;
+
+  $: bestCost = completedStrategies.length > 0
+    ? Math.min(...completedStrategies.map(s => s.metrics.total_cost))
+    : 0;
+
+  $: costRange = baselineCost - bestCost;
+
+  function isVisible(id: string): boolean {
+    return $chartVisibleStrategies.has(id);
   }
 
   // ---- Running strategies ----
@@ -104,6 +81,27 @@
     }
     return running;
   })();
+
+  // ---- Detail metrics for single view ----
+
+  interface MetricDef {
+    key: keyof StrategyMetrics;
+    label: string;
+    unit: string;
+    format: (v: number) => string;
+  }
+
+  const METRICS: MetricDef[] = [
+    { key: 'total_cost', label: 'Total Cost', unit: '\u20ac', format: v => v.toFixed(2) },
+    { key: 'total_grid_imported', label: 'Grid Import', unit: 'kWh', format: v => formatKwh(v) },
+    { key: 'total_solar_generated', label: 'Solar Gen.', unit: 'kWh', format: v => formatKwh(v) },
+    { key: 'total_solar_consumed', label: 'Solar Cons.', unit: 'kWh', format: v => formatKwh(v) },
+    { key: 'total_solar_exported', label: 'Solar Exp.', unit: 'kWh', format: v => formatKwh(v) },
+    { key: 'self_consumption_rate', label: 'Self Cons.', unit: '%', format: v => v.toFixed(1) },
+    { key: 'solar_fraction', label: 'Solar Frac.', unit: '%', format: v => v.toFixed(1) },
+    { key: 'total_battery_in', label: 'Battery In', unit: 'kWh', format: v => formatKwh(v) },
+    { key: 'total_battery_out', label: 'Battery Out', unit: 'kWh', format: v => formatKwh(v) },
+  ];
 </script>
 
 <div class="results-container">
@@ -165,37 +163,132 @@
 
     <!-- Comparison view -->
     {#if isComparison}
-      <div class="comparison-results">
-        <table class="comparison-table">
-          <thead>
-            <tr>
-              <th class="metric-col">Metric</th>
-              {#each completedStrategies as strat (strat.id)}
-                <th class="strat-col" title={getStrategyName(strat.id)}>
-                  {getStrategyAbbrev(strat.id)}
-                </th>
-              {/each}
-            </tr>
-          </thead>
-          <tbody>
-            {#each COMPARISON_METRICS as metric (metric.key)}
+      <div class="comparison-section">
+        <div class="comparison-header">
+          <span class="section-title">Cost Ranking</span>
+          {#if periodYears}
+            <span class="period-info">{periodYears.toFixed(1)} yr</span>
+          {/if}
+        </div>
+
+        {#each completedStrategies as strat, i (strat.id)}
+          {@const cost = strat.metrics.total_cost}
+          {@const savings = baselineCost - cost}
+          {@const perYear = periodYears ? cost / periodYears : null}
+          {@const savingsPerYear = periodYears ? savings / periodYears : null}
+          {@const barPct = costRange > 0 ? ((cost - bestCost) / costRange) * 100 : 0}
+          {@const visible = isVisible(strat.id)}
+
+          <button
+            class="strat-row"
+            class:best={i === 0}
+            class:dimmed={!visible}
+            on:click={() => toggleChartVisibility(strat.id)}
+            title="{visible ? 'Hide' : 'Show'} on chart"
+          >
+            <div class="strat-header">
+              <span class="strat-eye">{visible ? '\u25C9' : '\u25CB'}</span>
+              <span class="strat-rank">#{i + 1}</span>
+              <span class="strat-name">{getStrategyName(strat.id)}</span>
+            </div>
+
+            <div class="strat-numbers">
+              <span class="strat-cost mono">{formatEur(cost)}€</span>
+              {#if perYear}
+                <span class="strat-per-year mono">{formatEur(perYear)}€/yr</span>
+              {/if}
+              {#if savings > 0}
+                <span class="strat-savings mono positive">+{formatEur(savings)}€</span>
+              {:else}
+                <span class="strat-savings mono baseline">base</span>
+              {/if}
+            </div>
+
+            <div class="cost-bar-track">
+              <div
+                class="cost-bar-fill"
+                class:bar-best={i === 0}
+                class:bar-worst={i === completedStrategies.length - 1}
+                style="width: {100 - barPct}%"
+              ></div>
+            </div>
+          </button>
+        {/each}
+
+        <!-- Detail metrics table -->
+        <div class="detail-section">
+          <div class="section-title">Detail Comparison</div>
+          <table class="detail-table">
+            <thead>
               <tr>
-                <td class="metric-label">
-                  {metric.label}
-                  <span class="metric-unit-label">({metric.unit})</span>
-                </td>
+                <th class="detail-metric-col"></th>
                 {#each completedStrategies as strat (strat.id)}
-                  <td
-                    class="metric-value mono"
-                    class:best-value={isBestValue(metric, strat.metrics)}
-                  >
-                    {metric.format(Number(strat.metrics[metric.key]))}
+                  <th class="detail-strat-col" title={getStrategyName(strat.id)}>
+                    {getStrategyName(strat.id).split(/[\s]+/).map(w => w[0]).join('')}
+                  </th>
+                {/each}
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="detail-label">Grid<span class="detail-unit">kWh</span></td>
+                {#each completedStrategies as strat (strat.id)}
+                  {@const val = strat.metrics.total_grid_imported}
+                  {@const allVals = completedStrategies.map(s => s.metrics.total_grid_imported)}
+                  <td class="detail-val mono" class:best-val={val <= Math.min(...allVals)}>
+                    {formatKwh(val)}
                   </td>
                 {/each}
               </tr>
-            {/each}
-          </tbody>
-        </table>
+              <tr>
+                <td class="detail-label">Self<span class="detail-unit">%</span></td>
+                {#each completedStrategies as strat (strat.id)}
+                  {@const val = strat.metrics.self_consumption_rate}
+                  {@const allVals = completedStrategies.map(s => s.metrics.self_consumption_rate)}
+                  <td class="detail-val mono" class:best-val={val >= Math.max(...allVals)}>
+                    {val.toFixed(1)}
+                  </td>
+                {/each}
+              </tr>
+              <tr>
+                <td class="detail-label">Solar<span class="detail-unit">%</span></td>
+                {#each completedStrategies as strat (strat.id)}
+                  {@const val = strat.metrics.solar_fraction}
+                  {@const allVals = completedStrategies.map(s => s.metrics.solar_fraction)}
+                  <td class="detail-val mono" class:best-val={val >= Math.max(...allVals)}>
+                    {val.toFixed(1)}
+                  </td>
+                {/each}
+              </tr>
+              <tr>
+                <td class="detail-label">Export<span class="detail-unit">kWh</span></td>
+                {#each completedStrategies as strat (strat.id)}
+                  {@const val = strat.metrics.total_solar_exported}
+                  {@const allVals = completedStrategies.map(s => s.metrics.total_solar_exported)}
+                  <td class="detail-val mono" class:best-val={val >= Math.max(...allVals)}>
+                    {formatKwh(val)}
+                  </td>
+                {/each}
+              </tr>
+              <tr>
+                <td class="detail-label">Bat In<span class="detail-unit">kWh</span></td>
+                {#each completedStrategies as strat (strat.id)}
+                  <td class="detail-val mono">
+                    {formatKwh(strat.metrics.total_battery_in)}
+                  </td>
+                {/each}
+              </tr>
+              <tr>
+                <td class="detail-label">Bat Out<span class="detail-unit">kWh</span></td>
+                {#each completedStrategies as strat (strat.id)}
+                  <td class="detail-val mono">
+                    {formatKwh(strat.metrics.total_battery_out)}
+                  </td>
+                {/each}
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     {/if}
 
@@ -264,6 +357,10 @@
     font-size: var(--font-size-sm);
   }
 
+  .mono {
+    font-family: var(--font-mono);
+  }
+
   /* ---- Progress ---- */
 
   .progress-section {
@@ -309,10 +406,6 @@
     flex-shrink: 0;
   }
 
-  .mono {
-    font-family: var(--font-mono);
-  }
-
   /* ---- Single strategy ---- */
 
   .single-results {
@@ -336,7 +429,6 @@
   .metrics-table td {
     padding: 3px 0;
     font-size: var(--font-size-sm);
-    border-bottom: none;
   }
 
   .metrics-table .metric-label {
@@ -357,60 +449,206 @@
 
   /* ---- Comparison ---- */
 
-  .comparison-results {
-    margin-bottom: var(--spacing-md);
+  .comparison-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-sm);
   }
 
-  .comparison-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: var(--font-size-sm);
+  .comparison-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
   }
 
-  .comparison-table th {
-    padding: 3px var(--spacing-xs);
+  .section-title {
     font-size: 10px;
-    font-weight: 500;
-    color: var(--text-secondary);
+    color: var(--text-dim);
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
+    letter-spacing: 0.06em;
   }
 
-  .comparison-table .metric-col {
-    text-align: left;
-  }
-
-  .comparison-table .strat-col {
-    text-align: right;
+  .period-info {
+    font-size: 10px;
+    color: var(--text-dim);
     font-family: var(--font-mono);
   }
 
-  .comparison-table td {
-    padding: 3px var(--spacing-xs);
+  /* ---- Strategy row ---- */
+
+  .strat-row {
+    all: unset;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 6px var(--spacing-sm);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: border-color 0.1s, opacity 0.15s;
+  }
+
+  .strat-row:hover {
+    border-color: var(--border-active);
+  }
+
+  .strat-row.best {
+    border-color: rgba(34, 197, 94, 0.3);
+  }
+
+  .strat-row.dimmed {
+    opacity: 0.4;
+  }
+
+  .strat-header {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+  }
+
+  .strat-eye {
+    font-size: 11px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  .strat-rank {
+    font-size: 10px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    flex-shrink: 0;
+  }
+
+  .strat-name {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .strat-numbers {
+    display: flex;
+    align-items: baseline;
+    gap: var(--spacing-sm);
+    padding-left: 26px; /* align with name */
+  }
+
+  .strat-cost {
+    font-size: var(--font-size-base);
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  .strat-cost {
+    min-width: 55px;
+  }
+
+  .strat-per-year {
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+
+  .strat-savings {
+    font-size: 10px;
+    margin-left: auto;
+  }
+
+  .strat-savings.positive {
+    color: var(--color-success, #22c55e);
+  }
+
+  .strat-savings.baseline {
+    color: var(--text-dim);
+  }
+
+  /* Cost bar */
+
+  .cost-bar-track {
+    height: 3px;
+    background: var(--bg-input);
+    border-radius: 1px;
+    overflow: hidden;
+    margin-left: 26px;
+  }
+
+  .cost-bar-fill {
+    height: 100%;
+    background: var(--text-dim);
+    border-radius: 1px;
+    transition: width 0.3s ease;
+  }
+
+  .cost-bar-fill.bar-best {
+    background: var(--color-success, #22c55e);
+  }
+
+  .cost-bar-fill.bar-worst {
+    background: var(--color-error, #ef4444);
+  }
+
+  /* ---- Detail comparison table ---- */
+
+  .detail-section {
+    margin-top: var(--spacing-sm);
+    padding-top: var(--spacing-sm);
+    border-top: 1px solid var(--border);
+  }
+
+  .detail-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10px;
+    margin-top: var(--spacing-xs);
+  }
+
+  .detail-table th {
+    padding: 2px 3px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    max-width: 36px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .detail-metric-col {
+    text-align: left !important;
+  }
+
+  .detail-strat-col {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .detail-table td {
+    padding: 2px 3px;
     border-bottom: 1px solid var(--border);
   }
 
-  .comparison-table .metric-label {
+  .detail-label {
     color: var(--text-dim);
-    text-align: left;
     white-space: nowrap;
   }
 
-  .metric-unit-label {
+  .detail-unit {
     color: var(--text-dim);
-    font-size: 10px;
+    font-size: 9px;
+    margin-left: 2px;
+    opacity: 0.6;
   }
 
-  .comparison-table .metric-value {
+  .detail-val {
     text-align: right;
     color: var(--text-primary);
-    font-size: var(--font-size-sm);
   }
 
-  .best-value {
-    color: var(--color-success);
+  .best-val {
+    color: var(--color-success, #22c55e);
   }
 
   /* ---- Errors ---- */

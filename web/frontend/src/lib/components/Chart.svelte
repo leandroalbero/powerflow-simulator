@@ -3,7 +3,7 @@
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
 
-  import { currentRun, strategies, addLog } from '../stores/simulation';
+  import { currentRun, strategies, addLog, chartVisibleStrategies, addChartVisibility } from '../stores/simulation';
   import { systemConfig } from '../stores/config';
   import { getTimeseries } from '../api/client';
   import type { TimeseriesResponse, StrategyRunState } from '../types/index';
@@ -44,9 +44,8 @@
     peak: 'rgba(239, 68, 68, 0.05)',
   };
 
-  const DEFAULT_MAX_POINTS = 2000;
-  const ZOOM_MAX_POINTS = 4000;
-  const ZOOM_THRESHOLD_DAYS = 3;
+  const DEFAULT_MAX_POINTS = 4000;
+  const ZOOM_THRESHOLD_DAYS = 30;
 
   // ---- State ----
 
@@ -75,6 +74,13 @@
   /** ResizeObserver for chart container. */
   let resizeObserver: ResizeObserver | null = null;
 
+  /** Prevent re-fetch for the same zoom range. */
+  let lastZoomRange = '';
+
+  /** Full data x-range for zoom reset. */
+  let fullXMin: number | null = null;
+  let fullXMax: number | null = null;
+
   // ---- Reactive: watch for completed strategies ----
 
   $: runResults = $currentRun?.results ?? new Map<string, StrategyRunState>();
@@ -91,10 +97,11 @@
     }
   }
 
-  // ---- Reactive: rebuild charts when data changes ----
+  // ---- Reactive: rebuild charts when data or visibility changes ----
 
   $: loadedKeys = [...loadedData.keys()].sort().join(',');
-  $: if (loadedKeys && powerChartEl && batteryChartEl) {
+  $: visibleKeys = [...$chartVisibleStrategies].sort().join(',');
+  $: if (loadedKeys && powerChartEl && batteryChartEl && visibleKeys !== undefined) {
     rebuildCharts();
   }
 
@@ -138,6 +145,7 @@
 
       loadedData.set(strategyId, data);
       loadedData = new Map(loadedData); // trigger reactivity
+      addChartVisibility(strategyId);
 
       if (!firstLoadedStrategy) {
         firstLoadedStrategy = strategyId;
@@ -214,23 +222,77 @@
     return containerEl.clientWidth - 2; // account for border
   }
 
+  function resetZoom() {
+    if (!powerChart || !batteryChart || fullXMin == null || fullXMax == null) return;
+
+    // Reset scale to full range
+    syncing = true;
+    powerChart.setScale('x', { min: fullXMin, max: fullXMax });
+    batteryChart.setScale('x', { min: fullXMin, max: fullXMax });
+    syncing = false;
+
+    // Reload full-resolution data if we were zoomed in
+    if (isZoomed && runId) {
+      lastZoomRange = '';
+      isZoomed = false;
+      const promises = [...loadedData.keys()].map(stratId =>
+        loadTimeseries(runId!, stratId, { maxPoints: DEFAULT_MAX_POINTS })
+      );
+      Promise.all(promises).then(() => {
+        const arrays = buildChartArrays();
+        if (arrays && powerChart && batteryChart) {
+          powerChart.setData(arrays.powerData);
+          batteryChart.setData(arrays.batteryData);
+        }
+      });
+    }
+  }
+
+  function getVisibleStrategyIds(): string[] {
+    const all = [...loadedData.keys()];
+    return all.filter(id => $chartVisibleStrategies.has(id));
+  }
+
   function rebuildCharts() {
     destroyCharts();
 
-    const strategyIds = [...loadedData.keys()];
+    const strategyIds = getVisibleStrategyIds();
     if (strategyIds.length === 0) return;
 
     const firstData = loadedData.get(strategyIds[0])!;
     const timestamps = parseTimestamps(firstData.timestamps);
+
+    // Store full range for zoom reset
+    fullXMin = timestamps[0];
+    fullXMax = timestamps[timestamps.length - 1];
 
     const tariffZones = getTariffZones();
     const drawHook = buildTariffDrawHook(tariffZones);
     const chartWidth = getContainerWidth();
 
     // ---- Power Chart ----
-    const powerSeries: uPlot.Series[] = [{ label: 'Time' }];
+    const fmtTime = "{YYYY}-{MM}-{DD} {HH}:{mm}";
+    const fmtKw = (self: uPlot, rawValue: number, seriesIdx: number, idx: number | null) => rawValue == null ? '--' : rawValue.toFixed(2) + ' kW';
+    const fmtKwh = (self: uPlot, rawValue: number, seriesIdx: number, idx: number | null) => rawValue == null ? '--' : rawValue.toFixed(2) + ' kWh';
+
+    const powerSeries: uPlot.Series[] = [{ label: 'Time', value: fmtTime }];
     const powerData: uPlot.AlignedData = [timestamps];
-    const powerFields = ['solar_power', 'house_consumption', 'grid_import', 'grid_export'] as const;
+
+    // Solar and load are strategy-independent — add only once
+    const sharedFields = ['solar_power', 'house_consumption'] as const;
+    const perStrategyFields = ['grid_import', 'grid_export'] as const;
+
+    const firstStratData = loadedData.get(strategyIds[0])!;
+    for (const field of sharedFields) {
+      powerSeries.push({
+        label: SERIES_LABELS[field],
+        stroke: SERIES_COLORS[field],
+        width: 1.5,
+        value: fmtKw,
+        points: { show: false, size: 0, fill: '' },
+      });
+      powerData.push(firstStratData[field] as number[]);
+    }
 
     for (let si = 0; si < strategyIds.length; si++) {
       const stratId = strategyIds[si];
@@ -238,13 +300,15 @@
       const dashPattern = DASH_PATTERNS[si % DASH_PATTERNS.length];
       const label = strategyIds.length > 1 ? getStrategyName(stratId) : '';
 
-      for (const field of powerFields) {
+      for (const field of perStrategyFields) {
         const seriesLabel = label ? `${SERIES_LABELS[field]} (${label})` : SERIES_LABELS[field];
         powerSeries.push({
           label: seriesLabel,
           stroke: SERIES_COLORS[field],
           width: 1.5,
           dash: dashPattern.length > 0 ? dashPattern : undefined,
+          value: fmtKw,
+          points: { show: false, size: 0, fill: '' },
         });
         powerData.push(data[field] as number[]);
       }
@@ -271,8 +335,10 @@
         ],
       },
       cursor: {
+        show: true,
         sync: { key: 'chart-sync', setSeries: true },
         drag: { x: true, y: false },
+        focus: { prox: 30 },
       },
       scales: {
         x: { time: true },
@@ -303,11 +369,12 @@
       series: powerSeries,
       legend: {
         show: true,
+        live: true,
       },
     };
 
     // ---- Battery Chart ----
-    const batterySeries: uPlot.Series[] = [{ label: 'Time' }];
+    const batterySeries: uPlot.Series[] = [{ label: 'Time', value: fmtTime }];
     const batteryData: uPlot.AlignedData = [timestamps];
 
     for (let si = 0; si < strategyIds.length; si++) {
@@ -323,6 +390,8 @@
         width: 1.5,
         dash: dashPattern.length > 0 ? dashPattern : undefined,
         fill: si === 0 ? 'rgba(139, 92, 246, 0.1)' : undefined,
+        value: fmtKwh,
+        points: { show: false, size: 0, fill: '' },
       });
       batteryData.push(data.battery_level);
     }
@@ -348,8 +417,10 @@
         ],
       },
       cursor: {
+        show: true,
         sync: { key: 'chart-sync', setSeries: true },
         drag: { x: true, y: false },
+        focus: { prox: 30 },
       },
       scales: {
         x: { time: true },
@@ -377,13 +448,16 @@
       series: batterySeries,
       legend: {
         show: true,
+        live: true,
       },
     };
 
-    // Calculate heights
+    // Calculate heights — reserve space for legends below each canvas
+    const LEGEND_ROOM = 80; // ~50px power legend + ~30px battery legend
     const availableHeight = containerEl ? (containerEl.clientHeight - 28) : 400; // minus panel header
-    const powerHeight = Math.floor(availableHeight * 0.65);
-    const batteryHeight = availableHeight - powerHeight;
+    const chartArea = Math.max(availableHeight - LEGEND_ROOM, 200);
+    const powerHeight = Math.floor(chartArea * 0.65);
+    const batteryHeight = chartArea - powerHeight;
 
     powerOpts.height = Math.max(powerHeight, 100);
     batteryOpts.height = Math.max(batteryHeight, 80);
@@ -405,25 +479,89 @@
 
   // ---- Zoom handling ----
 
+  /** Track whether current data is zoomed (filtered) so we can detect zoom-out. */
+  let isZoomed = false;
+
+  /** Build uPlot-ready data arrays from loadedData (visible strategies only). */
+  function buildChartArrays() {
+    const strategyIds = getVisibleStrategyIds();
+    if (strategyIds.length === 0) return null;
+
+    const firstData = loadedData.get(strategyIds[0])!;
+    const timestamps = parseTimestamps(firstData.timestamps);
+
+    const sharedFields = ['solar_power', 'house_consumption'] as const;
+    const perStrategyFields = ['grid_import', 'grid_export'] as const;
+    const powerData: uPlot.AlignedData = [timestamps];
+    const batteryData: uPlot.AlignedData = [timestamps];
+
+    // Shared fields once from first strategy
+    const firstStratData = loadedData.get(strategyIds[0])!;
+    for (const field of sharedFields) {
+      powerData.push(firstStratData[field] as number[]);
+    }
+
+    for (const stratId of strategyIds) {
+      const data = loadedData.get(stratId)!;
+      for (const field of perStrategyFields) {
+        powerData.push(data[field] as number[]);
+      }
+      batteryData.push(data.battery_level);
+    }
+
+    return { powerData, batteryData };
+  }
+
   function handleZoom(xMin: number, xMax: number) {
     if (!runId) return;
 
     const rangeDays = (xMax - xMin) / 86400;
+    const rangeKey = `${xMin.toFixed(0)}-${xMax.toFixed(0)}`;
+
+    // Skip if we just loaded data for this exact range
+    if (rangeKey === lastZoomRange) return;
 
     if (zoomDebounce) clearTimeout(zoomDebounce);
 
-    zoomDebounce = setTimeout(() => {
+    zoomDebounce = setTimeout(async () => {
       if (rangeDays < ZOOM_THRESHOLD_DAYS && rangeDays > 0) {
-        const startDate = new Date(xMin * 1000).toISOString().split('T')[0];
-        const endDate = new Date(xMax * 1000).toISOString().split('T')[0];
+        // Scale points: more points for tighter zoom
+        const maxPoints = Math.round(4000 + (rangeDays / ZOOM_THRESHOLD_DAYS) * 4000);
 
-        for (const stratId of loadedData.keys()) {
-          loadTimeseries(runId!, stratId, {
-            start: startDate,
-            end: endDate,
-            maxPoints: ZOOM_MAX_POINTS,
-          });
+        const start = new Date(xMin * 1000).toISOString();
+        const end = new Date(xMax * 1000).toISOString();
+
+        lastZoomRange = rangeKey;
+
+        // Fetch all strategies in parallel, then update charts in-place
+        const promises = [...loadedData.keys()].map(stratId =>
+          loadTimeseries(runId!, stratId, { start, end, maxPoints })
+        );
+        await Promise.all(promises);
+
+        // Update charts with new higher-res data (no full rebuild)
+        const arrays = buildChartArrays();
+        if (arrays && powerChart && batteryChart) {
+          powerChart.setData(arrays.powerData);
+          batteryChart.setData(arrays.batteryData);
+          addLog(`Zoom: loaded ${loadedData.values().next().value?.point_count ?? '?'} points for ${rangeDays.toFixed(1)} days`);
         }
+        isZoomed = true;
+      } else if (isZoomed) {
+        // Zoomed back out past threshold — reload full data
+        lastZoomRange = '';
+
+        const promises = [...loadedData.keys()].map(stratId =>
+          loadTimeseries(runId!, stratId, { maxPoints: DEFAULT_MAX_POINTS })
+        );
+        await Promise.all(promises);
+
+        const arrays = buildChartArrays();
+        if (arrays && powerChart && batteryChart) {
+          powerChart.setData(arrays.powerData);
+          batteryChart.setData(arrays.batteryData);
+        }
+        isZoomed = false;
       }
     }, 400);
   }
@@ -437,20 +575,29 @@
       loadedData = new Map();
       loadingStrategies = new Set();
       firstLoadedStrategy = null;
+      isZoomed = false;
+      lastZoomRange = '';
+      chartVisibleStrategies.set(new Set());
       destroyCharts();
     }
   }
 
   // ---- Lifecycle ----
 
+  function handleDblClick() {
+    resetZoom();
+  }
+
   onMount(() => {
     // Observe container resizes
     resizeObserver = new ResizeObserver(() => {
       if (powerChart && batteryChart && containerEl) {
         const chartWidth = getContainerWidth();
+        const LEGEND_ROOM = 80;
         const availableHeight = containerEl.clientHeight - 28;
-        const powerHeight = Math.floor(availableHeight * 0.65);
-        const batteryHeight = availableHeight - powerHeight;
+        const chartArea = Math.max(availableHeight - LEGEND_ROOM, 200);
+        const powerHeight = Math.floor(chartArea * 0.65);
+        const batteryHeight = chartArea - powerHeight;
 
         powerChart.setSize({
           width: chartWidth,
@@ -465,11 +612,15 @@
 
     if (containerEl) {
       resizeObserver.observe(containerEl);
+      containerEl.addEventListener('dblclick', handleDblClick);
     }
   });
 
   onDestroy(() => {
     destroyCharts();
+    if (containerEl) {
+      containerEl.removeEventListener('dblclick', handleDblClick);
+    }
     if (resizeObserver) {
       resizeObserver.disconnect();
       resizeObserver = null;
@@ -486,6 +637,10 @@
     {#if loadedData.size > 0}
       <span class="chart-info">
         {loadedData.size} strateg{loadedData.size === 1 ? 'y' : 'ies'}
+        {#if isZoomed}
+          &middot; <button class="reset-zoom-btn" on:click={resetZoom}>Reset Zoom</button>
+          <span class="zoom-hint">(or double-click)</span>
+        {/if}
       </span>
     {/if}
   </div>
@@ -539,6 +694,31 @@
     font-family: var(--font-mono);
   }
 
+  .reset-zoom-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 1px 6px;
+    border-radius: 2px;
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
+  .reset-zoom-btn:hover {
+    border-color: var(--border-active);
+    color: var(--text-primary);
+  }
+
+  .zoom-hint {
+    font-size: 9px;
+    color: var(--text-dim);
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
   .chart-placeholder {
     flex: 1;
     display: flex;
@@ -561,12 +741,13 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
   }
 
   .power-chart,
   .battery-chart {
-    overflow: hidden;
+    flex-shrink: 0;
   }
 
   /* Override uPlot styles to match theme */
@@ -592,6 +773,8 @@
   .chart-container :global(.u-legend .u-value) {
     color: var(--text-primary);
     font-family: var(--font-mono);
+    min-width: 5em;
+    text-align: right;
   }
 
   .chart-container :global(.u-select) {
@@ -600,6 +783,10 @@
 
   .chart-container :global(.u-cursor-x),
   .chart-container :global(.u-cursor-y) {
-    border-color: rgba(136, 136, 160, 0.3);
+    border-color: rgba(136, 136, 160, 0.5);
+  }
+
+  .chart-container :global(.u-legend) {
+    text-align: left;
   }
 </style>

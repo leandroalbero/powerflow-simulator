@@ -37,3 +37,11 @@ async def upload_data(
         raise HTTPException(status_code=422, detail=str(e))
 
     return data_service.get_data_info()
+
+
+@router.post("/data/reload", response_model=DataInfo)
+def reload_data(request: Request) -> DataInfo:
+    """Reload CSV files from disk without restarting the server."""
+    data_service = request.app.state.data_service
+    data_service.load_default_data()
+    return data_service.get_data_info()

@@ -1,0 +1,13 @@
+
+from web.backend.services.simulation_service import _STRATEGY_CLASSES, STRATEGY_MAP
+
+
+class TestOracleRegistration:
+    def test_oracle_in_strategy_registry(self):
+        """Oracle should appear in the strategy registry."""
+        assert "oracle" in STRATEGY_MAP
+        assert STRATEGY_MAP["oracle"].name == "Oracle Optimizer"
+
+    def test_oracle_in_strategy_classes(self):
+        """Oracle strategy class should be registered."""
+        assert "oracle" in _STRATEGY_CLASSES

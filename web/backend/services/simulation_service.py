@@ -3,10 +3,11 @@
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
+import numpy as np
+import pandas as pd
 import pytz
 
 from src.domain.battery.models import Battery
@@ -15,19 +16,29 @@ from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.solar_generator.solar_generator import SolarGenerator
+from src.domain.strategy.forecast_loader import load_daily_forecasts
 from src.domain.strategy.model import (
     ForceChargeAtNightStrategy,
     ForceChargeAtValleyStrategy,
     ForceChargeValleyAndPrePeakStrategy,
+    ForecastChargeStrategy,
     SelfConsumeStrategy,
+    SmartDischargeStrategy,
+    ValleyChargePeakDischargeStrategy,
 )
+from src.domain.strategy.mpc import (
+    CalibratedSolarForecaster,
+    LoadForecaster,
+    MpcStrategy,
+    PerfectSolarForecaster,
+    SolarForecaster,
+    learn_monthly_ghi_factors,
+    load_hourly_ghi_forecasts,
+)
+from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
-    BatteryConfig,
-    GridConfig,
     StrategyInfo,
-    StrategyMetrics,
     SystemConfig,
-    TariffConfig,
 )
 from web.backend.services.data_service import DataService
 
@@ -60,6 +71,66 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         description="Charge battery during valley and pre-peak shoulder windows. "
         "Discharge during peak hours for maximum savings.",
     ),
+    StrategyInfo(
+        id="forecast_charge",
+        name="Forecast Charge",
+        description="Uses day-ahead solar irradiance forecasts to set night charge target. "
+        "Skips charging on sunny days, charges fully on cloudy days.",
+    ),
+    StrategyInfo(
+        id="smart_discharge",
+        name="Smart Discharge",
+        description="Charge at valley, discharge morning shoulder + evening peak. "
+        "Morning discharge creates room for solar; holds battery for evening when solar is gone.",
+    ),
+    StrategyInfo(
+        id="valley_charge_peak_discharge",
+        name="Valley Charge, Peak Discharge",
+        description="Charge at cheapest valley rate, discharge only during peak-rate hours. "
+        "Preserves battery for highest-value periods instead of wasting on shoulder.",
+    ),
+    StrategyInfo(
+        id="oracle",
+        name="Oracle Optimizer",
+        description="Computes the theoretical minimum cost using linear programming with "
+        "perfect foresight. Not deployable — serves as a benchmark.",
+    ),
+    StrategyInfo(
+        id="mpc",
+        name="Model Predictive Control",
+        description="Rolling 24h LP with solar forecasts and learned load profiles. "
+        "Re-solves every 15 minutes. Deployable in real-time.",
+    ),
+    StrategyInfo(
+        id="mpc_calibrated",
+        name="MPC (Calibrated Solar)",
+        description="MPC with monthly-calibrated GHI forecast. Learns seasonal correction "
+        "factors from historical actual-vs-forecast data to fix systematic bias.",
+    ),
+    StrategyInfo(
+        id="mpc_5min",
+        name="MPC 5-min (Calibrated)",
+        description="MPC at 5-min resolution with calibrated solar forecast. "
+        "Finer battery control and faster re-solving for better load tracking.",
+    ),
+    StrategyInfo(
+        id="mpc_5min_perfect",
+        name="MPC 5-min (Perfect Solar)",
+        description="MPC at 5-min resolution with perfect solar foresight. "
+        "Shows the ceiling for high-resolution MPC.",
+    ),
+    StrategyInfo(
+        id="mpc_perfect",
+        name="MPC (Perfect Solar)",
+        description="MPC with perfect solar foresight — uses actual solar data instead of "
+        "GHI forecast. Shows MPC ceiling without forecast error.",
+    ),
+    StrategyInfo(
+        id="dqn_agent",
+        name="DQN Agent",
+        description="Deep Q-Network reinforcement learning agent trained on historical data. "
+        "Uses learned policy for charge/discharge decisions.",
+    ),
 ]
 
 STRATEGY_MAP = {s.id: s for s in STRATEGY_REGISTRY}
@@ -70,6 +141,16 @@ _STRATEGY_CLASSES = {
     "charge_night": ForceChargeAtNightStrategy,
     "force_valleys": ForceChargeAtValleyStrategy,
     "force_valleys_pre_peak": ForceChargeValleyAndPrePeakStrategy,
+    "forecast_charge": ForecastChargeStrategy,
+    "smart_discharge": SmartDischargeStrategy,
+    "valley_charge_peak_discharge": ValleyChargePeakDischargeStrategy,
+    "oracle": OracleStrategy,
+    "mpc": MpcStrategy,
+    "mpc_calibrated": MpcStrategy,
+    "mpc_5min": MpcStrategy,
+    "mpc_5min_perfect": MpcStrategy,
+    "mpc_perfect": MpcStrategy,
+    # dqn_agent: lazy-imported in _run_strategy to avoid torch import at startup
 }
 
 
@@ -189,6 +270,16 @@ class SimulationService:
         # Fetch data once (shared across strategies — read only)
         solar_df, load_df = self.data_service.get_filtered_data(start, end)
 
+        # Load forecasts once if needed (shared across threads)
+        daily_forecasts = (
+            load_daily_forecasts() if "forecast_charge" in strategy_ids else None
+        )
+        hourly_ghi_forecasts = (
+            load_hourly_ghi_forecasts()
+            if any(s in strategy_ids for s in ("mpc", "mpc_calibrated", "mpc_5min"))
+            else None
+        )
+
         for sid in strategy_ids:
             self._executor.submit(
                 self._run_strategy,
@@ -201,6 +292,8 @@ class SimulationService:
                 on_strategy_done,
                 on_run_done,
                 strategy_ids,
+                daily_forecasts,
+                hourly_ghi_forecasts,
             )
 
         return run_id
@@ -209,13 +302,15 @@ class SimulationService:
         self,
         run: SimulationRun,
         strategy_id: str,
-        solar_df,
-        load_df,
+        solar_df: pd.DataFrame,
+        load_df: pd.DataFrame,
         config: SystemConfig,
         on_progress: Optional[ProgressCallback],
         on_strategy_done: Optional[StrategyDoneCallback],
         on_run_done: Optional[RunDoneCallback],
         all_strategy_ids: List[str],
+        daily_forecasts: Optional[Dict] = None,
+        hourly_ghi_forecasts: Optional[Dict] = None,
     ) -> None:
         result = run.strategies[strategy_id]
         result.status = "running"
@@ -229,10 +324,83 @@ class SimulationService:
             solar = SolarGenerator(solar_df)
 
             strategy_cls = _STRATEGY_CLASSES.get(strategy_id)
-            if strategy_cls is None:
+            if strategy_cls is None and strategy_id != "dqn_agent":
                 raise ValueError(f"Unknown strategy: {strategy_id}")
 
-            strategy = strategy_cls(battery, grid, tariff)
+            if strategy_id == "forecast_charge":
+                strategy = strategy_cls(battery, grid, tariff, daily_forecasts)
+            elif strategy_id == "mpc":
+                load_forecaster = LoadForecaster(load_df)
+                solar_forecaster = SolarForecaster(hourly_ghi_forecasts or {})
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                )
+            elif strategy_id == "mpc_calibrated":
+                load_forecaster = LoadForecaster(load_df)
+                ghi_fc = hourly_ghi_forecasts or {}
+                monthly_factors = learn_monthly_ghi_factors(solar_df, ghi_fc)
+                solar_forecaster = CalibratedSolarForecaster(ghi_fc, monthly_factors)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                )
+            elif strategy_id == "mpc_5min":
+                load_forecaster = LoadForecaster(load_df)
+                ghi_fc = hourly_ghi_forecasts or {}
+                monthly_factors = learn_monthly_ghi_factors(solar_df, ghi_fc)
+                solar_forecaster = CalibratedSolarForecaster(ghi_fc, monthly_factors)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                    step_minutes=5, resolve_minutes=5,
+                )
+            elif strategy_id == "mpc_5min_perfect":
+                load_forecaster = LoadForecaster(load_df)
+                solar_forecaster = PerfectSolarForecaster(solar_df)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                    step_minutes=5, resolve_minutes=5,
+                )
+            elif strategy_id == "mpc_perfect":
+                load_forecaster = LoadForecaster(load_df)
+                solar_forecaster = PerfectSolarForecaster(solar_df)
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    load_forecaster=load_forecaster,
+                    solar_forecaster=solar_forecaster,
+                )
+            elif strategy_id == "dqn_agent":
+                import os
+                from src.domain.strategy.dqn.agent import DqnAgent
+                from src.domain.strategy.dqn_strategy import DqnStrategy as DqnStrategyCls
+                agent = DqnAgent(state_dim=16, action_dim=9)
+                model_path = "output_files/dqn_policy.pt"
+                if os.path.exists(model_path):
+                    agent.load(model_path)
+                strategy = DqnStrategyCls(battery, grid, tariff, agent=agent)
+            elif strategy_id == "oracle":
+                # Resample to 5-min (inverter granularity) for tight LP
+                solar_5m = solar_df.resample("5min").mean().fillna(0.0)
+                load_5m = load_df.resample("5min").mean().fillna(0.0)
+                common_idx = solar_5m.index.intersection(load_5m.index)
+                solar_kw = solar_5m.loc[common_idx, "state"].values / 1000.0
+                load_kw = load_5m.loc[common_idx, "state"].values / 1000.0
+                hours_arr = np.array([ts.hour for ts in common_idx])
+                durations = np.full(len(common_idx), 5.0 / 60.0)  # 5 min each
+                strategy = strategy_cls(
+                    battery, grid, tariff,
+                    solar=solar_kw, load=load_kw,
+                    hours=hours_arr, durations=durations,
+                    timestamps=list(common_idx),
+                )
+            else:
+                strategy = strategy_cls(battery, grid, tariff)
             # Apply strategy config
             sc = config.strategy
             strategy.min_battery_level = sc.min_battery_level
@@ -247,6 +415,10 @@ class SimulationService:
             last_reported = -1
 
             for i, timestamp in enumerate(timestamps):
+                if hasattr(strategy, 'current_date'):
+                    strategy.current_date = timestamp.date()
+                if hasattr(strategy, 'set_timestamp'):
+                    strategy.set_timestamp(timestamp)
                 sim.step(timestamp, prev_timestamp)
                 prev_timestamp = timestamp
 
