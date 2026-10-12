@@ -10,6 +10,8 @@ class StrategyInfo(BaseModel):
     name: str
     description: str
     group: Literal["core", "advanced", "experimental"] = "advanced"
+    available: bool = True
+    unavailable_reason: Optional[str] = None
 
 
 # --- Battery / Grid / Tariff config ---
@@ -111,6 +113,7 @@ class ConfigResponse(BaseModel):
     tariff: TariffConfig
     strategy: StrategyConfig
     data_date_range: Optional[DateRange] = None
+    exclude_ev: bool = False
 
 
 # --- Simulation ---
@@ -120,6 +123,7 @@ class SimulationRequest(BaseModel):
     date_range: Optional[DateRange] = None
     config: Optional[SystemConfig] = Field(
         None, description="Configuration for this run; defaults to the server's current config")
+    label: Optional[str] = None
 
 
 class SimulationStartResponse(BaseModel):
@@ -179,6 +183,7 @@ class StrategyMetrics(BaseModel):
 class StrategyResult(BaseModel):
     strategy_id: str
     status: str
+    progress: int = 0
     metrics: Optional[StrategyMetrics] = None
     error: Optional[str] = None
 
@@ -187,6 +192,10 @@ class RunSummary(BaseModel):
     run_id: str
     status: str
     strategies: List[StrategyResult]
+    label: Optional[str] = None
+    created_at: Optional[str] = None
+    date_range: Optional[DateRange] = None
+    config: Optional[SystemConfig] = None
 
 
 class TimeseriesResponse(BaseModel):
@@ -197,6 +206,15 @@ class TimeseriesResponse(BaseModel):
     solar_power: List[Optional[float]]
     house_consumption: List[Optional[float]]
     point_count: int
+    ts: List[int] = Field(default_factory=list)
+    battery_charge: List[Optional[float]] = Field(default_factory=list)
+    battery_discharge: List[Optional[float]] = Field(default_factory=list)
+    soc_pct: List[Optional[float]] = Field(default_factory=list)
+    import_price: List[Optional[float]] = Field(default_factory=list)
+    export_price: List[Optional[float]] = Field(default_factory=list)
+    step_cost: List[Optional[float]] = Field(default_factory=list)
+    downsampled: bool = False
+    resolution_minutes: float = 1.0
 
 
 # --- Data info ---
@@ -221,3 +239,5 @@ class DataInfo(BaseModel):
     entities: List[str] = Field(default_factory=list)
     source: Optional[str] = Field(None, description="'store' (parquet) or 'csv'")
     uploads: List[str] = Field(default_factory=list, description="Entities overridden by an uploaded CSV")
+    has_ev: bool = False
+    has_measured: bool = False

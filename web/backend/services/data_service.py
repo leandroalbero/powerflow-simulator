@@ -36,7 +36,7 @@ STORE_ENTITIES = ("pv", "load", "battery", "grid", "soc", "ev")
 LEGACY_CSVS = {"pv": "pv_power_highres.csv", "load": "house_consumption_highres.csv"}
 FRAME_CACHE_SIZE = 4
 
-FrameKey = Tuple[Optional[str], Optional[str], bool]
+FrameKey = Tuple[Optional[str], Optional[str], bool, bool]
 
 
 def data_dir() -> Path:
@@ -104,17 +104,19 @@ class DataService:
     # --- frames ---
 
     def get_frame(self, start: Optional[str] = None, end: Optional[str] = None,
-                  exclude_ev: bool = False) -> pd.DataFrame:
+                  exclude_ev: bool = False, include_measured: bool = False) -> pd.DataFrame:
         if not self.has_data():
             raise ValueError("Data not loaded. Load or upload CSV files first.")
-        key: FrameKey = (start, end, exclude_ev)
+        key: FrameKey = (start, end, exclude_ev, include_measured)
         with self._lock:
             frame = self._frames.get(key)
             if frame is not None:
                 self._frames.move_to_end(key)
                 return frame
             reader = self._reader()
-        frame = build_power_frame(start, end, exclude_ev=exclude_ev, reader=reader)
+        frame = build_power_frame(
+            start, end, exclude_ev=exclude_ev, include_measured=include_measured, reader=reader,
+        )
         with self._lock:
             self._frames[key] = frame
             while len(self._frames) > FRAME_CACHE_SIZE:
@@ -171,6 +173,8 @@ class DataService:
             entities=entities,
             source="store" if self.use_store else "csv",
             uploads=sorted(self.uploads),
+            has_ev="ev" in entities,
+            has_measured={"grid", "battery", "soc"} <= set(entities),
         )
         self._info = info
         return info

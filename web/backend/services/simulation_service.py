@@ -1,12 +1,16 @@
 """Wraps domain simulation code, runs strategies in background threads, stores results."""
 
 import logging
+import threading
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
-from threading import Lock
+from datetime import datetime, timedelta
+from pathlib import Path
+from threading import Event, Lock
 from typing import Any, Callable, Dict, List, Optional, cast
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -37,11 +41,16 @@ from web.backend.models.schemas import (
     StrategyInfo,
     SystemConfig,
 )
+from web.backend.services.cancel import RunCancelled
 from web.backend.services.data_service import DataService
+from web.backend.services.history_store import HistoryStore, config_digest
 from web.backend.services.pvpc_service import PvpcService
 
 LOCAL_TZ = pytz.timezone("Europe/Madrid")
 logger = logging.getLogger(__name__)
+_DQN_POLICY = Path(__file__).resolve().parents[3] / "output_files" / "dqn_policy.pt"
+_TERMINAL = ("completed", "failed", "cancelled")
+_TS_LIMIT = 8
 
 # --- Strategy registry ---
 
@@ -190,12 +199,15 @@ class StrategyRunResult:
 @dataclass
 class SimulationRun:
     run_id: str
-    status: str = "running"  # running | completed | failed
+    status: str = "running"  # running | completed | failed | cancelled
     strategies: Dict[str, StrategyRunResult] = field(default_factory=dict)
     lock: Lock = field(default_factory=Lock)
     start: Optional[str] = None
     end: Optional[str] = None
     config: Optional[SystemConfig] = None
+    label: Optional[str] = None
+    created_at: str = ""
+    cancel: Event = field(default_factory=Event)
 
 
 # Progress callback type: (strategy_id, percent 0-100)
@@ -217,6 +229,23 @@ class RunInputs:
     pvpc_prices: Optional[Dict[datetime, float]] = None
 
 
+def _end_of_tomorrow(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    """23:00 Europe/Madrid on the calendar day after ``now``.
+
+    ``Timedelta(days=2)`` is 48 elapsed hours and is an hour off on DST eves.
+    """
+    if now is None:
+        now = pd.Timestamp.now(tz="Europe/Madrid")
+    else:
+        now = pd.Timestamp(now)
+        if now.tzinfo is None:
+            now = now.tz_localize("Europe/Madrid")
+        else:
+            now = now.tz_convert("Europe/Madrid")
+    day = now.date() + timedelta(days=2)
+    return pd.Timestamp(day).tz_localize("Europe/Madrid") - pd.Timedelta(hours=1)
+
+
 class SimulationService:
     """Manages simulation runs in background threads."""
 
@@ -230,6 +259,10 @@ class SimulationService:
         self.config = SystemConfig()
         self.runs: Dict[str, SimulationRun] = {}
         self._executor = ThreadPoolExecutor(max_workers=4)
+        self.history = HistoryStore()
+        self._ts_order: OrderedDict[str, None] = OrderedDict()
+        self.pool = None
+        self._progress_q = None
 
     # --- config ---
 
@@ -244,7 +277,15 @@ class SimulationService:
 
     @staticmethod
     def list_strategies() -> List[StrategyInfo]:
-        return STRATEGY_REGISTRY
+        missing = not _DQN_POLICY.exists()
+        reason = "DQN policy not trained: output_files/dqn_policy.pt missing" if missing else None
+        listed = []
+        for info in STRATEGY_REGISTRY:
+            if info.id == "dqn_agent" and missing:
+                listed.append(info.model_copy(update={"available": False, "unavailable_reason": reason}))
+            else:
+                listed.append(info.model_copy(update={"available": True, "unavailable_reason": None}))
+        return listed
 
     # --- build domain objects from config ---
 
@@ -342,22 +383,23 @@ class SimulationService:
         if len(set(strategy_ids)) != len(strategy_ids):
             raise ValueError("Duplicate strategies in request")
         bounds = []
-        for label, value in (("start", start), ("end", end)):
+        for label, value, is_end in (("start", start, False), ("end", end, True)):
             try:
-                bounds.append(to_utc_bound(value, is_end=False))
+                bounds.append(to_utc_bound(value, is_end=is_end))
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Invalid {label} date {value!r}: expected YYYY-MM-DD or ISO datetime") from exc
-        if bounds[0] is not None and bounds[1] is not None and bounds[0] > bounds[1]:
+        # A date-only end covers that whole local day, so compare against the exclusive end.
+        if bounds[0] is not None and bounds[1] is not None and bounds[0] >= bounds[1]:
             raise ValueError(f"start ({start}) must not be after end ({end})")
 
-    def _pvpc_window(self, frame: pd.DataFrame, config: SystemConfig) -> Optional[tuple]:
+    def _pvpc_window(self, frame: pd.DataFrame, config: SystemConfig,
+                     now: Optional[pd.Timestamp] = None) -> Optional[tuple]:
         if len(frame) == 0:
             return None
         lookahead = pd.Timedelta(hours=max(24, config.tariff.mpc_horizon_hours))
         needed_end = frame.index[-1] + lookahead
         # Prices are published for tomorrow at the latest; PvpcTariff falls back for later hours.
-        tomorrow_end = (pd.Timestamp.now(tz="Europe/Madrid").normalize() + pd.Timedelta(days=2)
-                        - pd.Timedelta(hours=1))
+        tomorrow_end = _end_of_tomorrow(now)
         end = min(needed_end, tomorrow_end)
         start = frame.index[0]
         if end < start:
@@ -370,6 +412,7 @@ class SimulationService:
         start: Optional[str] = None,
         end: Optional[str] = None,
         config: Optional[SystemConfig] = None,
+        label: Optional[str] = None,
         on_progress: Optional[ProgressCallback] = None,
         on_strategy_done: Optional[StrategyDoneCallback] = None,
         on_run_done: Optional[RunDoneCallback] = None,
@@ -384,7 +427,13 @@ class SimulationService:
             raise ValueError(f"No data between {start or 'the beginning'} and {end or 'the end'}")
 
         run_id = uuid.uuid4().hex[:12]
-        run = SimulationRun(run_id=run_id, start=start, end=end, config=config_snapshot)
+        created_at = datetime.now(ZoneInfo("Europe/Madrid")).isoformat()
+        run = SimulationRun(
+            run_id=run_id, start=start, end=end, config=config_snapshot,
+            label=label, created_at=created_at,
+        )
+        if self.pool is not None:
+            run.cancel = self.pool.manager.Event()
         for sid in strategy_ids:
             run.strategies[sid] = StrategyRunResult(strategy_id=sid)
         self.runs[run_id] = run
@@ -406,21 +455,101 @@ class SimulationService:
             self._fail_run(run, strategy_ids, f"{type(exc).__name__}: {exc}", on_strategy_done, on_run_done)
             return run_id
 
-        for sid in strategy_ids:
-            self._executor.submit(
-                self._run_strategy, run, sid, inputs, config_snapshot,
-                on_progress, on_strategy_done, on_run_done, strategy_ids,
-            )
+        if self.pool is not None:
+            for sid in strategy_ids:
+                self._submit_pooled(run, sid, inputs, config_snapshot, strategy_ids)
+        else:
+            for sid in strategy_ids:
+                self._executor.submit(
+                    self._run_strategy, run, sid, inputs, config_snapshot,
+                    on_progress, on_strategy_done, on_run_done, strategy_ids,
+                )
         return run_id
 
-    @staticmethod
-    def _fail_run(run: SimulationRun, strategy_ids: List[str], error: str,
+    def attach_pool(self, pool) -> None:
+        """Use the process pool created on the main thread. Progress comes back on a manager queue."""
+        self.pool = pool
+        self._progress_q = pool.manager.Queue()
+        threading.Thread(target=self._drain_progress, args=(self._progress_q,), daemon=True).start()
+
+    def _drain_progress(self, queue) -> None:
+        while True:
+            try:
+                item = queue.get()
+            except (EOFError, OSError):
+                return
+            if item is None:
+                return
+            run_id, strategy_id, pct = item
+            run = self.runs.get(run_id)
+            if run is None or strategy_id not in run.strategies:
+                continue
+            run.strategies[strategy_id].progress = pct
+
+    def _submit_pooled(self, run: SimulationRun, strategy_id: str, inputs: RunInputs,
+                       config: SystemConfig, all_strategy_ids: List[str]) -> None:
+        from web.backend.services.sim_worker import CasePayload, execute_case
+
+        run.strategies[strategy_id].status = "running"
+        payload = CasePayload(
+            frame=inputs.frame,
+            strategy_id=strategy_id,
+            config=config,
+            pvpc_prices=inputs.pvpc_prices,
+            history=inputs.history,
+            daily_forecasts=inputs.daily_forecasts,
+            cancel=run.cancel,
+            progress=self._progress_q,
+            job_id=run.run_id,
+        )
+        fut = self.pool.executor.submit(execute_case, payload)
+
+        def _done(future) -> None:
+            self._apply_output(run, strategy_id, future, all_strategy_ids)
+
+        fut.add_done_callback(_done)
+
+    def _apply_output(self, run: SimulationRun, strategy_id: str, future, all_strategy_ids: List[str]) -> None:
+        result = run.strategies[strategy_id]
+        try:
+            output = future.result()
+        except Exception as exc:  # noqa: BLE001 — pool boundary
+            output_status, error, metrics, timeseries = "failed", str(exc), None, None
+        else:
+            output_status, error = output.status, output.error
+            metrics, timeseries = output.metrics, output.timeseries
+        with run.lock:
+            result.status = output_status
+            result.error = error
+            result.metrics = metrics
+            result.timeseries = timeseries
+            if output_status == "completed":
+                result.progress = 100
+            self._finish_if_done(run, all_strategy_ids)
+
+    def _finish_if_done(self, run: SimulationRun, all_strategy_ids: List[str]) -> None:
+        if not all(run.strategies[sid].status in _TERMINAL for sid in all_strategy_ids):
+            return
+        if run.status != "running":
+            return
+        statuses = [run.strategies[sid].status for sid in all_strategy_ids]
+        if any(status == "cancelled" for status in statuses):
+            run.status = "cancelled"
+        elif all(status == "failed" for status in statuses):
+            run.status = "failed"
+        else:
+            run.status = "completed"
+        self._persist_run(run)
+        self._retain_timeseries(run.run_id)
+
+    def _fail_run(self, run: SimulationRun, strategy_ids: List[str], error: str,
                   on_strategy_done: Optional[StrategyDoneCallback], on_run_done: Optional[RunDoneCallback]) -> None:
         with run.lock:
             for sid in strategy_ids:
                 run.strategies[sid].status = "failed"
                 run.strategies[sid].error = error
             run.status = "failed"
+        self._persist_run(run)
         if on_strategy_done is not None:
             for sid in strategy_ids:
                 on_strategy_done(sid, "failed", None)
@@ -446,6 +575,8 @@ class SimulationService:
             strategy = self._build_strategy(strategy_id, config, inputs, tariff)
 
             def progress(pct: int) -> None:
+                if run.cancel.is_set():
+                    raise RunCancelled()
                 result.progress = pct
                 if on_progress is not None:
                     on_progress(strategy_id, pct)
@@ -460,6 +591,12 @@ class SimulationService:
             if on_strategy_done is not None:
                 on_strategy_done(strategy_id, "completed", sim.metrics)
 
+        except RunCancelled:
+            with run.lock:
+                result.status = "cancelled"
+                result.error = None
+            if on_strategy_done is not None:
+                on_strategy_done(strategy_id, "cancelled", None)
         except Exception as e:
             logger.exception("Strategy %s failed in run %s", strategy_id, run.run_id)
             with run.lock:
@@ -472,32 +609,179 @@ class SimulationService:
         # Check if all strategies finished (only first thread fires callback)
         should_fire_done = False
         with run.lock:
-            all_done = all(
-                run.strategies[sid].status in ("completed", "failed")
-                for sid in all_strategy_ids
-            )
+            all_done = all(run.strategies[sid].status in _TERMINAL for sid in all_strategy_ids)
             if all_done and run.status == "running":
-                all_failed = all(
-                    run.strategies[sid].status == "failed"
-                    for sid in all_strategy_ids
-                )
-                run.status = "failed" if all_failed else "completed"
+                statuses = [run.strategies[sid].status for sid in all_strategy_ids]
+                if any(status == "cancelled" for status in statuses):
+                    run.status = "cancelled"
+                elif all(status == "failed" for status in statuses):
+                    run.status = "failed"
+                else:
+                    run.status = "completed"
                 should_fire_done = True
 
-        if should_fire_done and on_run_done is not None:
-            on_run_done()
+        if should_fire_done:
+            self._persist_run(run)
+            self._retain_timeseries(run.run_id)
+            if on_run_done is not None:
+                on_run_done()
 
     # --- query results ---
 
     def get_run(self, run_id: str) -> Optional[SimulationRun]:
-        return self.runs.get(run_id)
+        run = self.runs.get(run_id)
+        if run is not None:
+            return run
+        return self._hydrate(run_id)
 
     def get_run_timeseries(self, run_id: str, strategy_id: str) -> Optional[Dict[str, np.ndarray]]:
         """Raw per-minute numpy arrays (``ts`` epoch ms; NaN on invalid minutes)."""
+        status, data = self.fetch_timeseries(run_id, strategy_id)
+        return data if status == "ok" else None
+
+    def fetch_timeseries(self, run_id: str, strategy_id: str) -> tuple[str, Optional[Dict[str, np.ndarray]]]:
+        run = self.runs.get(run_id)
+        if run is not None:
+            result = run.strategies.get(strategy_id)
+            if result is None:
+                return "missing", None
+            if result.timeseries is not None:
+                return "ok", result.timeseries
+            if result.status in ("pending", "running"):
+                return "not_ready", None
+            return "evicted", None
+        row = self.history.get_run(run_id)
+        if row is None:
+            return "missing", None
+        if strategy_id not in {item["strategy_id"] for item in row["strategies"]}:
+            return "missing", None
+        return "evicted", None
+
+    def cancel_run(self, run_id: str) -> Optional[str]:
         run = self.runs.get(run_id)
         if run is None:
+            row = self.history.get_run(run_id)
+            return None if row is None else row["status"]
+        run.cancel.set()
+        with run.lock:
+            for result in run.strategies.values():
+                if result.status == "pending":
+                    result.status = "cancelled"
+            if all(result.status in _TERMINAL for result in run.strategies.values()):
+                run.status = "cancelled" if any(
+                    result.status == "cancelled" for result in run.strategies.values()
+                ) else run.status
+                self._persist_run(run)
+        return run.status
+
+    def delete_run(self, run_id: str) -> bool:
+        removed = self.history.delete_run(run_id)
+        if run_id in self.runs:
+            del self.runs[run_id]
+            self._ts_order.pop(run_id, None)
+            removed = True
+        return removed
+
+    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for row in self.history.list_runs(limit):
+            merged[row["run_id"]] = _public_run(row)
+        for run in self.runs.values():
+            merged[run.run_id] = _public_run_memory(run)
+        items = sorted(merged.values(), key=lambda item: item["created_at"], reverse=True)
+        return items[:limit]
+
+    def _persist_run(self, run: SimulationRun) -> None:
+        if run.config is None:
+            return
+        self.history.upsert_run(
+            run_id=run.run_id,
+            label=run.label,
+            created_at=run.created_at,
+            status=run.status,
+            date_start=run.start,
+            date_end=run.end,
+            config=run.config.model_dump(mode="json"),
+            strategies=[_strategy_blob(result) for result in run.strategies.values()],
+        )
+
+    def _retain_timeseries(self, run_id: str) -> None:
+        self._ts_order[run_id] = None
+        self._ts_order.move_to_end(run_id)
+        while len(self._ts_order) > _TS_LIMIT:
+            old, _ = self._ts_order.popitem(last=False)
+            victim = self.runs.get(old)
+            if victim is None or victim.status == "running":
+                continue
+            for result in victim.strategies.values():
+                result.timeseries = None
+
+    def _hydrate(self, run_id: str) -> Optional[SimulationRun]:
+        row = self.history.get_run(run_id)
+        if row is None:
             return None
-        result = run.strategies.get(strategy_id)
-        if result is None or result.timeseries is None:
-            return None
-        return result.timeseries
+        config = SystemConfig.model_validate(row["config"])
+        run = SimulationRun(
+            run_id=row["run_id"],
+            status=row["status"],
+            start=row["date_range"].start if row["date_range"] else None,
+            end=row["date_range"].end if row["date_range"] else None,
+            config=config,
+            label=row["label"],
+            created_at=row["created_at"],
+        )
+        for item in row["strategies"]:
+            run.strategies[item["strategy_id"]] = StrategyRunResult(
+                strategy_id=item["strategy_id"],
+                status=item["status"],
+                progress=100 if item["status"] in _TERMINAL else 0,
+                metrics=item.get("metrics"),
+                error=item.get("error"),
+            )
+        return run
+
+
+def _strategy_blob(result: StrategyRunResult) -> dict[str, Any]:
+    return {
+        "strategy_id": result.strategy_id,
+        "status": result.status,
+        "progress": result.progress,
+        "metrics": result.metrics,
+        "error": result.error,
+    }
+
+
+def _public_run(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": row["run_id"],
+        "label": row["label"],
+        "created_at": row["created_at"],
+        "status": row["status"],
+        "date_range": row["date_range"],
+        "strategies": [
+            {
+                "strategy_id": item["strategy_id"],
+                "status": item["status"],
+                "total_cost": (item.get("metrics") or {}).get("total_cost"),
+                "adjusted_cost": (item.get("metrics") or {}).get("adjusted_cost"),
+            }
+            for item in row["strategies"]
+        ],
+        "config_digest": config_digest(row["config"]),
+    }
+
+
+def _public_run_memory(run: SimulationRun) -> dict[str, Any]:
+    date_range = None
+    if run.start and run.end:
+        from web.backend.models.schemas import DateRange
+        date_range = DateRange(start=run.start, end=run.end)
+    return _public_run({
+        "run_id": run.run_id,
+        "label": run.label,
+        "created_at": run.created_at,
+        "status": run.status,
+        "date_range": date_range,
+        "config": run.config.model_dump(mode="json") if run.config else {},
+        "strategies": [_strategy_blob(result) for result in run.strategies.values()],
+    })

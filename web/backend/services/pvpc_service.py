@@ -76,7 +76,7 @@ class PvpcService:
                 "PVPC cache miss: %d hours missing between %s and %s",
                 len(missing), start_utc.isoformat(), end_utc.isoformat(),
             )
-            fetched = self._fetch_missing(missing)
+            fetched = self._fetch_missing(missing, strict=strict)
             with self._write_lock:
                 self._insert_prices(fetched)
             cached.update(fetched)
@@ -163,12 +163,16 @@ class PvpcService:
     # -- fetching ----------------------------------------------------------------
 
     def _fetch_missing(
-        self, missing_hours: List[datetime]
+        self, missing_hours: List[datetime], strict: bool = True
     ) -> Dict[datetime, float]:
         """Group missing hours into contiguous ranges and fetch each.
 
-        Ranges are widened to full-day boundaries and split into 30-day
-        windows — REE returns at most ~31 days per request.
+        Ranges are split into ``MAX_WINDOW_DAYS`` windows (REE returns at
+        most ~31 days per request). With ``strict=False`` a failed window
+        that starts tomorrow (local) or later is logged and skipped: REE
+        answers HTTP 502 for a window holding only unpublished hours (e.g.
+        tomorrow before ~20:15). Earlier hours are published, so a failure
+        there still raises rather than silently pricing them by fallback.
         """
         if not missing_hours:
             return {}
@@ -187,11 +191,20 @@ class PvpcService:
         ranges.append((run_start, run_end))
 
         out: Dict[datetime, float] = {}
+        unpublished_from = _unpublished_from()
         for run_start, run_end in ranges:
             cursor = run_start
             while cursor <= run_end:
                 window_end = min(cursor + timedelta(days=MAX_WINDOW_DAYS) - timedelta(hours=1), run_end)
-                out.update(self._fetch_window(cursor, window_end))
+                try:
+                    out.update(self._fetch_window(cursor, window_end))
+                except RuntimeError as exc:
+                    if strict or cursor < unpublished_from:
+                        raise
+                    logger.warning(
+                        "PVPC prices unavailable for %s..%s, using tariff fallback: %s",
+                        cursor.isoformat(), window_end.isoformat(), exc,
+                    )
                 cursor = window_end + timedelta(hours=1)
         return out
 
@@ -204,11 +217,16 @@ class PvpcService:
         returned datetimes include explicit UTC offsets, so we always trust
         the response's offset rather than the request-side assumption.
         """
-        start_madrid = start_utc.astimezone(_MADRID_TZ)
-        end_madrid = end_utc.astimezone(_MADRID_TZ)
+        end_param = _ree_local(end_utc)
+        request_start = start_utc
+        # REE answers HTTP 400 when start_date == end_date (a one-hour window, or two UTC hours that
+        # share a wall-clock label on the DST fall-back day). Earlier hours are always published, so
+        # widen backwards and keep only the requested hours.
+        while _ree_local(request_start) >= end_param:
+            request_start -= timedelta(hours=1)
         params = (
-            f"?start_date={start_madrid.strftime('%Y-%m-%dT%H:%M')}"
-            f"&end_date={end_madrid.strftime('%Y-%m-%dT%H:%M')}"
+            f"?start_date={_ree_local(request_start)}"
+            f"&end_date={end_param}"
             f"&time_trunc=hour"
         )
         url = REE_ENDPOINT + params
@@ -226,7 +244,8 @@ class PvpcService:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RuntimeError(f"PVPC fetch failed: invalid JSON from REE: {exc}") from exc
 
-        return _parse_ree_response(doc)
+        prices = _parse_ree_response(doc)
+        return {ts: p for ts, p in prices.items() if start_utc <= ts <= end_utc}
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +295,16 @@ def _parse_ree_response(doc: dict) -> Dict[datetime, float]:
     if not out:
         raise RuntimeError("PVPC fetch failed: PVPC values array was empty")
     return out
+
+
+def _ree_local(ts_utc: datetime) -> str:
+    return ts_utc.astimezone(_MADRID_TZ).strftime("%Y-%m-%dT%H:%M")
+
+
+def _unpublished_from() -> datetime:
+    """UTC start of tomorrow (local): the earliest hour REE may not have published yet."""
+    tomorrow = datetime.now(_MADRID_TZ).date() + timedelta(days=1)
+    return _MADRID_TZ.localize(datetime(tomorrow.year, tomorrow.month, tomorrow.day)).astimezone(_UTC)
 
 
 def _normalise_to_utc_hour(dt: datetime) -> datetime:

@@ -127,6 +127,7 @@ def _metrics(frame, strategy, valid, pv, load, imp_price, exp_price, imp, exp, c
     terminal_value = delta * mean_import_rate * battery.discharge_efficiency
     usable = battery.capacity * (1.0 - strategy.min_battery_level)
     battery_out = s(dis)
+    curtailed_kwh = s(curt)
 
     m: Dict[str, Any] = {
         "total_cost": total_cost,
@@ -139,12 +140,14 @@ def _metrics(frame, strategy, valid, pv, load, imp_price, exp_price, imp, exp, c
         "total_house_consumption": load_kwh,
         "battery_level": final_kwh,
         "battery_capacity": battery.capacity,
-        "self_consumption_rate": (100.0 * (solar_kwh - export_kwh) / solar_kwh) if solar_kwh > 0 else 0.0,
+        "self_consumption_rate": (
+            100.0 * max(0.0, solar_kwh - export_kwh - curtailed_kwh) / solar_kwh if solar_kwh > 0 else 0.0
+        ),
         "solar_fraction": (100.0 * max(0.0, load_kwh - import_kwh) / load_kwh) if load_kwh > 0 else 0.0,
         "import_cost": import_cost,
         "export_revenue": export_revenue,
         "unserved_kwh": s(unserved),
-        "curtailed_kwh": s(curt),
+        "curtailed_kwh": curtailed_kwh,
         "over_limit_kwh": s(over),
         "grid_charge_kwh": s(gc),
         "initial_battery_kwh": initial_kwh,

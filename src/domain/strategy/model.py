@@ -117,7 +117,8 @@ class BaseEnergyStrategy(ABC):
             grid_part = 0.0
             if allow_grid_charge:
                 # The import cap only constrains controllable import: load is always served.
-                grid_part = max(0.0, min(battery_cmd_kw - solar_part, max_import - deficit))
+                grid_part = max(0.0, min(battery_cmd_kw - solar_part, max_import - deficit,
+                                         self.grid_charge_power))
             if solar_part + grid_part > _EPS:
                 charged = self.battery.charge(solar_part + grid_part, dt_h)
                 from_solar = min(charged, solar_part)
@@ -262,14 +263,19 @@ class ForceChargeAtValleyStrategy(BaseRateAwareStrategy):
     """Grid-charge in the last hour of a shoulder block right before a peak; discharge only at peak."""
 
     def _is_pre_peak_hour(self) -> bool:
-        if not self._is_type(RateType.PLAIN):
+        if self._single_rate_day() or not self._is_type(RateType.PLAIN):
             return False
         blocks = self._blocks()
         current = blocks[self._current_index(blocks)]
         hour = local_date_hour(self.now)[1]
-        return hour == current["end"] - 1 and self._neighbour_block(1)["rate"].rate_type == RateType.PEAK
+        nxt = self._neighbour_block(1)["rate"]
+        return (hour == current["end"] - 1
+                and nxt.rate_type == RateType.PEAK
+                and nxt.price > current["rate"].price + _EPS)
 
     def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._single_rate_day():
+            return self._self_consume(solar_kw, load_kw)
         if self._is_pre_peak_hour():
             return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
         if self._is_type(RateType.PEAK):
@@ -281,13 +287,22 @@ class ForceChargeValleyAndPrePeakStrategy(BaseRateAwareStrategy):
     """Grid-charge in valley blocks and in shoulder blocks that precede a peak; discharge at peak."""
 
     def _should_charge(self) -> bool:
-        if self._neighbour_block(-1)["rate"].rate_type == RateType.VALLEY:
+        if self._single_rate_day():
             return False
         if self._is_type(RateType.VALLEY):
             return self._pricier_ahead()
-        return self._is_type(RateType.PLAIN) and self._neighbour_block(1)["rate"].rate_type == RateType.PEAK
+        # Only shoulders skip after a valley: the previous block can be yesterday's all-day
+        # off-peak block (Monday, day after a holiday), which never charged.
+        if self._neighbour_block(-1)["rate"].rate_type == RateType.VALLEY:
+            return False
+        nxt = self._neighbour_block(1)["rate"]
+        return (self._is_type(RateType.PLAIN)
+                and nxt.rate_type == RateType.PEAK
+                and nxt.price > self._current_rate().price + _EPS)
 
     def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._single_rate_day():
+            return self._self_consume(solar_kw, load_kw)
         if self._should_charge():
             return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
         if self._is_type(RateType.PEAK):

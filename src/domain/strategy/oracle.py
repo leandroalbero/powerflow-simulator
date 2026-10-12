@@ -65,6 +65,7 @@ def solve_oracle_lp(
     taper_start: Optional[float] = None,
     taper_factor: float = 0.0,
     active: Optional[np.ndarray] = None,
+    max_grid_charge: Optional[float] = None,
 ) -> OracleLpResult:
     """Cost-minimising battery schedule with perfect foresight.
 
@@ -75,6 +76,8 @@ def solve_oracle_lp(
     energy stored at the end (not a cash flow). ``taper_start``/``taper_factor``
     add the battery's charge-power taper as a linear constraint on the previous
     step's SoC. ``active`` = False forces charge = discharge = 0 for that step.
+    ``max_grid_charge`` caps the grid-sourced part of charging (kW): charge may
+    exceed it only by the step's solar surplus.
     """
     n = len(solar)
     if n == 0:
@@ -120,24 +123,68 @@ def solve_oracle_lp(
         b_ub[0] -= k * initial_soc * battery_capacity
 
     act = np.ones(n, dtype=bool) if active is None else np.asarray(active, dtype=bool)
+    ch_ub = np.full(n, float(max_charge_rate))
+    if max_grid_charge is not None:
+        ch_ub = np.minimum(ch_ub, max(0.0, max_grid_charge) + np.maximum(solar - load, 0.0))
     lb = np.concatenate([np.zeros(5 * n), np.full(n, min_soc_frac * battery_capacity)])
     ub = np.concatenate([
-        np.where(act, max_charge_rate, 0.0),
+        np.where(act, ch_ub, 0.0),
         np.where(act, max_discharge_rate, 0.0),
         np.maximum(max_grid_import, load - solar),
         np.full(n, max_grid_export),
         np.maximum(solar, 0.0),
         np.full(n, battery_capacity),
     ])
-    if initial_soc * battery_capacity < lb[5 * n]:
-        lb[5 * n:] = np.minimum(lb[5 * n:], initial_soc * battery_capacity)
+    floor = lb[5 * n]
+    below_floor = initial_soc * battery_capacity < floor
+    if below_floor:
+        lb[5 * n:] = initial_soc * battery_capacity
 
-    result = linprog(c, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=np.column_stack([lb, ub]),
-                     method="highs", options={"presolve": True, "time_limit": 600})
-    if not result.success:
+    def solve(lo: np.ndarray, hi: np.ndarray) -> Optional[np.ndarray]:
+        r = linprog(c, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=np.column_stack([lo, hi]),
+                    method="highs", options={"presolve": True, "time_limit": 600})
+        return r.x if r.success else None
+
+    x = solve(lb, ub)
+    if x is None:
         return _empty_result(n, False)
 
-    x = result.x
+    if below_floor:
+        # The battery cannot discharge below the floor, and once it is back above it may not
+        # drop under it again; a single relaxed lb would let the plan cycle in the band.
+        reached = np.flatnonzero(x[i_soc] >= floor - _EPS)
+        k = int(reached[0]) if reached.size else n
+        lb2, ub2 = lb.copy(), ub.copy()
+        ub2[n:n + min(k + 1, n)] = 0.0
+        lb2[5 * n + k:] = floor
+        x2 = solve(lb2, ub2)
+        if x2 is None:
+            ub2[n:2 * n] = 0.0
+            lb2[5 * n:] = initial_soc * battery_capacity
+            x2 = solve(lb2, ub2)
+        if x2 is None:
+            return _empty_result(n, False)
+        lb, ub, x = lb2, ub2, x2
+
+    wash = import_rates <= export_rates + 1e-12
+    if wash.any() and np.any(wash & (np.minimum(x[i_imp], x[i_exp]) > _EPS)):
+        # A net meter cannot import and export in the same slot; with import cheaper than export the
+        # LP would do both and earn the spread, mispricing grid charging and export. Fixing each
+        # slot's direction to the netted first solution keeps that solution feasible.
+        net = x[i_imp] - x[i_exp]
+        # A slot with zero net (e.g. washing exactly the solar surplus into the battery) keeps its natural
+        # direction; forcing it to import mode would forbid exporting the surplus.
+        importing = np.where(np.abs(net) > 1e-9, net > 0, load > solar)
+        ub2 = ub.copy()
+        ub2[3 * n:4 * n] = np.where(wash & importing, 0.0, ub2[3 * n:4 * n])
+        ub2[2 * n:3 * n] = np.where(wash & ~importing, 0.0, ub2[2 * n:3 * n])
+        x2 = solve(lb, ub2)
+        if x2 is not None:
+            x = x2
+
+    x = x.copy()
+    net = x[i_imp] - x[i_exp]
+    x[i_imp], x[i_exp] = np.maximum(net, 0.0), np.maximum(-net, 0.0)
     grid_cost = float(np.sum((x[i_imp] * import_rates - x[i_exp] * export_rates) * dt_arr))
     return OracleLpResult(
         success=True, total_cost=grid_cost,
@@ -235,7 +282,7 @@ class OracleStrategy(BaseEnergyStrategy):
                 min_soc_frac=self.min_battery_level, max_grid_import=self.grid.max_import,
                 max_grid_export=self.grid.max_export, cycle_cost_eur_kwh=cycle_cost,
                 terminal_value_eur_kwh=self.terminal_value_eur_kwh, taper_start=b.taper_start,
-                taper_factor=b.taper_factor, active=s.dt[sl] > 0,
+                taper_factor=b.taper_factor, active=s.dt[sl] > 0, max_grid_charge=self.grid_charge_power,
             )
             if not r.success:
                 return _empty_result(n, False)

@@ -237,7 +237,7 @@ class MpcStrategy(BaseEnergyStrategy):
             initial_soc=b.current_charge / b.capacity, min_soc_frac=self.min_battery_level,
             max_grid_import=self.grid.max_import, max_grid_export=self.grid.max_export,
             cycle_cost_eur_kwh=self._cycle_cost_eur_kwh, terminal_value_eur_kwh=tv,
-            taper_start=b.taper_start, taper_factor=b.taper_factor,
+            taper_start=b.taper_start, taper_factor=b.taper_factor, max_grid_charge=self.grid_charge_power,
         )
         if result.success:
             self._cached_plan = {"solar": solar_fc, "load": load_fc,
