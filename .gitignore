@@ -40,3 +40,18 @@ google-service-account-file.json
 
 # fetched data (regenerable via scripts/)
 data/irradiance/
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# local research, notes and agent tooling (not part of the product)
+research/
+docs/superpowers/
+.claude/
+ha-battery-mpc/
+
+# generated artifacts
+output_files/*
+!output_files/_SIMULATION_RESULTS_GO_HERE
+data/pvpc_cache.db
+web/frontend/vite.config.ts.timestamp-*

@@ -2,6 +2,8 @@ ruff
 mypy
 matplotlib
 pandas
+scipy
+pyarrow
 colorama
 numpy
 types-colorama
