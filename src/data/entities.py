@@ -19,18 +19,19 @@ class Entity:
     entity_id: str
     unit: str
     semantics: str
+    scale: float = 1.0
 
 
-# ev lives in measurement kW, not W. W is empty for both wall-connector ids.
-# Values are kilowatts (observed max ~7.4). Chosen over tesla_wall_connector_total_power
-# because wall_connector_power has the larger recent sample count and is not nonsense.
+# The wall connector only reports in measurement kW (W is empty for both ids); scale keeps
+# the stored unit W like every other power entity. wall_connector_power is preferred over
+# tesla_wall_connector_total_power for its denser recent sampling.
 ENTITIES: Final[dict[str, Entity]] = {
     "pv": Entity("pv", "W", "pv_power", "W", "PV DC power, >=0"),
     "load": Entity("load", "W", "house_consumption", "W", "whole-house load incl. EV charger"),
     "battery": Entity("battery", "W", "battery_power", "W", ">0 discharging, <0 charging"),
     "grid": Entity("grid", "W", "on_grid_export_power", "W", ">0 exporting, <0 importing"),
     "soc": Entity("soc", "%", "battery_state_of_charge", "%", "0-100"),
-    "ev": Entity("ev", "kW", "wall_connector_power", "kW", "Tesla wall connector power, part of load"),
+    "ev": Entity("ev", "kW", "wall_connector_power", "W", "Tesla wall connector power, part of load", 1000.0),
 }
 
 

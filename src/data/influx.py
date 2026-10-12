@@ -159,7 +159,10 @@ def concat_frames(parts: list[pd.DataFrame]) -> pd.DataFrame:
 
 def fetch_range(cfg: InfluxConfig, entity: Entity, start: datetime, end: datetime) -> pd.DataFrame:
     parts = [fetch_chunk(cfg, entity, chunk_start, chunk_end) for chunk_start, chunk_end in iter_chunks(start, end)]
-    return concat_frames(parts)
+    frame = concat_frames(parts)
+    if entity.scale != 1.0 and not frame.empty:
+        frame["mean"] = frame["mean"] * entity.scale
+    return frame
 
 
 def drop_at_or_after(frame: pd.DataFrame, end: datetime) -> pd.DataFrame:

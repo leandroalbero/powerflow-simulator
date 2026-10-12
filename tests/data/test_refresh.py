@@ -207,3 +207,19 @@ def test_concat_keeps_one_row_when_chunks_both_emit_the_boundary() -> None:
     merged = concat_frames([left, right])
     assert len(merged) == 1
     assert merged["mean"].iloc[0] == 2.0
+
+
+def test_fetch_range_scales_kw_entities_to_watts(monkeypatch):
+    from src.data import influx
+    from src.data.entities import ENTITIES
+
+    frame = pd.DataFrame({
+        "ts": pd.to_datetime([0, 60], unit="s", utc=True).astype("datetime64[ns, UTC]"),
+        "mean": pd.Series([7.4, 0.0], dtype="float64"),
+        "count": pd.Series([3, 1], dtype="int32"),
+    })
+    monkeypatch.setattr(influx, "fetch_chunk", lambda *a, **k: frame.copy())
+    out = influx.fetch_range(None, ENTITIES["ev"], datetime(2026, 1, 1, tzinfo=timezone.utc),
+                             datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc))
+    assert out["mean"].tolist() == [7400.0, 0.0]
+    assert ENTITIES["ev"].unit == "W"
