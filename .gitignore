@@ -38,8 +38,9 @@ db_local/messages.db
 google-service-account-file.json
 /qodana.yaml
 
-# fetched data (regenerable via scripts/)
+# fetched data (regenerable via scripts/ and make fetch-data)
 data/irradiance/
+data/influx/
 .venv/
 .ruff_cache/
 .pytest_cache/
