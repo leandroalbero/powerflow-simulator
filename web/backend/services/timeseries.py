@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from src.data.frame import to_utc_bound
 from web.backend.models.schemas import TimeseriesResponse
 from web.backend.services.envelope import envelope_downsample
 
@@ -33,9 +34,9 @@ def present_timeseries(
     cost = np.asarray(ts_data["step_cost"], dtype=float)
     mask = np.ones(len(ts_ms), dtype=bool)
     if start:
-        mask &= ts_ms >= epoch_ms(start)
+        mask &= ts_ms >= epoch_ms(start, is_end=False)
     if end:
-        mask &= ts_ms <= epoch_ms(end)
+        mask &= ts_ms < epoch_ms(end, is_end=True)
     ts_ms = ts_ms[mask]
     columns = {key: values[mask] for key, values in columns.items()}
     cost = cost[mask]
@@ -52,11 +53,15 @@ def present_timeseries(
     )
 
 
-def epoch_ms(value: str) -> int:
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("Europe/Madrid", ambiguous=True, nonexistent="shift_forward")
-    return int(ts.value // 1_000_000)
+def epoch_ms(value: str, is_end: bool) -> int:
+    """Exclusive end, same convention as /simulate: a date-only end covers that whole local day."""
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text) + (1 if is_end else 0)
+    bound = to_utc_bound(text, is_end=is_end)
+    if bound is None:
+        raise ValueError(f"empty bound {value!r}")
+    return int(bound.value // 1_000_000)
 
 
 def _nan_to_none(values: np.ndarray) -> list[Optional[float]]:

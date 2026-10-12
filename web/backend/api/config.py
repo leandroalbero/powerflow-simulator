@@ -16,6 +16,7 @@ def get_config(request: Request) -> ConfigResponse:
         tariff=cfg.tariff,
         strategy=cfg.strategy,
         data_date_range=data_service.get_date_range(),
+        exclude_ev=cfg.exclude_ev,
     )
 
 
@@ -30,4 +31,5 @@ def update_config(body: SystemConfig, request: Request) -> ConfigResponse:
         tariff=updated.tariff,
         strategy=updated.strategy,
         data_date_range=data_service.get_date_range(),
+        exclude_ev=updated.exclude_ev,
     )

@@ -137,16 +137,21 @@ async def ws_run_progress(websocket: WebSocket, run_id: str) -> None:
 
     try:
         while True:
-            for sid, result in list(run.strategies.items()):
-                if result.status == "pending":
-                    continue
-                if result.status == "running" and result.progress != last_pcts.get(sid, -1):
-                    last_pcts[sid] = result.progress
-                    await websocket.send_text(json.dumps({"strategy": sid, "percent": result.progress}))
-                if result.status in ("completed", "failed", "cancelled") and sid not in sent_done:
-                    await websocket.send_text(json.dumps(_strategy_message(sid, result)))
+            # One snapshot under the run lock: the service finalises run.status under the same
+            # lock after the last strategy, so a finished run here implies every strategy's
+            # done message goes out in this pass, before run_complete.
+            with run.lock:
+                run_done = run.status in ("completed", "failed", "cancelled")
+                snapshot = [(sid, r.status, r.progress) for sid, r in run.strategies.items()]
+                results = dict(run.strategies)
+            for sid, status, progress in snapshot:
+                if status == "running" and progress != last_pcts.get(sid, -1):
+                    last_pcts[sid] = progress
+                    await websocket.send_text(json.dumps({"strategy": sid, "percent": progress}))
+                elif status in ("completed", "failed", "cancelled") and sid not in sent_done:
+                    await websocket.send_text(json.dumps(_strategy_message(sid, results[sid])))
                     sent_done.add(sid)
-            if run.status in ("completed", "failed", "cancelled"):
+            if run_done:
                 await websocket.send_json({"status": "run_complete"})
                 break
             await asyncio.sleep(0.3)

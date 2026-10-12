@@ -168,6 +168,11 @@ def test_day_blocks_cover_all_hours(jan1_prices):
 
 
 def test_tertiles_generalise_to_any_day_length():
-    assert _tertile_rate_types([1.0] * 24).count(RateType.VALLEY) == 8
+    # Equal prices must share a type. Splitting a flat day by hour order
+    # labelled it valley/plain/peak and made force_valleys grid-charge at hour 15.
+    flat = _tertile_rate_types([1.0] * 24)
+    assert len(set(flat)) == 1
+    partial = _tertile_rate_types([0.05] * 8 + [0.20] * 16)
+    assert len(set(partial[8:])) == 1
     assert len(_tertile_rate_types(list(range(23)))) == 23
     assert _tertile_rate_types([]) == []

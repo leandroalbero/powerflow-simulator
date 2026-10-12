@@ -178,6 +178,16 @@ class TestMpcStrategy:
         assert res.timeseries["grid_charge_kw"][hours < 8].sum() > 0
         assert res.timeseries["battery_discharge_kw"][(hours >= 18) & (hours < 22)].sum() > 0
 
+    def test_grid_charge_power_limits_plan_and_replay(self):
+        frame = synthetic_frame(days=1, outage=False)
+        frame["pv_kw"] = 0.0
+        s, tariff = _mpc(frame, max_charge_power=2.0)
+        res = run(frame, s, tariff)
+        gc = res.timeseries["grid_charge_kw"]
+        assert gc.max() <= 2.0 + 1e-9
+        assert gc.max() > 1.9
+        assert np.all(s._cached_plan["charge"] <= 2.0 + 1e-6)
+
     def test_mpc_cannot_beat_oracle(self):
         frame = synthetic_frame()
         s, tariff = _mpc(frame)

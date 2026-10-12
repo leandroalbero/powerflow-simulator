@@ -1,10 +1,13 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
 
-from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
+from src.domain.battery.models import Battery
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateType
+from src.domain.power_tariff.pvpc import PvpcTariff
 from src.domain.strategy.model import (
     EnergyFlow,
     ForceChargeAtNightStrategy,
@@ -22,6 +25,46 @@ DT = 1 / 60
 HEURISTICS = [SelfConsumeStrategy, ForceChargeAtNightStrategy, ForceChargeAtValleyStrategy,
               ForceChargeValleyAndPrePeakStrategy, ValleyChargePeakDischargeStrategy, SmartDischargeStrategy,
               NoBatteryStrategy]
+_RATE_HEURISTICS = [ForceChargeAtNightStrategy, ForceChargeAtValleyStrategy,
+                    ForceChargeValleyAndPrePeakStrategy, ValleyChargePeakDischargeStrategy,
+                    SmartDischargeStrategy, ForecastChargeStrategy]
+_MAD = ZoneInfo("Europe/Madrid")
+_FLOW_FIELDS = (
+    "direct_solar", "battery_charge", "battery_discharge", "grid_import", "grid_export",
+    "unserved", "curtailed", "battery_charge_from_grid", "over_limit",
+)
+
+
+def _madrid_prices(day: date, hourly: list[float]) -> dict[datetime, float]:
+    start = datetime(day.year, day.month, day.day, tzinfo=_MAD).astimezone(timezone.utc)
+    return {start + timedelta(hours=h): price for h, price in enumerate(hourly)}
+
+
+def _pvpc_around(day: date, hourly: list[float]) -> PvpcTariff:
+    """Tariff whose seed day has distinct prices, so strategy construction still sees 3 rates."""
+    seed = date.fromordinal(day.toordinal() - 1)
+    nxt = date.fromordinal(day.toordinal() + 1)
+    prices = _madrid_prices(seed, [0.05 + 0.01 * h for h in range(24)])
+    prices.update(_madrid_prices(day, hourly))
+    prices.update(_madrid_prices(nxt, hourly))
+    return PvpcTariff(prices, export_price=0.04)
+
+
+def _fresh(grid, tariff, cls, soc: float = 5.0):
+    battery = Battery(capacity=10.0, max_charge_rate=2.0, max_discharge_rate=2.0,
+                      efficiency=0.81, initial_soc=0.5)
+    battery.current_charge = soc
+    kwargs = {"daily_forecasts": {}} if cls is ForecastChargeStrategy else {}
+    return cls(battery, grid, tariff, **kwargs)
+
+
+def _assert_same_flows(got, ref, where) -> None:
+    for name in _FLOW_FIELDS:
+        assert getattr(got, name) == pytest.approx(getattr(ref, name), abs=1e-9), (where, name)
+
+
+def local_hour(ts: datetime) -> int:
+    return ts.astimezone(_MAD).hour if ts.tzinfo else ts.hour
 
 
 def step(strategy, ts, solar, load, dt=DT) -> EnergyFlow:
@@ -50,6 +93,12 @@ class TestSettle:
         f = s._settle(0.0, 0.5, -2.0, 1.0, allow_grid_charge=False, allow_export_discharge=True)
         assert f.battery_discharge == pytest.approx(2.0)
         assert f.grid_export == pytest.approx(1.5)
+
+    def test_grid_part_of_charge_capped_by_grid_charge_power(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20, max_charge_power=0.5)
+        f = s._settle(1.5, 1.0, 2.0, 1.0, allow_grid_charge=True)
+        assert f.battery_charge_from_grid == pytest.approx(0.5)
+        assert f.battery_charge == pytest.approx(1.0)
 
     def test_min_soc_floor_never_violated(self, battery, grid, td20):
         s = SelfConsumeStrategy(battery, grid, td20, min_battery_level=0.3)
@@ -185,6 +234,13 @@ class TestStrategies:
         assert step(s, at(WEEKDAY, 19), 0.0, 1.0).battery_discharge == pytest.approx(DT)
         assert step(s, at(WEEKDAY, 23), 0.0, 1.0).battery_discharge == 0.0
 
+    @pytest.mark.parametrize("day", ["2026-10-05", "2026-10-13"], ids=["monday", "after_holiday"])
+    def test_force_valleys_pre_peak_charges_in_valley_after_offpeak_day(self, battery, grid, td20, day):
+        s = ForceChargeValleyAndPrePeakStrategy(battery, grid, td20)
+        assert step(s, at(day, 3), 0.0, 0.5).battery_charge_from_grid > 0
+        after_valley = step(s, at(day, 8, 30), 0.0, 1.0)
+        assert after_valley.battery_charge_from_grid == 0.0 and after_valley.battery_discharge == 0.0
+
     def test_valley_charge_peak_discharge(self, battery, grid, td20):
         s = ValleyChargePeakDischargeStrategy(battery, grid, td20)
         assert step(s, at(WEEKDAY, 3), 0.0, 0.5).battery_charge_from_grid > 0
@@ -229,6 +285,64 @@ class TestStrategies:
         peak_now = step(s, at("2026-03-05", 2), 0.0, 1.0)
         assert peak_now.battery_charge_from_grid == 0.0 and peak_now.battery_discharge > 0
         assert step(s, at("2026-03-05", 18), 0.0, 0.5).battery_charge_from_grid > 0
+
+    def test_flat_pvpc_day_matches_self_consume(self, grid):
+        tariff = _pvpc_around(date(2026, 10, 13), [0.12] * 24)
+        for hour in range(24):
+            ts = at("2026-10-13", hour)
+            ref = step(_fresh(grid, tariff, SelfConsumeStrategy), ts, 0.0, 1.0)
+            for cls in _RATE_HEURISTICS:
+                got = step(_fresh(grid, tariff, cls), ts, 0.0, 1.0)
+                _assert_same_flows(got, ref, (cls.__name__, hour))
+
+    def test_partial_price_tie_does_not_grid_charge_into_equal_block(self, grid):
+        hourly = [0.05] * 8 + [0.20] * 16
+        tariff = _pvpc_around(date(2026, 10, 13), hourly)
+        for cls in (ForceChargeAtValleyStrategy, ForceChargeValleyAndPrePeakStrategy):
+            flow = step(_fresh(grid, tariff, cls), at("2026-10-13", 15), 0.0, 0.5)
+            assert flow.battery_charge_from_grid == 0.0, cls.__name__
+
+    def test_labelled_peak_at_the_same_price_is_not_a_pre_peak_charge(self, battery, grid):
+        valley = Rate(price=0.10, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.VALLEY)
+        morning_peak = Rate(price=0.30, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PEAK)
+        plain = Rate(price=0.20, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PLAIN)
+        equal_peak = Rate(price=0.20, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PEAK)
+        export = Rate(price=0.04, energy_direction=EnergyDirection.EXPORT, _rate_type=RateType.PLAIN)
+        blocks = [
+            {"start": 0, "end": 8, "rate": valley},
+            {"start": 8, "end": 14, "rate": morning_peak},
+            {"start": 14, "end": 18, "rate": plain},
+            {"start": 18, "end": 24, "rate": equal_peak},
+        ]
+
+        class _Tariff:
+            rate_schedule = {
+                (0, 8): valley,
+                (8, 14): morning_peak,
+                (14, 18): plain,
+                (18, 24): equal_peak,
+                (0, 24): export,
+            }
+
+            def rate_at(self, ts, direction):
+                if direction == EnergyDirection.EXPORT:
+                    return export
+                hour = local_hour(ts)
+                for block in blocks:
+                    if block["start"] <= hour < block["end"]:
+                        return block["rate"]
+                raise AssertionError(hour)
+
+            def day_rate_blocks(self, _day):
+                return blocks
+
+        tariff = _Tariff()
+        battery.current_charge = 5.0
+        assert step(ForceChargeAtValleyStrategy(battery, grid, tariff), at(WEEKDAY, 17), 0.0, 0.5).battery_charge_from_grid == 0.0
+        battery.current_charge = 5.0
+        assert step(
+            ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff), at(WEEKDAY, 15), 0.0, 0.5
+        ).battery_charge_from_grid == 0.0
 
     @pytest.mark.parametrize("cls", HEURISTICS + [ForecastChargeStrategy])
     def test_energy_balance_every_step(self, cls, battery, grid, td20):

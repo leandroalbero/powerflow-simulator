@@ -41,8 +41,14 @@ def store_reader(key: str, start: Optional[pd.Timestamp], end: Optional[pd.Times
 
     try:
         return read_entity(key, start=start, end=end)
-    except (FileNotFoundError, KeyError):
+    except FileNotFoundError:
         return None
+    except KeyError as exc:
+        # Only an unknown entity means "no data"; a KeyError from a malformed file must not
+        # silently turn into an empty frame.
+        if exc.args[:1] == (key,):
+            return None
+        raise
 
 
 def memory_reader(entities: Mapping[str, pd.DataFrame], fallback: Optional[EntityReader] = None) -> EntityReader:
@@ -148,6 +154,36 @@ def _empty_frame(include_measured: bool) -> pd.DataFrame:
     return df
 
 
+def _has_load(reader: EntityReader, start: Optional[pd.Timestamp], end: Optional[pd.Timestamp]) -> bool:
+    return _read(reader, "load", start, end) is not None
+
+
+def _clamp_to_load_span(
+    reader: EntityReader, load: Optional[pd.Series], start_utc: Optional[pd.Timestamp],
+    end_utc: Optional[pd.Timestamp],
+) -> tuple:
+    """Clamp ``[start_utc, end_utc)`` to the GLOBAL span of load data, not the window's.
+
+    An outage at a window edge must stay in the frame as invalid rows, so the
+    window is only shortened where the load series itself begins or ends.
+    """
+    first = load.index[0] if load is not None else None
+    last_end = load.index[-1] + pd.Timedelta(minutes=1) if load is not None else None
+    if start_utc is None:
+        lo = first
+    elif (first is not None and first <= start_utc) or _has_load(reader, None, start_utc):
+        lo = start_utc
+    else:
+        lo = first
+    if end_utc is None:
+        hi = last_end
+    elif (last_end is not None and last_end >= end_utc) or _has_load(reader, end_utc, None):
+        hi = end_utc
+    else:
+        hi = last_end
+    return lo, hi
+
+
 def build_power_frame(
     start: DateLike = None,
     end: DateLike = None,
@@ -159,7 +195,8 @@ def build_power_frame(
 
     ``'YYYY-MM-DD'`` bounds are Europe/Madrid local days and ``end`` is inclusive
     (the whole end day). Timestamps are taken to the minute, ``end`` inclusive.
-    The range is clamped to the span covered by load data.
+    The range is clamped to the overall span of the load data; minutes inside
+    it without load data are rows with ``valid=False``.
     """
     reader = reader or store_reader
     start_utc = to_utc_bound(start, is_end=False)
@@ -172,14 +209,8 @@ def build_power_frame(
         return start_utc - (pd.Timedelta(minutes=limit) if limit is not None else _SOC_LOOKBACK)
 
     load = _read(reader, "load", lookback("load"), end_utc)
-    if load is None:
-        return _empty_frame(include_measured)
-
-    lo = load.index[0] if start_utc is None else max(start_utc, load.index[0])
-    hi = load.index[-1] + pd.Timedelta(minutes=1)
-    if end_utc is not None:
-        hi = min(hi, end_utc)
-    if lo >= hi:
+    lo, hi = _clamp_to_load_span(reader, load, start_utc, end_utc)
+    if lo is None or hi is None or lo >= hi:
         return _empty_frame(include_measured)
     grid = pd.date_range(lo, hi, freq="1min", inclusive="left")
 

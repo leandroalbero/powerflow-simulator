@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 from fastapi import HTTPException
 
+from web.backend.api.config import get_config, update_config
 from web.backend.api.simulation import get_timeseries, start_simulation
 from web.backend.models.schemas import DateRange, SimulationRequest, SystemConfig
 from web.backend.services import data_service as ds_module
@@ -63,6 +64,16 @@ class TestValidation:
         with pytest.raises(ValueError, match=msg):
             sim.start_run(ids, start, end)
         assert sim.runs == {}
+
+    def test_date_only_end_is_inclusive_whole_day(self, data):
+        sim = SimulationService(data)
+        sim.validate_request(["self_consume"], "2026-03-04T12:00:00", "2026-03-04")
+        sim.validate_request(["self_consume"], "2026-03-04", "2026-03-04")
+        with pytest.raises(ValueError, match="must not be after"):
+            sim.validate_request(["self_consume"], "2026-03-05T00:00:00", "2026-03-04")
+        run = _wait(sim, sim.start_run(["self_consume"], "2026-03-04T12:00:00", "2026-03-04"))
+        assert run.status == "completed"
+        assert run.strategies["self_consume"].metrics["valid_hours"] == pytest.approx(12.0)
 
     def test_api_maps_value_error_to_422(self, data):
         sim = SimulationService(data)
@@ -133,6 +144,13 @@ class TestRuns:
         assert day.point_count == 1440
         assert day.house_consumption[11 * 60] is None
         assert day.timestamps[0].startswith("2026-03-05T00:00:00+01:00")
+        whole = get_timeseries(run.run_id, _request(sim), strategy="self_consume", start="2026-03-05",
+                               end="2026-03-05", max_points=2000)
+        assert whole.point_count == 1440
+        assert whole.timestamps == day.timestamps
+        zulu = get_timeseries(run.run_id, _request(sim), strategy="self_consume", start="2026-03-04T23:00:00Z",
+                              end="2026-03-05T00:59:00Z", max_points=2000)
+        assert zulu.point_count == 120
 
 
 class TestDataService:
@@ -188,5 +206,102 @@ def test_pvpc_window_stops_at_end_of_tomorrow(data):
     assert pd.Timestamp(start) == frame.index[0]
 
 
+def test_pvpc_window_end_of_tomorrow_follows_the_calendar(data):
+    sim = SimulationService(data)
+    # Frame end plus the lookahead must sit past every injected tomorrow, or the clamp is invisible.
+    frame = pd.DataFrame(index=pd.DatetimeIndex([
+        pd.Timestamp("2026-01-01", tz="Europe/Madrid"),
+        pd.Timestamp("2026-12-31 12:00", tz="Europe/Madrid"),
+    ]))
+    cases = [
+        ("2026-10-24 21:00", "2026-10-25 23:00:00+01:00"),
+        ("2026-03-28 21:00", "2026-03-29 23:00:00+02:00"),
+        ("2026-06-15 21:00", "2026-06-16 23:00:00+02:00"),
+    ]
+    for now_s, expected in cases:
+        now = pd.Timestamp(now_s, tz="Europe/Madrid")
+        _start, end = sim._pvpc_window(frame, SystemConfig(), now=now)
+        assert pd.Timestamp(end) == pd.Timestamp(expected), now_s
+
+
+def test_config_roundtrips_exclude_ev(data):
+    sim = SimulationService(data)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        sim_service=sim, data_service=data)))
+    put = update_config(SystemConfig(exclude_ev=True), request)
+    assert put.exclude_ev is True
+    assert get_config(request).exclude_ev is True
+
+
 def test_daterange_model_accepts_dates():
     assert DateRange(start="2026-03-04", end="2026-03-05").start == "2026-03-04"
+
+
+class _RaceRun:
+    """Run whose last strategy finishes between the websocket's strategy scan and its run-status check."""
+
+    def __init__(self):
+        from threading import Lock
+
+        from web.backend.services.simulation_service import StrategyRunResult
+        self.lock = Lock()
+        self.strategies = {"self_consume": StrategyRunResult("self_consume", status="running", progress=99)}
+        self._reads = 0
+
+    @property
+    def status(self):
+        self._reads += 1
+        if self._reads < 2:
+            return "running"
+        result = self.strategies["self_consume"]
+        result.status, result.metrics = "completed", {"total_cost": 1.0}
+        return "completed"
+
+
+def test_websocket_sends_every_done_message_before_run_complete():
+    import asyncio
+
+    from web.backend.api.simulation import ws_run_progress
+
+    sent = []
+
+    class FakeSocket:
+        app = SimpleNamespace(state=SimpleNamespace(sim_service=SimpleNamespace(get_run=lambda _id: run)))
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, text):
+            sent.append(json.loads(text))
+
+        async def send_json(self, obj):
+            sent.append(obj)
+
+        async def close(self):
+            pass
+
+    run = _RaceRun()
+    asyncio.run(ws_run_progress(FakeSocket(), "r1"))
+    assert sent[-1] == {"status": "run_complete"}
+    done = [m for m in sent if m.get("status") == "completed"]
+    assert done == [{"strategy": "self_consume", "status": "completed", "metrics": {"total_cost": 1.0}}]
+
+
+def test_downsample_keeps_gaps_of_any_column_not_just_the_reference():
+    n = 525_600
+    t = np.arange(n)
+    battery = 7.0 + 5.0 * np.sin(t / 700.0)
+    flow = np.abs(np.sin(t / 3000.0))
+    flow[200_000:200_129] = np.nan
+    flow[400_000:411_100] = np.nan
+    idx = downsample_indices({"battery_level": battery, "grid_import": flow}, 2000)
+    assert len(idx) <= 2004
+    assert {200_000, 199_999, 400_000, 399_999} <= set(idx.tolist())
+    assert np.isnan(flow[idx]).sum() == 2
+    assert np.isfinite(battery[idx]).all()
+
+
+def test_downsample_ignores_columns_that_are_nan_everywhere():
+    y = np.sin(np.linspace(0, 20, 10_000))
+    idx = downsample_indices({"y": y, "empty": np.full(10_000, np.nan)}, 300)
+    assert 290 <= len(idx) <= 300

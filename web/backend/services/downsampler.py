@@ -76,32 +76,40 @@ def lttb_downsample(
 def downsample_indices(columns: dict, max_points: int = 2000) -> np.ndarray:
     """Row indices to keep so every column fits in about ``max_points`` points.
 
-    LTTB runs on the valid (non-NaN) rows of the highest-variance column; the
-    first row of every NaN run is kept as well so charts still break at gaps.
+    A row is a gap if any column is NaN there (columns that are NaN everywhere
+    are ignored). LTTB runs on the highest-variance column over the rows valid
+    in every column; the first row of every gap and the last valid row before
+    it are kept as well so charts break at gaps instead of bridging them.
     """
     arrays = [np.asarray(v, dtype=np.float64) for v in columns.values()]
     n = len(arrays[0]) if arrays else 0
     if n <= max_points:
         return np.arange(n)
 
+    finite = np.ones(n, dtype=bool)
+    for arr in arrays:
+        ok = np.isfinite(arr)
+        if ok.any():
+            finite &= ok
+
     best_var = -1.0
     ref_y = np.zeros(n)
     for arr in arrays:
-        v = float(np.nanvar(arr)) if np.isfinite(arr).any() else 0.0
+        v = float(np.var(arr[finite])) if finite.any() else 0.0
         if v > best_var:
             best_var = v
             ref_y = arr
 
-    finite = np.isfinite(ref_y)
     gap_starts = np.flatnonzero(~finite & np.concatenate(([True], finite[:-1])))
+    before_gaps = gap_starts[gap_starts > 0] - 1
     valid_idx = np.flatnonzero(finite)
-    budget = max(2, max_points - len(gap_starts))
+    budget = max(2, max_points - len(gap_starts) - len(before_gaps))
     if len(valid_idx) > budget:
         x_down, _ = lttb_downsample(valid_idx.astype(np.float64), ref_y[valid_idx], budget)
         keep = x_down.astype(np.intp)
     else:
         keep = valid_idx
-    return np.union1d(keep, gap_starts)
+    return np.union1d(np.union1d(keep, gap_starts), before_gaps)
 
 
 def downsample_timeseries(
