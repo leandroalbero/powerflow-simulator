@@ -1,6 +1,7 @@
 """FastAPI application for the powerflow-simulator web UI."""
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,9 +9,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from web.backend.api import config, data, simulation, strategies
+from web.backend.api import backtest, config, data, presets, runs, simulation, strategies, sweep
 from web.backend.services.data_service import DataService
+from web.backend.services.pool import SimPool
+from web.backend.services.refresh_jobs import RefreshRegistry
 from web.backend.services.simulation_service import SimulationService
+from web.backend.services.sweep_service import SweepService
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +26,17 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     data_service.load_default_data()
 
     sim_service = SimulationService(data_service)
+    pool = None
+    if os.environ.get("POWERFLOW_EAGER_POOL", "1") != "0":
+        pool = SimPool()
+        sim_service.attach_pool(pool)
+    sweep_service = SweepService(sim_service, pool, sim_service.history) if pool is not None else None
 
     app.state.data_service = data_service
     app.state.sim_service = sim_service
+    app.state.sim_pool = pool
+    app.state.sweep_service = sweep_service
+    app.state.refresh_registry = RefreshRegistry(data_service.load_default_data)
 
     info = data_service.get_data_info()
     logger.info(
@@ -38,6 +50,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
     # --- shutdown ---
     sim_service._executor.shutdown(wait=False)
+    if pool is not None:
+        if sim_service._progress_q is not None:
+            sim_service._progress_q.put(None)
+        pool.shutdown()
+    sim_service.history.close()
 
 
 app = FastAPI(
@@ -59,7 +76,11 @@ app.add_middleware(
 app.include_router(strategies.router)
 app.include_router(config.router)
 app.include_router(simulation.router)
+app.include_router(runs.router)
 app.include_router(data.router)
+app.include_router(presets.router)
+app.include_router(sweep.router)
+app.include_router(backtest.router)
 
 
 @app.get("/api/health")
