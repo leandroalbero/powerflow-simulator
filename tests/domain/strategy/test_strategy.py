@@ -51,6 +51,12 @@ class TestSettle:
         assert f.battery_discharge == pytest.approx(2.0)
         assert f.grid_export == pytest.approx(1.5)
 
+    def test_grid_part_of_charge_capped_by_grid_charge_power(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20, max_charge_power=0.5)
+        f = s._settle(1.5, 1.0, 2.0, 1.0, allow_grid_charge=True)
+        assert f.battery_charge_from_grid == pytest.approx(0.5)
+        assert f.battery_charge == pytest.approx(1.0)
+
     def test_min_soc_floor_never_violated(self, battery, grid, td20):
         s = SelfConsumeStrategy(battery, grid, td20, min_battery_level=0.3)
         for _ in range(500):

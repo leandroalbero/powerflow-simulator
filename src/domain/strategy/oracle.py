@@ -65,6 +65,7 @@ def solve_oracle_lp(
     taper_start: Optional[float] = None,
     taper_factor: float = 0.0,
     active: Optional[np.ndarray] = None,
+    max_grid_charge: Optional[float] = None,
 ) -> OracleLpResult:
     """Cost-minimising battery schedule with perfect foresight.
 
@@ -75,6 +76,8 @@ def solve_oracle_lp(
     energy stored at the end (not a cash flow). ``taper_start``/``taper_factor``
     add the battery's charge-power taper as a linear constraint on the previous
     step's SoC. ``active`` = False forces charge = discharge = 0 for that step.
+    ``max_grid_charge`` caps the grid-sourced part of charging (kW): charge may
+    exceed it only by the step's solar surplus.
     """
     n = len(solar)
     if n == 0:
@@ -120,9 +123,12 @@ def solve_oracle_lp(
         b_ub[0] -= k * initial_soc * battery_capacity
 
     act = np.ones(n, dtype=bool) if active is None else np.asarray(active, dtype=bool)
+    ch_ub = np.full(n, float(max_charge_rate))
+    if max_grid_charge is not None:
+        ch_ub = np.minimum(ch_ub, max(0.0, max_grid_charge) + np.maximum(solar - load, 0.0))
     lb = np.concatenate([np.zeros(5 * n), np.full(n, min_soc_frac * battery_capacity)])
     ub = np.concatenate([
-        np.where(act, max_charge_rate, 0.0),
+        np.where(act, ch_ub, 0.0),
         np.where(act, max_discharge_rate, 0.0),
         np.maximum(max_grid_import, load - solar),
         np.full(n, max_grid_export),
@@ -235,7 +241,7 @@ class OracleStrategy(BaseEnergyStrategy):
                 min_soc_frac=self.min_battery_level, max_grid_import=self.grid.max_import,
                 max_grid_export=self.grid.max_export, cycle_cost_eur_kwh=cycle_cost,
                 terminal_value_eur_kwh=self.terminal_value_eur_kwh, taper_start=b.taper_start,
-                taper_factor=b.taper_factor, active=s.dt[sl] > 0,
+                taper_factor=b.taper_factor, active=s.dt[sl] > 0, max_grid_charge=self.grid_charge_power,
             )
             if not r.success:
                 return _empty_result(n, False)

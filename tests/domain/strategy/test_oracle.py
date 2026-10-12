@@ -90,6 +90,19 @@ class TestSolveOracleLp:
         assert result.success
         assert all(s <= 2.0 + 1e-6 for s in result.soc)
 
+    def test_max_grid_charge_bounds_grid_sourced_charge(self):
+        solar = np.array([0.0, 0.0, 3.0, 0.0])
+        load = np.array([0.0, 0.0, 0.5, 1.0])
+        result = solve_oracle_lp(
+            solar=solar, load=load, import_rates=np.array([0.05, 0.05, 0.3, 0.3]),
+            export_rates=np.zeros(4), dt=1.0, battery_capacity=20.0, max_charge_rate=4.5,
+            max_discharge_rate=4.5, efficiency=0.95, initial_soc=0.1, min_soc_frac=0.1,
+            max_grid_import=10.0, terminal_value_eur_kwh=0.3, max_grid_charge=1.5,
+        )
+        assert result.success
+        np.testing.assert_allclose(result.charge[:2], 1.5, atol=1e-6)
+        assert result.charge[2] <= 1.5 + 2.5 + 1e-6
+
     def test_respects_charge_rate_limits(self):
         """Charge rate cannot exceed max_charge_rate."""
         n = 2
@@ -264,6 +277,28 @@ class TestOracleStrategy:
         a = run(frame, single, t1).metrics["adjusted_cost"]
         b = run(frame, chunked, t2).metrics["adjusted_cost"]
         assert b == pytest.approx(a, abs=0.05)
+
+    def test_grid_charge_power_limits_plan_and_replay(self):
+        frame = synthetic_frame()
+        oracle, tariff = self.build(frame, max_charge_power=2.0)
+        lp, sl = oracle.lp_result, oracle.slots
+        assert np.all(lp.charge <= 2.0 + np.maximum(sl.solar - sl.load, 0.0) + 1e-6)
+        res = run(frame, oracle, tariff)
+        gc = res.timeseries["grid_charge_kw"]
+        assert np.nanmax(gc) <= 2.0 + 1e-9
+        assert np.nanmax(gc) > 1.9
+        unlimited, t2 = self.build(frame)
+        assert np.nanmax(run(frame, unlimited, t2).timeseries["grid_charge_kw"]) > 2.5
+
+    def test_beats_capped_heuristics_with_the_same_cap(self):
+        frame = synthetic_frame()
+        oracle, tariff = self.build(frame, max_charge_power=2.0)
+        best = run(frame, oracle, tariff).metrics["adjusted_cost"]
+        battery = Battery(capacity=10.0, max_charge_rate=4.5, max_discharge_rate=4.6, efficiency=0.9, initial_soc=0.1)
+        t = make_td20()
+        night = ForceChargeAtNightStrategy(battery, Grid(max_import=5.5, max_export=5.5), t, max_charge_power=2.0)
+        other = run(frame, night, t).metrics["adjusted_cost"]
+        assert best <= other + max(0.01 * abs(other), 0.5)
 
     def test_beats_every_heuristic_on_synthetic_frame(self):
         frame = synthetic_frame()

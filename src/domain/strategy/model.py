@@ -117,7 +117,8 @@ class BaseEnergyStrategy(ABC):
             grid_part = 0.0
             if allow_grid_charge:
                 # The import cap only constrains controllable import: load is always served.
-                grid_part = max(0.0, min(battery_cmd_kw - solar_part, max_import - deficit))
+                grid_part = max(0.0, min(battery_cmd_kw - solar_part, max_import - deficit,
+                                         self.grid_charge_power))
             if solar_part + grid_part > _EPS:
                 charged = self.battery.charge(solar_part + grid_part, dt_h)
                 from_solar = min(charged, solar_part)
