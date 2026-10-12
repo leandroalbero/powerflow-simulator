@@ -1,21 +1,17 @@
-"""Train multiple DQN architectures on GPU in parallel.
+"""Train DQN on GPU — sequential variants.
 
-Usage: python3 -m src.domain.strategy.dqn.train_gpu
-Runs on CUDA GPUs: architecture variants on GPU 0 (RTX 3090) and GPU 1 (RTX 2060).
+Usage: python3 -u -m src.domain.strategy.dqn.train_gpu [--device cuda:0]
 """
 
-import os
+import argparse
 import random
 import sys
-from multiprocessing import Process
 
 import numpy as np
 import pandas as pd
 import pytz
 import torch
-
-from src.domain.strategy.dqn.agent import DqnAgent, QNetwork
-from src.domain.strategy.dqn.environment import BatteryEnv
+import torch.nn as nn
 
 LOCAL_TZ = pytz.timezone("Europe/Madrid")
 
@@ -27,7 +23,8 @@ IMPORT_RATES_BY_HOUR = {
 }
 
 
-def load_episodes() -> list[dict]:
+def load_episodes():
+    from src.domain.strategy.dqn.environment import BatteryEnv
     solar_df = pd.read_csv("data/pv_power.csv", index_col="last_changed")
     solar_df.index = pd.to_datetime(solar_df.index, utc=True).tz_convert(LOCAL_TZ)
     solar_df["state"] = pd.to_numeric(solar_df["state"], errors="coerce")
@@ -41,101 +38,83 @@ def load_episodes() -> list[dict]:
     solar_h = solar_df.resample("1h").mean().fillna(0.0)
     load_h = load_df.resample("1h").mean().fillna(0.0)
     common = solar_h.index.intersection(load_h.index)
-    solar_h = solar_h.loc[common]
-    load_h = load_h.loc[common]
 
     episodes = []
-    for period, group in load_h.groupby(load_h.index.to_period("M")):
-        month_idx = group.index
-        solar_month = solar_h.loc[month_idx]
-        if len(month_idx) < 24:
+    for period, group in load_h.loc[common].groupby(load_h.loc[common].index.to_period("M")):
+        idx = group.index
+        s = solar_h.loc[idx]
+        if len(idx) < 24:
             continue
         episodes.append({
-            "solar": (solar_month["state"].values / 1000.0).astype(np.float32),
+            "solar": (s["state"].values / 1000.0).astype(np.float32),
             "load": (group["state"].values / 1000.0).astype(np.float32),
-            "hours": np.array([ts.hour for ts in month_idx], dtype=np.int32),
-            "import_rates": np.array(
-                [IMPORT_RATES_BY_HOUR[ts.hour] for ts in month_idx], dtype=np.float32
-            ),
+            "hours": np.array([t.hour for t in idx], dtype=np.int32),
+            "rates": np.array([IMPORT_RATES_BY_HOUR[t.hour] for t in idx], dtype=np.float32),
         })
     return episodes
 
 
-def train_variant(
-    name: str,
-    device: str,
-    episodes_data: list[dict],
-    num_episodes: int,
-    lr: float,
-    batch_size: int,
-    hidden_size: int,
-    num_layers: int,
-    gamma: float,
-    reward_scale: float,
-    train_steps_per_env: int,
-    output_path: str,
-) -> None:
-    """Train a single DQN variant."""
-    print(f"[{name}] Starting on {device}, lr={lr}, hidden={hidden_size}x{num_layers}, "
-          f"gamma={gamma}, reward_scale={reward_scale}", flush=True)
-
-    agent = DqnAgent(
-        state_dim=16, action_dim=9,
-        lr=lr, batch_size=batch_size,
-        buffer_size=500_000,
-        target_update_freq=1000,
-        device=device,
+def make_env(ep_data, init_soc=0.1):
+    from src.domain.strategy.dqn.environment import BatteryEnv
+    return BatteryEnv(
+        solar=ep_data["solar"], load=ep_data["load"],
+        hours=ep_data["hours"], import_rates=ep_data["rates"],
+        export_rate=0.08, battery_capacity=15.0,
+        max_charge_rate=4.8, max_discharge_rate=4.8,
+        efficiency=0.95, initial_soc=init_soc, min_soc_frac=0.1, dt=1.0,
     )
 
-    # Replace network with custom architecture
-    if hidden_size != 128 or num_layers != 2:
-        import torch.nn as nn
-        layers = []
-        in_dim = 16
-        for _ in range(num_layers):
-            layers.extend([nn.Linear(in_dim, hidden_size), nn.ReLU()])
-            in_dim = hidden_size
-        layers.append(nn.Linear(in_dim, 9))
-        agent.policy_net = nn.Sequential(*layers).to(agent.device)
-        agent.target_net = nn.Sequential(*layers).to(agent.device)
+
+def train_variant(name, device, episodes, num_ep, lr, hidden, layers, gamma, reward_scale, train_per_step, output):
+    print(f"\n{'='*60}", flush=True)
+    print(f"[{name}] device={device} lr={lr} hidden={hidden}x{layers} gamma={gamma} "
+          f"reward_scale={reward_scale} episodes={num_ep}", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    from src.domain.strategy.dqn.agent import DqnAgent
+
+    # Large batch to saturate GPU — 4096 for 3090, 1024 for 2060
+    gpu_batch = 4096 if "cuda:0" in device else 1024
+    agent = DqnAgent(state_dim=16, action_dim=9, lr=lr, batch_size=gpu_batch,
+                     buffer_size=1_000_000, target_update_freq=500, device=device)
+
+    # Replace network if non-default architecture
+    if hidden != 128 or layers != 2:
+        net_layers = []
+        in_d = 16
+        for _ in range(layers):
+            net_layers.extend([nn.Linear(in_d, hidden), nn.ReLU()])
+            in_d = hidden
+        net_layers.append(nn.Linear(in_d, 9))
+        agent.policy_net = nn.Sequential(*net_layers).to(agent.device)
+        agent.target_net = nn.Sequential(*net_layers).to(agent.device)
         agent.target_net.load_state_dict(agent.policy_net.state_dict())
         agent.optimizer = torch.optim.Adam(agent.policy_net.parameters(), lr=lr)
 
-    epsilon = 1.0
-    epsilon_min = 0.05
-    epsilon_decay = (epsilon - epsilon_min) / min(num_episodes, 200)
+    eps = 1.0
+    eps_min = 0.05
+    eps_decay = (eps - eps_min) / min(num_ep, 200)
     best_avg = -float("inf")
-    recent: list[float] = []
+    recent = []
 
-    for ep in range(num_episodes):
-        ep_data = random.choice(episodes_data)
-        init_soc = random.uniform(0.1, 0.5)
-
-        env = BatteryEnv(
-            solar=ep_data["solar"], load=ep_data["load"],
-            hours=ep_data["hours"], import_rates=ep_data["import_rates"],
-            export_rate=0.08, battery_capacity=15.0,
-            max_charge_rate=4.8, max_discharge_rate=4.8,
-            efficiency=0.95, initial_soc=init_soc, min_soc_frac=0.1, dt=1.0,
-        )
-
+    for ep in range(num_ep):
+        ep_data = random.choice(episodes)
+        env = make_env(ep_data, init_soc=random.uniform(0.1, 0.5))
         state = env.reset()
         total_reward = 0.0
 
         while True:
-            action = agent.select_action(state, epsilon)
-            next_state, reward, done, _ = env.step(action)
-            agent.store_transition(state, action, reward * reward_scale, next_state, done)
-
-            for _ in range(train_steps_per_env):
+            action = agent.select_action(state, eps)
+            ns, reward, done, _ = env.step(action)
+            agent.store_transition(state, action, reward * reward_scale, ns, done)
+            for _ in range(train_per_step):
                 agent.train_step()
-
             total_reward += reward
-            state = next_state
+            state = ns
             if done:
                 break
 
-        epsilon = max(epsilon_min, epsilon - epsilon_decay)
+        eps = max(eps_min, eps - eps_decay)
         recent.append(total_reward)
         if len(recent) > 20:
             recent.pop(0)
@@ -143,92 +122,58 @@ def train_variant(
 
         if len(recent) >= 20 and avg > best_avg:
             best_avg = avg
-            agent.save(output_path)
+            agent.save(output)
 
         if (ep + 1) % 50 == 0:
-            print(f"[{name}] Ep {ep+1}/{num_episodes} | "
-                  f"Reward: {total_reward:.1f} | Avg20: {avg:.1f} | "
-                  f"Best: {best_avg:.1f} | Eps: {epsilon:.3f}", flush=True)
+            print(f"[{name}] Ep {ep+1}/{num_ep} | R={total_reward:.1f} | "
+                  f"Avg20={avg:.1f} | Best={best_avg:.1f} | eps={eps:.3f}", flush=True)
 
-    agent.save(output_path.replace(".pt", "_final.pt"))
-    print(f"[{name}] Done! Best avg: {best_avg:.1f}. Saved to {output_path}", flush=True)
+    agent.save(output.replace(".pt", "_final.pt"))
+    print(f"[{name}] DONE. Best avg: {best_avg:.1f}", flush=True)
+    return best_avg
 
 
-def main() -> None:
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cuda:0")
+    args = parser.parse_args()
+
     print("Loading data...", flush=True)
     episodes = load_episodes()
-    print(f"Built {len(episodes)} episodes", flush=True)
+    print(f"Built {len(episodes)} episodes on {args.device}", flush=True)
+    print(f"CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}", flush=True)
 
-    # Define architecture variants
-    variants = [
-        # GPU 0 (RTX 3090) — larger models, more episodes
-        {
-            "name": "large_3layer",
-            "device": "cuda:0",
-            "num_episodes": 2000,
-            "lr": 5e-4,
-            "batch_size": 256,
-            "hidden_size": 256,
-            "num_layers": 3,
-            "gamma": 0.99,
-            "reward_scale": 10.0,
-            "train_steps_per_env": 4,
-            "output_path": "output_files/dqn_large_3layer.pt",
-        },
-        {
-            "name": "deep_4layer",
-            "device": "cuda:0",
-            "num_episodes": 2000,
-            "lr": 3e-4,
-            "batch_size": 256,
-            "hidden_size": 128,
-            "num_layers": 4,
-            "gamma": 0.995,
-            "reward_scale": 15.0,
-            "train_steps_per_env": 8,
-            "output_path": "output_files/dqn_deep_4layer.pt",
-        },
-        # GPU 1 (RTX 2060) — baseline and low gamma
-        {
-            "name": "baseline_long",
-            "device": "cuda:1",
-            "num_episodes": 3000,
-            "lr": 1e-3,
-            "batch_size": 128,
-            "hidden_size": 128,
-            "num_layers": 2,
-            "gamma": 0.99,
-            "reward_scale": 10.0,
-            "train_steps_per_env": 4,
-            "output_path": "output_files/dqn_baseline_long.pt",
-        },
-        {
-            "name": "high_gamma",
-            "device": "cuda:1",
-            "num_episodes": 2000,
-            "lr": 5e-4,
-            "batch_size": 128,
-            "hidden_size": 192,
-            "num_layers": 2,
-            "gamma": 0.999,
-            "reward_scale": 20.0,
-            "train_steps_per_env": 4,
-            "output_path": "output_files/dqn_high_gamma.pt",
-        },
-    ]
+    gpu_tag = args.device.replace(":", "")  # e.g. "cuda0"
 
-    processes = []
-    for v in variants:
-        p = Process(target=train_variant, kwargs={**v, "episodes_data": episodes})
-        p.start()
-        processes.append((v["name"], p))
-        print(f"Started {v['name']} on {v['device']}", flush=True)
+    # GPU 0 (RTX 3090, 24GB): big batches, big networks
+    # GPU 1 (RTX 2060, 6GB): moderate batches, focused hyperparams
+    if "0" in gpu_tag:
+        variants = [
+            # name, episodes, lr, hidden, layers, gamma, reward_scale, train_per_step
+            ("big_512x3_3k", 3000, 5e-4, 512, 3, 0.99, 10.0, 32),
+            ("huge_1024x2_2k", 2000, 3e-4, 1024, 2, 0.995, 15.0, 32),
+            ("deep_256x5_2k", 2000, 1e-4, 256, 5, 0.999, 20.0, 32),
+            ("wide_768x2_2k", 2000, 5e-4, 768, 2, 0.99, 10.0, 16),
+        ]
+    else:
+        variants = [
+            ("baseline_3k", 3000, 1e-3, 128, 2, 0.99, 10.0, 16),
+            ("med_256x3_2k", 2000, 5e-4, 256, 3, 0.99, 10.0, 16),
+            ("high_gamma_2k", 2000, 5e-4, 192, 2, 0.999, 20.0, 16),
+            ("fast_lr_2k", 2000, 2e-3, 128, 2, 0.99, 15.0, 16),
+        ]
 
-    for name, p in processes:
-        p.join()
-        print(f"{name} finished with exit code {p.exitcode}", flush=True)
+    results = {}
+    for name, num_ep, lr, hidden, layers, gamma, rs, tps in variants:
+        output = f"output_files/dqn_{name}_{gpu_tag}.pt"
+        best = train_variant(name, args.device, episodes, num_ep, lr, hidden, layers, gamma, rs, tps, output)
+        results[name] = best
 
-    print("\nAll training complete!", flush=True)
+    print(f"\n{'='*60}", flush=True)
+    print("RESULTS SUMMARY", flush=True)
+    print(f"{'='*60}", flush=True)
+    for name, best in sorted(results.items(), key=lambda x: -x[1]):
+        print(f"  {name:30s} best_avg={best:.1f}", flush=True)
 
 
 if __name__ == "__main__":
