@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 from fastapi import HTTPException
 
+from web.backend.api.config import get_config, update_config
 from web.backend.api.simulation import get_timeseries, start_simulation
 from web.backend.models.schemas import DateRange, SimulationRequest, SystemConfig
 from web.backend.services import data_service as ds_module
@@ -221,6 +222,15 @@ def test_pvpc_window_end_of_tomorrow_follows_the_calendar(data):
         now = pd.Timestamp(now_s, tz="Europe/Madrid")
         _start, end = sim._pvpc_window(frame, SystemConfig(), now=now)
         assert pd.Timestamp(end) == pd.Timestamp(expected), now_s
+
+
+def test_config_roundtrips_exclude_ev(data):
+    sim = SimulationService(data)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        sim_service=sim, data_service=data)))
+    put = update_config(SystemConfig(exclude_ev=True), request)
+    assert put.exclude_ev is True
+    assert get_config(request).exclude_ev is True
 
 
 def test_daterange_model_accepts_dates():
