@@ -8,7 +8,6 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, cast
 
-import numpy as np
 import pandas as pd
 import pytz
 
@@ -471,14 +470,11 @@ class SimulationService:
                     agent.load(model_path)
                 strategy = DqnStrategyCls(battery, grid, tariff, agent=agent)
             elif strategy_id == "oracle":
-                # Resample to 5-min (inverter granularity) for tight LP
-                slots = frame[["pv_kw", "load_kw"]].resample("5min").mean().fillna(0.0)
                 strategy = strategy_cls(
-                    battery, grid, tariff,
-                    solar=slots["pv_kw"].to_numpy(), load=slots["load_kw"].to_numpy(),
-                    hours=np.array([ts.hour for ts in slots.index]),
-                    durations=np.full(len(slots), 5.0 / 60.0),
-                    timestamps=list(slots.index),
+                    battery, grid, tariff, frame,
+                    min_battery_level=config.strategy.min_battery_level,
+                    max_charge_power=config.strategy.max_charge_power,
+                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
                 )
             else:
                 strategy = strategy_cls(battery, grid, tariff)
