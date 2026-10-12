@@ -30,9 +30,9 @@ def grid():
 @pytest.fixture
 def rates():
     return {
-        0: Rate(price=0.1, energy_direction=EnergyDirection.IMPORT),
-        8: Rate(price=0.2, energy_direction=EnergyDirection.IMPORT),
-        16: Rate(price=0.3, energy_direction=EnergyDirection.IMPORT),
+        0: Rate(price=0.1, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.VALLEY),
+        8: Rate(price=0.2, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PLAIN),
+        16: Rate(price=0.3, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PEAK),
     }
 
 
