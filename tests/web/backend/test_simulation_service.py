@@ -207,3 +207,53 @@ def test_pvpc_window_stops_at_end_of_tomorrow(data):
 
 def test_daterange_model_accepts_dates():
     assert DateRange(start="2026-03-04", end="2026-03-05").start == "2026-03-04"
+
+
+class _RaceRun:
+    """Run whose last strategy finishes between the websocket's strategy scan and its run-status check."""
+
+    def __init__(self):
+        from threading import Lock
+
+        from web.backend.services.simulation_service import StrategyRunResult
+        self.lock = Lock()
+        self.strategies = {"self_consume": StrategyRunResult("self_consume", status="running", progress=99)}
+        self._reads = 0
+
+    @property
+    def status(self):
+        self._reads += 1
+        if self._reads < 2:
+            return "running"
+        result = self.strategies["self_consume"]
+        result.status, result.metrics = "completed", {"total_cost": 1.0}
+        return "completed"
+
+
+def test_websocket_sends_every_done_message_before_run_complete():
+    import asyncio
+
+    from web.backend.api.simulation import ws_run_progress
+
+    sent = []
+
+    class FakeSocket:
+        app = SimpleNamespace(state=SimpleNamespace(sim_service=SimpleNamespace(get_run=lambda _id: run)))
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, text):
+            sent.append(json.loads(text))
+
+        async def send_json(self, obj):
+            sent.append(obj)
+
+        async def close(self):
+            pass
+
+    run = _RaceRun()
+    asyncio.run(ws_run_progress(FakeSocket(), "r1"))
+    assert sent[-1] == {"status": "run_complete"}
+    done = [m for m in sent if m.get("status") == "completed"]
+    assert done == [{"strategy": "self_consume", "status": "completed", "metrics": {"total_cost": 1.0}}]

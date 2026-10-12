@@ -164,35 +164,30 @@ async def ws_run_progress(websocket: WebSocket, run_id: str) -> None:
     try:
         while True:
             changed = False
+            # One snapshot under the run lock: the service finalises run.status under the same
+            # lock after the last strategy, so a finished run here implies every strategy's
+            # done message (with its metrics) goes out in this pass, before run_complete.
+            with run.lock:
+                run_done = run.status in ("completed", "failed")
+                snapshot = [(sid, r.status, r.progress, r.metrics, r.error) for sid, r in run.strategies.items()]
 
-            for sid, result in run.strategies.items():
-                # Nothing to do yet
-                if result.status == "pending":
-                    continue
-
-                # Stream progress percentage
-                if result.status == "running":
-                    prev = last_pcts.get(sid, -1)
-                    if result.progress != prev:
-                        last_pcts[sid] = result.progress
-                        await websocket.send_text(json.dumps({
-                            "strategy": sid, "percent": result.progress,
-                        }))
+            for sid, status, progress, metrics, error in snapshot:
+                if status == "running":
+                    if progress != last_pcts.get(sid, -1):
+                        last_pcts[sid] = progress
+                        await websocket.send_text(json.dumps({"strategy": sid, "percent": progress}))
                         changed = True
-
-                # Strategy finished
-                if result.status in ("completed", "failed") and sid not in sent_done:
-                    msg: Dict[str, Any] = {"strategy": sid, "status": result.status}
-                    if result.metrics is not None:
-                        msg["metrics"] = result.metrics
-                    if result.error is not None:
-                        msg["error"] = result.error
+                elif status in ("completed", "failed") and sid not in sent_done:
+                    msg: Dict[str, Any] = {"strategy": sid, "status": status}
+                    if metrics is not None:
+                        msg["metrics"] = metrics
+                    if error is not None:
+                        msg["error"] = error
                     await websocket.send_text(json.dumps(msg))
                     sent_done.add(sid)
                     changed = True
 
-            # Check if entire run is done
-            if run.status in ("completed", "failed"):
+            if run_done:
                 await websocket.send_json({"status": "run_complete"})
                 break
 
