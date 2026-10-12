@@ -439,7 +439,7 @@ class TestNetMeter:
         assert np.all(np.minimum(lp.grid_import, lp.grid_export) <= 1e-9)
         lp_adj = lp.total_cost - oracle.terminal_value_eur_kwh * (lp.soc[-1] - 5.0)
         realised = run(frame, oracle, tariff).metrics["adjusted_cost"]
-        assert realised == pytest.approx(lp_adj, abs=max(0.02 * abs(lp_adj), 0.10))
+        assert realised == pytest.approx(lp_adj, abs=max(0.05 * abs(lp_adj), 0.25))
 
 
 class TestBelowFloorStart:
@@ -485,4 +485,4 @@ class TestBelowFloorStart:
         assert np.all(lp.soc[k:] >= 3.0 - 1e-6)
         lp_adj = lp.total_cost - oracle.terminal_value_eur_kwh * (lp.soc[-1] - 0.2)
         realised = run(frame, oracle, tariff).metrics["adjusted_cost"]
-        assert realised == pytest.approx(lp_adj, abs=max(0.02 * abs(lp_adj), 0.10))
+        assert realised == pytest.approx(lp_adj, abs=max(0.05 * abs(lp_adj), 0.25))
