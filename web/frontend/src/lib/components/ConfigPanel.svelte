@@ -38,6 +38,11 @@
   let weekendRateEnabled = false;
   let weekendRatePrice = 0.085;
   let weekendRateDirection: 'import' | 'export' = 'import';
+  let usePvpc = false;
+  let exportFollowsPvpc = false;
+  let exportPvpcDiscount = 0;
+  let mpcHorizonHours = 24;
+  let batteryCycleCost = 0;
 
   // Sync local state from store only on initial load (not on every store update)
   $: if ($systemConfig && !initialized) {
@@ -58,6 +63,11 @@
     } else {
       weekendRateEnabled = false;
     }
+    usePvpc = $systemConfig.tariff.use_pvpc ?? false;
+    exportFollowsPvpc = $systemConfig.tariff.export_follows_pvpc ?? false;
+    exportPvpcDiscount = $systemConfig.tariff.export_pvpc_discount ?? 0;
+    mpcHorizonHours = $systemConfig.tariff.mpc_horizon_hours ?? 24;
+    batteryCycleCost = $systemConfig.battery.cycle_cost_eur_kwh ?? 0;
     const strat = $systemConfig.strategy ?? { min_battery_level: 0.1, max_charge_power: 2.05, valley_charge_target: 1.0 };
     stratMinBatteryLevel = strat.min_battery_level;
     stratMaxChargePower = strat.max_charge_power;
@@ -77,6 +87,7 @@
           initial_soc: batteryInitialSoc,
           taper_start: batteryTaperStart,
           taper_factor: batteryTaperFactor,
+          cycle_cost_eur_kwh: batteryCycleCost,
         },
         grid: {
           max_import: gridMaxImport,
@@ -87,6 +98,10 @@
           weekend_rate: weekendRateEnabled
             ? { start_hour: 0, end_hour: 24, price: weekendRatePrice, direction: weekendRateDirection }
             : null,
+          use_pvpc: usePvpc,
+          export_follows_pvpc: exportFollowsPvpc,
+          export_pvpc_discount: exportPvpcDiscount,
+          mpc_horizon_hours: mpcHorizonHours,
         },
         strategy: {
           min_battery_level: stratMinBatteryLevel,
@@ -108,6 +123,7 @@
         initial_soc: batteryInitialSoc,
         taper_start: batteryTaperStart,
         taper_factor: batteryTaperFactor,
+        cycle_cost_eur_kwh: batteryCycleCost,
       },
       grid: {
         max_import: gridMaxImport,
@@ -118,6 +134,10 @@
         weekend_rate: weekendRateEnabled
           ? { start_hour: 0, end_hour: 24, price: weekendRatePrice, direction: weekendRateDirection }
           : null,
+        use_pvpc: usePvpc,
+        export_follows_pvpc: exportFollowsPvpc,
+        export_pvpc_discount: exportPvpcDiscount,
+        mpc_horizon_hours: mpcHorizonHours,
       },
       strategy: {
         min_battery_level: stratMinBatteryLevel,
@@ -318,6 +338,25 @@
     <!-- Tariff Section -->
     <div class="section">
       <div class="section-title">TARIFF</div>
+      <label class="field">
+        <span class="field-label">Use PVPC (Spain)</span>
+        <input type="checkbox" class="checkbox-input"
+          bind:checked={usePvpc} on:change={debouncedStoreUpdate} />
+      </label>
+      {#if usePvpc}
+        <label class="field">
+          <span class="field-label">Export follows PVPC</span>
+          <input type="checkbox" class="checkbox-input"
+            bind:checked={exportFollowsPvpc} on:change={debouncedStoreUpdate} />
+        </label>
+        <div class="pvpc-hint">
+          {#if exportFollowsPvpc}
+            Both import AND export use hourly PVPC. Zero spread — arbitrage vanishes.
+          {:else}
+            Import rates replaced by hourly PVPC from REE. Export uses the flat rate (below).
+          {/if}
+        </div>
+      {/if}
       {#if tariffRates.length > 0}
         <table class="tariff-table">
           <thead>
@@ -331,21 +370,25 @@
           </thead>
           <tbody>
             {#each tariffRates as rate, i}
-              <tr>
+              <tr class:pvpc-disabled={usePvpc && tariffRates[i].direction === 'import'}>
                 <td>
                   <input type="number" class="tariff-input mono" min="0" max="23" step="1"
-                    bind:value={tariffRates[i].start_hour} on:input={debouncedStoreUpdate} />
+                    bind:value={tariffRates[i].start_hour} on:input={debouncedStoreUpdate}
+                    disabled={usePvpc && tariffRates[i].direction === 'import'} />
                 </td>
                 <td>
                   <input type="number" class="tariff-input mono" min="1" max="24" step="1"
-                    bind:value={tariffRates[i].end_hour} on:input={debouncedStoreUpdate} />
+                    bind:value={tariffRates[i].end_hour} on:input={debouncedStoreUpdate}
+                    disabled={usePvpc && tariffRates[i].direction === 'import'} />
                 </td>
                 <td>
                   <input type="number" class="tariff-input tariff-price mono" min="0" step="0.001"
-                    bind:value={tariffRates[i].price} on:input={debouncedStoreUpdate} />
+                    bind:value={tariffRates[i].price} on:input={debouncedStoreUpdate}
+                    disabled={usePvpc && tariffRates[i].direction === 'import'} />
                 </td>
                 <td>
-                  <select class="tariff-select" bind:value={tariffRates[i].direction} on:change={debouncedStoreUpdate}>
+                  <select class="tariff-select" bind:value={tariffRates[i].direction} on:change={debouncedStoreUpdate}
+                    disabled={usePvpc && tariffRates[i].direction === 'import'}>
                     <option value="import">imp</option>
                     <option value="export">exp</option>
                   </select>
@@ -358,22 +401,25 @@
           </tbody>
         </table>
       {/if}
-      <button class="row-btn add-btn" on:click={addRate}>+ Add rate</button>
-      <div class="weekend-section">
+      <button class="row-btn add-btn" class:btn-disabled={usePvpc} on:click={addRate} disabled={usePvpc}>+ Add rate</button>
+      <div class="weekend-section" class:pvpc-disabled={usePvpc}>
         <label class="field">
           <span class="field-label">Weekend override</span>
           <input type="checkbox" class="checkbox-input"
-            bind:checked={weekendRateEnabled} on:change={debouncedStoreUpdate} />
+            bind:checked={weekendRateEnabled} on:change={debouncedStoreUpdate}
+            disabled={usePvpc} />
         </label>
         {#if weekendRateEnabled}
           <label class="field">
             <span class="field-label">Weekend price</span>
             <input type="number" step="0.001" min="0"
-              bind:value={weekendRatePrice} on:input={debouncedStoreUpdate} />
+              bind:value={weekendRatePrice} on:input={debouncedStoreUpdate}
+              disabled={usePvpc} />
           </label>
           <label class="field">
             <span class="field-label">Direction</span>
-            <select class="tariff-select" bind:value={weekendRateDirection} on:change={debouncedStoreUpdate}>
+            <select class="tariff-select" bind:value={weekendRateDirection} on:change={debouncedStoreUpdate}
+              disabled={usePvpc}>
               <option value="import">import</option>
               <option value="export">export</option>
             </select>
@@ -694,5 +740,35 @@
     width: 14px;
     height: 14px;
     accent-color: var(--color-selected);
+  }
+
+  tr.pvpc-disabled {
+    opacity: 0.4;
+  }
+
+  tr.pvpc-disabled input,
+  tr.pvpc-disabled select {
+    cursor: not-allowed;
+  }
+
+  .weekend-section.pvpc-disabled {
+    opacity: 0.4;
+  }
+
+  .weekend-section.pvpc-disabled input,
+  .weekend-section.pvpc-disabled select {
+    cursor: not-allowed;
+  }
+
+  .btn-disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .pvpc-hint {
+    font-size: var(--font-size-sm);
+    color: var(--text-dim);
+    padding: var(--spacing-xs) 0;
+    line-height: 1.3;
   }
 </style>

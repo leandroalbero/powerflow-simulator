@@ -1,10 +1,12 @@
 """Wraps domain simulation code, runs strategies in background threads, stores results."""
 
+import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from threading import Lock
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,7 @@ from src.domain.energy_load.model import EnergyLoad
 from src.domain.energy_simulator.models import EnergySimulator
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
+from src.domain.power_tariff.pvpc import PvpcTariff
 from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.forecast_loader import load_daily_forecasts
 from src.domain.strategy.model import (
@@ -41,8 +44,10 @@ from web.backend.models.schemas import (
     SystemConfig,
 )
 from web.backend.services.data_service import DataService
+from web.backend.services.pvpc_service import PvpcService
 
 LOCAL_TZ = pytz.timezone("Europe/Madrid")
+logger = logging.getLogger(__name__)
 
 # --- Strategy registry ---
 
@@ -185,8 +190,13 @@ RunDoneCallback = Callable[[], None]
 class SimulationService:
     """Manages simulation runs in background threads."""
 
-    def __init__(self, data_service: DataService) -> None:
+    def __init__(
+        self,
+        data_service: DataService,
+        pvpc_service: Optional[PvpcService] = None,
+    ) -> None:
         self.data_service = data_service
+        self.pvpc_service = pvpc_service or PvpcService()
         self.config = SystemConfig()
         self.runs: Dict[str, SimulationRun] = {}
         self._executor = ThreadPoolExecutor(max_workers=4)
@@ -208,8 +218,30 @@ class SimulationService:
 
     # --- build domain objects from config ---
 
-    def _build_tariff(self, config: Optional[SystemConfig] = None) -> PowerTariff:
+    def _build_tariff(
+        self,
+        config: Optional[SystemConfig] = None,
+        prices: Optional[Dict[datetime, float]] = None,
+    ) -> PowerTariff:
         config = config or self.config
+        if config.tariff.use_pvpc and prices is not None:
+            export_price = 0.0
+            for r in config.tariff.rates:
+                if r.direction == "export":
+                    export_price = r.price
+                    break
+            # PvpcTariff is structurally compatible with PowerTariff but is
+            # not a subclass (the existing PowerTariff is a dataclass).
+            return cast(
+                PowerTariff,
+                PvpcTariff(
+                    prices_eur_kwh=prices,
+                    export_price=export_price,
+                    export_follows_pvpc=config.tariff.export_follows_pvpc,
+                    export_pvpc_discount=config.tariff.export_pvpc_discount,
+                ),
+            )
+
         schedule = {}
         for r in config.tariff.rates:
             direction = (
@@ -280,6 +312,40 @@ class SimulationService:
             else None
         )
 
+        # Pre-fetch PVPC prices synchronously so failures short-circuit the
+        # whole run with a clear message instead of surfacing per-thread. All
+        # strategy threads then share the same price dict.
+        pvpc_prices: Optional[Dict[datetime, float]] = None
+        if config_snapshot.tariff.use_pvpc and len(load_df.index) > 0:
+            first_ts = load_df.index[0]
+            last_ts = load_df.index[-1]
+            # MPC-style strategies read prices ~24h ahead of the current
+            # simulation step. Fetch an extra day so the final simulation day
+            # has the lookahead prices available.
+            # +2 days minimum, or horizon+1 day whichever is larger (48h MPC
+            # horizon needs extra lookahead on the final simulation day).
+            horizon_buffer_days = max(2, config_snapshot.tariff.mpc_horizon_hours // 24 + 1)
+            last_ts_ext = last_ts + pd.Timedelta(days=horizon_buffer_days)
+            try:
+                pvpc_prices = self.pvpc_service.get_prices(
+                    first_ts.to_pydatetime(), last_ts_ext.to_pydatetime()
+                )
+            except Exception as exc:
+                logger.exception("PVPC fetch failed for run %s", run_id)
+                err = f"PVPC fetch failed: {exc}"
+                with run.lock:
+                    for sid in strategy_ids:
+                        sr = run.strategies[sid]
+                        sr.status = "failed"
+                        sr.error = err
+                    run.status = "failed"
+                if on_strategy_done is not None:
+                    for sid in strategy_ids:
+                        on_strategy_done(sid, "failed", None)
+                if on_run_done is not None:
+                    on_run_done()
+                return run_id
+
         for sid in strategy_ids:
             self._executor.submit(
                 self._run_strategy,
@@ -294,6 +360,7 @@ class SimulationService:
                 strategy_ids,
                 daily_forecasts,
                 hourly_ghi_forecasts,
+                pvpc_prices,
             )
 
         return run_id
@@ -311,12 +378,13 @@ class SimulationService:
         all_strategy_ids: List[str],
         daily_forecasts: Optional[Dict] = None,
         hourly_ghi_forecasts: Optional[Dict] = None,
+        pvpc_prices: Optional[Dict[datetime, float]] = None,
     ) -> None:
         result = run.strategies[strategy_id]
         result.status = "running"
 
         try:
-            tariff = self._build_tariff(config)
+            tariff = self._build_tariff(config, prices=pvpc_prices)
             battery = self._build_battery(config)
             grid = self._build_grid(config)
 
@@ -336,6 +404,8 @@ class SimulationService:
                     battery, grid, tariff,
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
+                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
+                    horizon_hours=config.tariff.mpc_horizon_hours,
                 )
             elif strategy_id == "mpc_calibrated":
                 load_forecaster = LoadForecaster(load_df)
@@ -346,6 +416,8 @@ class SimulationService:
                     battery, grid, tariff,
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
+                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
+                    horizon_hours=config.tariff.mpc_horizon_hours,
                 )
             elif strategy_id == "mpc_5min":
                 load_forecaster = LoadForecaster(load_df)
@@ -357,6 +429,8 @@ class SimulationService:
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
                     step_minutes=5, resolve_minutes=5,
+                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
+                    horizon_hours=config.tariff.mpc_horizon_hours,
                 )
             elif strategy_id == "mpc_5min_perfect":
                 load_forecaster = LoadForecaster(load_df)
@@ -366,6 +440,8 @@ class SimulationService:
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
                     step_minutes=5, resolve_minutes=5,
+                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
+                    horizon_hours=config.tariff.mpc_horizon_hours,
                 )
             elif strategy_id == "mpc_perfect":
                 load_forecaster = LoadForecaster(load_df)
@@ -374,6 +450,8 @@ class SimulationService:
                     battery, grid, tariff,
                     load_forecaster=load_forecaster,
                     solar_forecaster=solar_forecaster,
+                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
+                    horizon_hours=config.tariff.mpc_horizon_hours,
                 )
             elif strategy_id == "dqn_agent":
                 import os

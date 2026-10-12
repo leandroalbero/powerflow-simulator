@@ -16,6 +16,7 @@ export interface BatteryConfig {
   initial_soc: number;
   taper_start: number;
   taper_factor: number;
+  cycle_cost_eur_kwh: number;
 }
 
 export interface GridConfig {
@@ -33,6 +34,10 @@ export interface TariffRate {
 export interface TariffConfig {
   rates: TariffRate[];
   weekend_rate: TariffRate | null;
+  use_pvpc: boolean;
+  export_follows_pvpc: boolean;
+  export_pvpc_discount: number;
+  mpc_horizon_hours: number;
 }
 
 export interface StrategyConfig {

@@ -213,6 +213,8 @@ class MpcStrategy(BaseEnergyStrategy):
         step_minutes: int = 15,
         resolve_minutes: int = 15,
         horizon_hours: int = 24,
+        cycle_cost_eur_kwh: float = 0.0,
+        terminal_value_eur_kwh: float = 0.0,
     ) -> None:
         super().__init__(battery, grid, tariff)
         self._load_forecaster = load_forecaster
@@ -220,6 +222,8 @@ class MpcStrategy(BaseEnergyStrategy):
         self._step_minutes = step_minutes
         self._resolve_minutes = resolve_minutes
         self._horizon_steps = horizon_hours * 60 // step_minutes
+        self._cycle_cost_eur_kwh = cycle_cost_eur_kwh
+        self._terminal_value_eur_kwh = terminal_value_eur_kwh
         self._cached_plan: dict[str, np.ndarray] | None = None
         self._plan_start: pd.Timestamp | None = None
         self._current_ts: pd.Timestamp | None = None
@@ -269,6 +273,8 @@ class MpcStrategy(BaseEnergyStrategy):
             min_soc_frac=self.min_battery_level,
             max_grid_import=self.grid.max_import,
             max_grid_export=self.grid.max_export,
+            cycle_cost_eur_kwh=self._cycle_cost_eur_kwh,
+            terminal_value_eur_kwh=self._terminal_value_eur_kwh,
         )
 
         if result.success:
@@ -311,11 +317,23 @@ class MpcStrategy(BaseEnergyStrategy):
         load_energy = load_power * duration
         flows.direct_solar = min(solar_energy, load_energy)
 
-        flows.battery_charge = float(plan["charge"][t])
-        flows.battery_discharge = float(plan["discharge"][t])
-        flows.grid_import = float(plan["grid_import"][t])
-        flows.grid_export = float(plan["grid_export"][t])
+        # Apply the plan's battery command to the ACTUAL battery against ACTUAL
+        # solar/load — the plan was built on forecasts, so realised flows differ.
+        # Recording realised flows (and letting SOC follow the physical battery, which
+        # the next re-solve reads back as initial_soc) is what makes the simulator's
+        # cost accounting trustworthy. The old code recorded the *planned* flows and
+        # force-wrote SOC to the plan, so cost reflected a forecast that never
+        # happened (and the MPC could even "beat" the perfect-foresight oracle).
+        net_batt = float(plan["charge"][t] - plan["discharge"][t])  # +charge kW
+        if net_batt > 1e-6:
+            flows.battery_charge = float(self.battery.charge(net_batt, duration))
+        elif net_batt < -1e-6:
+            flows.battery_discharge = float(self.battery.discharge(-net_batt, duration))
 
-        self.battery.current_charge = float(plan["soc"][t])
+        net_kw = load_power - solar_power + flows.battery_charge - flows.battery_discharge
+        if net_kw >= 0:
+            flows.grid_import = float(self.grid.import_power(net_kw, duration))
+        else:
+            flows.grid_export = float(self.grid.export_power(-net_kw, duration))
 
         return flows

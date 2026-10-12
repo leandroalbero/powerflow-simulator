@@ -23,6 +23,14 @@ class BatteryConfig(BaseModel):
     initial_soc: float = Field(0.1, ge=0, le=1.0, description="Initial state of charge (0-1)")
     taper_start: float = Field(0.9, gt=0, le=1.0, description="SoC threshold where charge tapering begins")
     taper_factor: float = Field(0.7, ge=0, le=1.0, description="Tapering intensity (0=no taper, 1=full taper)")
+    cycle_cost_eur_kwh: float = Field(
+        0.0,
+        ge=0,
+        description="Battery wear cost per kWh cycled (EUR/kWh). "
+        "LFP example: €1500 / (4000 cycles × 15 kWh) ≈ 0.025. "
+        "Used by MPC/Oracle LP as a cycling penalty to prevent spurious "
+        "arbitrage. Not included in reported total_cost.",
+    )
 
 
 class GridConfig(BaseModel):
@@ -50,6 +58,32 @@ class TariffConfig(BaseModel):
     weekend_rate: Optional[TariffRate] = Field(
         default_factory=lambda: TariffRate(start_hour=0, end_hour=24, price=0.085, direction="import"),
         description="Flat override rate for weekends (Spain 2.0TD: valley all day)",
+    )
+    use_pvpc: bool = Field(
+        False,
+        description="Replace import rate schedule with hourly PVPC prices from REE. "
+        "Export uses the flat export rate from `rates`.",
+    )
+    export_follows_pvpc: bool = Field(
+        False,
+        description="When PVPC is on, also use the hourly PVPC price for export "
+        "compensation instead of the flat rate. Approximates contracts that "
+        "pay spot-indexed export.",
+    )
+    export_pvpc_discount: float = Field(
+        0.0,
+        ge=0,
+        description="When export_follows_pvpc is on, subtract this amount (EUR/kWh) "
+        "from the hourly PVPC price to model retailer margin/taxes. Clamped to 0. "
+        "Octopus-style: try ~0.06 for PVPC minus margin, ~0.02 for near-pass-through.",
+    )
+    mpc_horizon_hours: int = Field(
+        24,
+        ge=1,
+        le=48,
+        description="LP horizon (hours) for MPC strategies. 48h works when PVPC "
+        "next-day prices are published (after ~20:15) and models look further ahead. "
+        "Simulation always has full foresight, so 48h is always valid here.",
     )
 
 

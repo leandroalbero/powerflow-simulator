@@ -41,6 +41,8 @@ def solve_oracle_lp(
     min_soc_frac: float,
     max_grid_import: float = 5.0,
     max_grid_export: float = 5.0,
+    cycle_cost_eur_kwh: float = 0.0,
+    terminal_value_eur_kwh: float = 0.0,
 ) -> OracleLpResult:
     """Solve for the cost-minimizing battery schedule with perfect foresight.
 
@@ -83,9 +85,24 @@ def solve_oracle_lp(
     idx_soc = slice(4 * n, 5 * n)
 
     # Objective: min Σ (grid_import[t] * rate_import[t] - grid_export[t] * rate_export[t]) * dt[t]
+    # Optional battery-wear penalty: half the per-kWh cycling cost on charge
+    # and half on discharge (so a full round-trip of 1 kWh costs
+    # `cycle_cost_eur_kwh`). The wear term is subtracted from the reported
+    # total_cost so callers see pure grid cost comparable to non-LP strategies.
     c = np.zeros(nc)
     c[idx_imp] = import_rates * dt_arr
     c[idx_exp] = -export_rates * dt_arr
+    if cycle_cost_eur_kwh > 0:
+        half_wear = 0.5 * cycle_cost_eur_kwh
+        c[idx_ch] += half_wear * dt_arr
+        c[idx_dis] += half_wear * dt_arr
+    # Terminal cost-to-go: reward energy left in the battery at the horizon end so a
+    # finite-horizon (rolling) LP neither dumps the battery at the boundary nor
+    # grid-charges to hoard energy it can't use. Worth ~the avoided import price the
+    # stored energy will displace next. Subtracted from the objective (a reward); it
+    # is NOT a cash flow so it does not enter the reported grid cost below.
+    if terminal_value_eur_kwh > 0:
+        c[5 * n - 1] -= terminal_value_eur_kwh
 
     # Equality constraints built with sparse diagonal ops (vectorized, no Python loop).
     #
@@ -154,9 +171,13 @@ def solve_oracle_lp(
         )
 
     x = result.x
+    # Report pure grid cost (strip wear penalty so it's comparable to other strategies).
+    grid_cost = float(
+        np.sum((x[idx_imp] * import_rates - x[idx_exp] * export_rates) * dt_arr)
+    )
     return OracleLpResult(
         success=True,
-        total_cost=float(result.fun),
+        total_cost=grid_cost,
         charge=x[idx_ch],
         discharge=x[idx_dis],
         grid_import=x[idx_imp],
