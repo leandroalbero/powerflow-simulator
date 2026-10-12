@@ -16,6 +16,7 @@ from scipy.sparse import csr_matrix, diags, hstack, vstack  # type: ignore[impor
 from scipy.sparse import eye as speye  # type: ignore[import-untyped]
 
 from src.domain.battery.models import Battery
+from src.domain.energy_simulator.models import price_arrays
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
 from src.domain.strategy.model import BaseEnergyStrategy, Decision
@@ -201,8 +202,6 @@ class OracleStrategy(BaseEnergyStrategy):
         overlap_days: int = 3,
     ):
         super().__init__(battery, grid, tariff, min_battery_level, max_charge_power)
-        from src.domain.energy_simulator.models import price_arrays
-
         import_price, export_price = price_arrays(tariff, frame.index)
         valid = frame["valid"].to_numpy(dtype=bool)
         mean_import = float(import_price[valid].mean()) if valid.any() else 0.0

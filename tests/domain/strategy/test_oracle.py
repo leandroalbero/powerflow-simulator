@@ -8,6 +8,7 @@ import pytest
 from src.domain.battery.models import Battery
 from src.domain.energy_simulator.models import run
 from src.domain.grid.model import Grid
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.strategy.model import (
     ForceChargeAtNightStrategy,
     ForceChargeAtValleyStrategy,
@@ -179,16 +180,28 @@ class TestOracleStrategy:
         return oracle, tariff
 
     def test_charges_in_valley_and_discharges_at_evening_peak(self):
+        # Shoulder at 0.19: charging there loses money against a 0.197 peak at a 0.9 round trip,
+        # so the optimum charges only in the 00-08 valley.
         frame = synthetic_frame("2026-03-04", days=1, outage=False, spike=False)
         frame["pv_kw"] = 0.0
-        oracle, tariff = self.build(frame)
+        battery = Battery(capacity=10.0, max_charge_rate=4.5, max_discharge_rate=4.6, efficiency=0.9,
+                          initial_soc=0.1)
+        tariff = PowerTariff(rate_schedule={
+            (0, 8): Rate(price=0.085, energy_direction=EnergyDirection.IMPORT),
+            (8, 10): Rate(price=0.19, energy_direction=EnergyDirection.IMPORT),
+            (10, 14): Rate(price=0.197, energy_direction=EnergyDirection.IMPORT),
+            (14, 18): Rate(price=0.19, energy_direction=EnergyDirection.IMPORT),
+            (18, 22): Rate(price=0.197, energy_direction=EnergyDirection.IMPORT),
+            (22, 24): Rate(price=0.19, energy_direction=EnergyDirection.IMPORT),
+            (0, 24): Rate(price=0.08, energy_direction=EnergyDirection.EXPORT),
+        })
+        oracle = OracleStrategy(battery, Grid(max_import=5.5, max_export=5.5), tariff, frame)
         res = run(frame, oracle, tariff)
         hours = frame.index.hour
         gc = res.timeseries["grid_charge_kw"]
         dis = res.timeseries["battery_discharge_kw"]
-        peak = ((hours >= 10) & (hours < 14)) | ((hours >= 18) & (hours < 22))
-        assert gc[hours < 8].sum() > 0.5 * gc.sum() > 0
-        assert gc[peak].sum() == pytest.approx(0.0, abs=1e-9)
+        assert gc[hours < 8].sum() > 0
+        assert gc[hours >= 8].sum() == pytest.approx(0.0, abs=1e-9)
         assert dis[(hours >= 18) & (hours < 22)].sum() > 0
         assert dis[hours < 8].sum() == pytest.approx(0.0, abs=1e-9)
 

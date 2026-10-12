@@ -144,3 +144,44 @@ def test_dst_day_runs_on_fixed_grid():
     res = run(frame, strategy, tariff)
     assert pd.Series(res.timeseries["ts"]).is_monotonic_increasing
     assert res.metrics["valid_hours"] == pytest.approx(71.0)
+
+
+def _planner(sid):
+    from src.domain.strategy.dqn.agent import DqnAgent
+    from src.domain.strategy.dqn_strategy import DqnStrategy
+    from src.domain.strategy.mpc import LoadForecaster, MpcStrategy, PerfectSolarForecaster
+    from src.domain.strategy.oracle import OracleStrategy
+
+    frame = synthetic_frame()
+    battery = Battery(capacity=10.0, max_charge_rate=4.5, max_discharge_rate=4.6, efficiency=0.9, initial_soc=0.5)
+    grid = Grid(max_import=5.5, max_export=5.5)
+    tariff = make_td20()
+    if sid == "oracle":
+        s = OracleStrategy(battery, grid, tariff, frame)
+    elif sid == "mpc":
+        history = synthetic_frame("2026-02-01", days=40, outage=False, spike=False)
+        s = MpcStrategy(battery, grid, tariff, LoadForecaster(history["load_kw"]),
+                        PerfectSolarForecaster(frame["pv_kw"]), step_minutes=15, resolve_minutes=60)
+    else:
+        s = DqnStrategy(battery, grid, tariff, agent=DqnAgent(state_dim=16, action_dim=9))
+    return frame, s, tariff
+
+
+@pytest.mark.parametrize("sid", ["oracle", "mpc", "dqn"])
+def test_energy_balance_for_planning_strategies(sid):
+    frame, strategy, tariff = _planner(sid)
+    res = run(frame, strategy, tariff)
+    ts = res.timeseries
+    v = frame["valid"].to_numpy()
+    b = strategy.battery
+    lhs = (ts["solar_kw"] + ts["grid_import_kw"] + ts["battery_discharge_kw"])[v]
+    rhs = (ts["load_kw"] + ts["grid_export_kw"] + ts["battery_charge_kw"] + ts["curtailed_kw"])[v]
+    np.testing.assert_allclose(lhs, rhs, atol=1e-9)
+    level = ts["battery_level_kwh"]
+    prev = np.concatenate(([res.metrics["initial_battery_kwh"]], level[:-1]))
+    delta = (ts["battery_charge_kw"] * b.charge_efficiency - ts["battery_discharge_kw"] / b.discharge_efficiency) / 60
+    np.testing.assert_allclose((level - prev)[v], delta[v], atol=1e-9)
+    assert level.min() >= 0.1 * b.capacity - 1e-9
+    gc = ts["grid_charge_kw"][v]
+    assert np.all(gc <= np.maximum(0.0, 5.5 - (ts["grid_import_kw"][v] - gc)) + 1e-9)
+    assert res.metrics["unserved_kwh"] == 0.0
