@@ -257,3 +257,23 @@ def test_websocket_sends_every_done_message_before_run_complete():
     assert sent[-1] == {"status": "run_complete"}
     done = [m for m in sent if m.get("status") == "completed"]
     assert done == [{"strategy": "self_consume", "status": "completed", "metrics": {"total_cost": 1.0}}]
+
+
+def test_downsample_keeps_gaps_of_any_column_not_just_the_reference():
+    n = 525_600
+    t = np.arange(n)
+    battery = 7.0 + 5.0 * np.sin(t / 700.0)
+    flow = np.abs(np.sin(t / 3000.0))
+    flow[200_000:200_129] = np.nan
+    flow[400_000:411_100] = np.nan
+    idx = downsample_indices({"battery_level": battery, "grid_import": flow}, 2000)
+    assert len(idx) <= 2004
+    assert {200_000, 199_999, 400_000, 399_999} <= set(idx.tolist())
+    assert np.isnan(flow[idx]).sum() == 2
+    assert np.isfinite(battery[idx]).all()
+
+
+def test_downsample_ignores_columns_that_are_nan_everywhere():
+    y = np.sin(np.linspace(0, 20, 10_000))
+    idx = downsample_indices({"y": y, "empty": np.full(10_000, np.nan)}, 300)
+    assert 290 <= len(idx) <= 300
