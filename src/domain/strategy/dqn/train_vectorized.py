@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from src.data.store import read_entity
+
 LOCAL_TZ = pytz.timezone("Europe/Madrid")
 
 IMPORT_RATES_BY_HOUR = {
@@ -24,16 +26,15 @@ IMPORT_RATES_BY_HOUR = {
 }
 
 
-def load_episodes():
-    solar_df = pd.read_csv("data/pv_power.csv", index_col="last_changed")
-    solar_df.index = pd.to_datetime(solar_df.index, utc=True).tz_convert(LOCAL_TZ)
-    solar_df["state"] = pd.to_numeric(solar_df["state"], errors="coerce")
-    solar_df = solar_df[["state"]].dropna().sort_index()
+def _power_frame(key: str) -> pd.DataFrame:
+    frame = read_entity(key)[["mean"]].rename(columns={"mean": "state"})
+    frame.index = frame.index.tz_convert(LOCAL_TZ)
+    return frame.dropna().sort_index()
 
-    load_df = pd.read_csv("data/house_consumption.csv", index_col="last_changed")
-    load_df.index = pd.to_datetime(load_df.index, utc=True).tz_convert(LOCAL_TZ)
-    load_df["state"] = pd.to_numeric(load_df["state"], errors="coerce")
-    load_df = load_df[["state"]].dropna().sort_index()
+
+def load_episodes():
+    solar_df = _power_frame("pv")
+    load_df = _power_frame("load")
 
     solar_h = solar_df.resample("1h").mean().fillna(0.0)
     load_h = load_df.resample("1h").mean().fillna(0.0)

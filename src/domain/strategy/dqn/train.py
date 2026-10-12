@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytz
 
+from src.data.store import read_entity
 from src.domain.strategy.dqn.agent import DqnAgent
 from src.domain.strategy.dqn.environment import BatteryEnv
 
@@ -25,18 +26,14 @@ IMPORT_RATES_BY_HOUR = {
 }
 
 
+def _power_frame(key: str) -> pd.DataFrame:
+    frame = read_entity(key)[["mean"]].rename(columns={"mean": "state"})
+    frame.index = frame.index.tz_convert(LOCAL_TZ)
+    return frame.dropna().sort_index()
+
+
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    solar_df = pd.read_csv("data/pv_power.csv", index_col="last_changed")
-    solar_df.index = pd.to_datetime(solar_df.index, utc=True).tz_convert(LOCAL_TZ)
-    solar_df["state"] = pd.to_numeric(solar_df["state"], errors="coerce")
-    solar_df = solar_df[["state"]].dropna().sort_index()
-
-    load_df = pd.read_csv("data/house_consumption.csv", index_col="last_changed")
-    load_df.index = pd.to_datetime(load_df.index, utc=True).tz_convert(LOCAL_TZ)
-    load_df["state"] = pd.to_numeric(load_df["state"], errors="coerce")
-    load_df = load_df[["state"]].dropna().sort_index()
-
-    return solar_df, load_df
+    return _power_frame("pv"), _power_frame("load")
 
 
 def build_monthly_episodes(
