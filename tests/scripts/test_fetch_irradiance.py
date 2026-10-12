@@ -1,12 +1,13 @@
-import pytest
-from unittest.mock import patch, MagicMock
-import json
-import urllib.error
-import pandas as pd
-
 # We'll test the module's functions directly
 import importlib.util
+import json
+import urllib.error
+from datetime import date
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+import pytest
 
 # Load module from scripts/ without it being a package
 spec = importlib.util.spec_from_file_location(
@@ -119,9 +120,6 @@ class TestFetchMonthData:
                     m.fetch_month_data("2024-01-01", "2024-01-31")
 
 
-from datetime import date
-
-
 class TestMonthHelpers:
     def test_generate_months_full_range(self):
         m = _load_module()
@@ -143,8 +141,20 @@ class TestShouldSkipMonth:
     def test_skip_complete_past_month(self, tmp_path):
         m = _load_module()
         csv_path = tmp_path / "2024-01.csv"
-        csv_path.write_text("timestamp,ghi\n2024-01-01T00:00,0.0\n")
+        csv_path.write_text("timestamp,ghi\n2024-01-31 23:00:00,0.0\n")
         assert m.should_skip_month(csv_path, date(2024, 1, 1), today=date(2024, 3, 15)) is True
+
+    def test_do_not_skip_partial_past_month(self, tmp_path):
+        m = _load_module()
+        csv_path = tmp_path / "2024-01.csv"
+        csv_path.write_text("timestamp,ghi\n2024-01-05 23:00:00,0.0\n")
+        assert m.should_skip_month(csv_path, date(2024, 1, 1), today=date(2024, 3, 15)) is False
+
+    def test_do_not_skip_current_month_even_if_last_hour_present(self, tmp_path):
+        m = _load_module()
+        csv_path = tmp_path / "2024-03.csv"
+        csv_path.write_text("timestamp,ghi\n2024-03-31 23:00:00,0.0\n")
+        assert m.should_skip_month(csv_path, date(2024, 3, 1), today=date(2024, 3, 15)) is False
 
     def test_do_not_skip_current_month(self, tmp_path):
         m = _load_module()
@@ -205,7 +215,7 @@ class TestRunIngestion:
         m = _load_module()
 
         csv_file = tmp_path / "2024-01.csv"
-        csv_file.write_text("timestamp,ghi\nexisting,data\n")
+        csv_file.write_text("timestamp,ghi\n2024-01-31 23:00:00,0.0\n")
 
         with patch("urllib.request.urlopen") as mock_open:
             m.run_ingestion(
@@ -216,7 +226,5 @@ class TestRunIngestion:
                 today=date(2024, 3, 1),
             )
 
-        # Should not have made any API calls
         mock_open.assert_not_called()
-        # Original file should be untouched
-        assert csv_file.read_text() == "timestamp,ghi\nexisting,data\n"
+        assert csv_file.read_text() == "timestamp,ghi\n2024-01-31 23:00:00,0.0\n"

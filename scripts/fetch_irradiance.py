@@ -14,8 +14,8 @@ import argparse
 import calendar
 import json
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -107,24 +107,44 @@ def generate_months(start: date, end: date) -> list[tuple[date, date]]:
     return months
 
 
+def _month_last_hour(month_start: date) -> datetime:
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+    return datetime(month_start.year, month_start.month, last_day, 23, 0, 0)
+
+
+def _last_timestamp(csv_path: Path) -> datetime | None:
+    try:
+        lines = [line for line in csv_path.read_text().splitlines() if line.strip()]
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    raw = lines[-1].split(",", 1)[0].strip().strip('"')
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def should_skip_month(
     csv_path: Path,
     month_start: date,
     today: date | None = None,
     force: bool = False,
 ) -> bool:
-    """Return True if this month's CSV already exists and doesn't need re-fetching."""
-    if force:
-        return False
-    if not csv_path.exists():
+    """Skip only a past month whose last timestamp reaches that month's last hour."""
+    if force or not csv_path.exists():
         return False
     if today is None:
         today = date.today()
-    # Current month always re-fetched (still accumulating data)
-    is_current_month = (month_start.year == today.year and month_start.month == today.month)
-    if is_current_month:
+    if month_start.year == today.year and month_start.month == today.month:
         return False
-    return True
+    last_ts = _last_timestamp(csv_path)
+    if last_ts is None:
+        return False
+    return last_ts >= _month_last_hour(month_start)
 
 
 ARCHIVE_START = date(2024, 1, 1)
