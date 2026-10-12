@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
+from src.data.frame import to_utc_bound
 from web.backend.models.schemas import (
     RunSummary,
     SimulationRequest,
@@ -98,10 +99,10 @@ def get_timeseries(
     mask = np.ones(len(ts_ms), dtype=bool)
     try:
         if start:
-            mask &= ts_ms >= _epoch_ms(start)
+            mask &= ts_ms >= _epoch_ms(start, is_end=False)
         if end:
-            mask &= ts_ms <= _epoch_ms(end)
-    except ValueError as exc:
+            mask &= ts_ms < _epoch_ms(end, is_end=True)
+    except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"Invalid time filter: {exc}")
     ts_ms = ts_ms[mask]
     columns = {k: np.asarray(v, dtype=float)[mask] for k, v in columns.items()}
@@ -120,11 +121,12 @@ def get_timeseries(
     )
 
 
-def _epoch_ms(value: str) -> int:
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("Europe/Madrid", ambiguous=True, nonexistent="shift_forward")
-    return int(ts.value // 1_000_000)
+def _epoch_ms(value: str, is_end: bool) -> int:
+    """Same bound convention as /simulate: a date-only end is the whole local day; the end is exclusive."""
+    bound = to_utc_bound(value, is_end=is_end)
+    if bound is None:
+        raise ValueError(f"empty bound {value!r}")
+    return int(bound.value // 1_000_000)
 
 
 def _nan_to_none(values: np.ndarray) -> List[Optional[float]]:

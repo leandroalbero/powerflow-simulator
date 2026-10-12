@@ -64,6 +64,16 @@ class TestValidation:
             sim.start_run(ids, start, end)
         assert sim.runs == {}
 
+    def test_date_only_end_is_inclusive_whole_day(self, data):
+        sim = SimulationService(data)
+        sim.validate_request(["self_consume"], "2026-03-04T12:00:00", "2026-03-04")
+        sim.validate_request(["self_consume"], "2026-03-04", "2026-03-04")
+        with pytest.raises(ValueError, match="must not be after"):
+            sim.validate_request(["self_consume"], "2026-03-05T00:00:00", "2026-03-04")
+        run = _wait(sim, sim.start_run(["self_consume"], "2026-03-04T12:00:00", "2026-03-04"))
+        assert run.status == "completed"
+        assert run.strategies["self_consume"].metrics["valid_hours"] == pytest.approx(12.0)
+
     def test_api_maps_value_error_to_422(self, data):
         sim = SimulationService(data)
         with pytest.raises(HTTPException) as exc:
@@ -133,6 +143,13 @@ class TestRuns:
         assert day.point_count == 1440
         assert day.house_consumption[11 * 60] is None
         assert day.timestamps[0].startswith("2026-03-05T00:00:00+01:00")
+        whole = get_timeseries(run.run_id, _request(sim), strategy="self_consume", start="2026-03-05",
+                               end="2026-03-05", max_points=2000)
+        assert whole.point_count == 1440
+        assert whole.timestamps == day.timestamps
+        zulu = get_timeseries(run.run_id, _request(sim), strategy="self_consume", start="2026-03-04T23:00:00Z",
+                              end="2026-03-05T00:59:00Z", max_points=2000)
+        assert zulu.point_count == 120
 
 
 class TestDataService:

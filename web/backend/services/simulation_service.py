@@ -342,12 +342,13 @@ class SimulationService:
         if len(set(strategy_ids)) != len(strategy_ids):
             raise ValueError("Duplicate strategies in request")
         bounds = []
-        for label, value in (("start", start), ("end", end)):
+        for label, value, is_end in (("start", start, False), ("end", end, True)):
             try:
-                bounds.append(to_utc_bound(value, is_end=False))
+                bounds.append(to_utc_bound(value, is_end=is_end))
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Invalid {label} date {value!r}: expected YYYY-MM-DD or ISO datetime") from exc
-        if bounds[0] is not None and bounds[1] is not None and bounds[0] > bounds[1]:
+        # A date-only end covers that whole local day, so compare against the exclusive end.
+        if bounds[0] is not None and bounds[1] is not None and bounds[0] >= bounds[1]:
             raise ValueError(f"start ({start}) must not be after end ({end})")
 
     def _pvpc_window(self, frame: pd.DataFrame, config: SystemConfig) -> Optional[tuple]:
