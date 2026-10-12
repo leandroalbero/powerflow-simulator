@@ -7,6 +7,7 @@ Prices are keyed by **UTC** hour. ``rate_at(ts)`` prices the UTC hour that
 contains ``ts``, so both 02:00 hours of the October fall-back day get their own
 price. Rate types come from the tertiles of the ts's Madrid-local day (23, 24 or
 25 hourly prices): cheapest third VALLEY, middle PLAIN, most expensive PEAK.
+Hours with the same price always share a RateType.
 
 A missing hour falls back to the same local hour of the most recent earlier day
 that has a price (prices for the day after tomorrow are never published), so a
@@ -171,18 +172,33 @@ class PvpcTariff:
         return {(b["start"], b["end"]): b["rate"] for b in self._day(local_date).blocks}
 
 
+def _type_for_rank(rank: int, n: int) -> RateType:
+    if rank * 3 < n:
+        return RateType.VALLEY
+    if rank * 3 < 2 * n:
+        return RateType.PLAIN
+    return RateType.PEAK
+
+
 def _tertile_rate_types(prices: List[float]) -> List[RateType]:
-    """Classify a day's hourly prices into VALLEY/PLAIN/PEAK by rank tertile (ties by hour order)."""
+    """Classify a day's hourly prices into VALLEY/PLAIN/PEAK by rank tertile.
+
+    A tie takes the type of its cheapest rank, so equal prices are never split
+    across a tertile cut.
+    """
     n = len(prices)
     if n == 0:
         return []
-    ranked = sorted(range(n), key=lambda h: (prices[h], h))
+    order = sorted(range(n), key=lambda h: prices[h])
     result: List[RateType] = [RateType.PLAIN] * n
-    for rank, hour in enumerate(ranked):
-        if rank * 3 < n:
-            result[hour] = RateType.VALLEY
-        elif rank * 3 < 2 * n:
-            result[hour] = RateType.PLAIN
-        else:
-            result[hour] = RateType.PEAK
+    i = 0
+    while i < n:
+        price = prices[order[i]]
+        j = i + 1
+        while j < n and prices[order[j]] == price:
+            j += 1
+        rate_type = _type_for_rank(i, n)
+        for k in range(i, j):
+            result[order[k]] = rate_type
+        i = j
     return result
