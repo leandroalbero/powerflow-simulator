@@ -410,15 +410,12 @@ class SimulationService:
                     max_charge_power=config.strategy.max_charge_power,
                 )
             elif strategy_id == "dqn_agent":
-                import os
+                from src.domain.strategy.dqn_strategy import load_dqn_strategy
 
-                from src.domain.strategy.dqn.agent import DqnAgent
-                from src.domain.strategy.dqn_strategy import DqnStrategy as DqnStrategyCls
-                agent = DqnAgent(state_dim=16, action_dim=9)
-                model_path = "output_files/dqn_policy.pt"
-                if os.path.exists(model_path):
-                    agent.load(model_path)
-                strategy = DqnStrategyCls(battery, grid, tariff, agent=agent)
+                strategy = load_dqn_strategy(
+                    battery, grid, tariff,
+                    min_battery_level=config.strategy.min_battery_level,
+                )
             elif strategy_id == "oracle":
                 strategy = strategy_cls(
                     battery, grid, tariff, frame,

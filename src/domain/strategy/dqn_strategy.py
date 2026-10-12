@@ -1,6 +1,8 @@
 """DQN strategy: learned policy for battery control."""
 
 import math
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -78,3 +80,22 @@ class DqnStrategy(BaseEnergyStrategy):
         if action_val > 0:
             return Decision(action_val * self.battery.max_charge_rate, allow_grid_charge=True)
         return Decision(action_val * self.battery.max_discharge_rate)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_POLICY = Path("output_files") / "dqn_policy.pt"
+
+
+def load_dqn_strategy(battery: Battery, grid: Grid, tariff: PowerTariff,
+                      policy_path: Optional[Path] = None, **kwargs) -> DqnStrategy:
+    """DqnStrategy with the trained policy; refuses to run untrained (random) weights."""
+    path = Path(policy_path) if policy_path is not None else REPO_ROOT / DEFAULT_POLICY
+    if not path.exists():
+        shown = DEFAULT_POLICY if policy_path is None else path
+        raise FileNotFoundError(f"DQN policy not trained: {shown.as_posix()} missing")
+    agent = DqnAgent(state_dim=16, action_dim=9)
+    agent.load(str(path))
+    strategy = DqnStrategy(battery, grid, tariff, agent=agent)
+    for key, value in kwargs.items():
+        setattr(strategy, key, value)
+    return strategy
