@@ -17,6 +17,7 @@ from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.power_tariff.pvpc import PvpcTariff
 from src.domain.strategy.forecast_loader import load_daily_forecasts
+from src.domain.strategy.irradiance import HourlyGhi, load_irradiance
 from src.domain.strategy.model import (
     ForceChargeAtNightStrategy,
     ForceChargeAtValleyStrategy,
@@ -27,15 +28,7 @@ from src.domain.strategy.model import (
     SmartDischargeStrategy,
     ValleyChargePeakDischargeStrategy,
 )
-from src.domain.strategy.mpc import (
-    CalibratedSolarForecaster,
-    LoadForecaster,
-    MpcStrategy,
-    PerfectSolarForecaster,
-    SolarForecaster,
-    learn_monthly_ghi_factors,
-    load_hourly_ghi_forecasts,
-)
+from src.domain.strategy.mpc import MPC_VARIANTS, MpcStrategy, build_mpc
 from src.domain.strategy.oracle import OracleStrategy
 from web.backend.models.schemas import (
     StrategyInfo,
@@ -284,6 +277,14 @@ class SimulationService:
 
     # --- run simulation ---
 
+    def _history_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Frame from up to 60 days before the run start to its end, for out-of-sample forecasters."""
+        if len(frame) == 0:
+            return frame
+        first = frame.index[0]
+        start = (first - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+        return self.data_service.get_frame(start, frame.index[-1].strftime("%Y-%m-%d"))
+
     def start_run(
         self,
         strategy_ids: List[str],
@@ -305,17 +306,16 @@ class SimulationService:
 
         # Fetch data once (shared across strategies — read only)
         frame = self.data_service.get_frame(start, end)
-        valid_rows = frame[frame["valid"]]
-        solar_df = pd.DataFrame({"state": valid_rows["pv_kw"] * 1000.0})
-        load_df = pd.DataFrame({"state": valid_rows["load_kw"] * 1000.0})
+        needs_mpc = any(s in MPC_VARIANTS for s in strategy_ids)
+        history = self._history_frame(frame) if needs_mpc else None
 
         # Load forecasts once if needed (shared across threads)
         daily_forecasts = (
             load_daily_forecasts() if "forecast_charge" in strategy_ids else None
         )
-        hourly_ghi_forecasts = (
-            load_hourly_ghi_forecasts()
-            if any(s in strategy_ids for s in ("mpc", "mpc_calibrated", "mpc_5min"))
+        ghi = (
+            HourlyGhi(load_irradiance())
+            if any(MPC_VARIANTS[s].solar != "perfect" for s in strategy_ids if s in MPC_VARIANTS)
             else None
         )
 
@@ -323,9 +323,9 @@ class SimulationService:
         # whole run with a clear message instead of surfacing per-thread. All
         # strategy threads then share the same price dict.
         pvpc_prices: Optional[Dict[datetime, float]] = None
-        if config_snapshot.tariff.use_pvpc and len(load_df.index) > 0:
-            first_ts = load_df.index[0]
-            last_ts = load_df.index[-1]
+        if config_snapshot.tariff.use_pvpc and len(frame.index) > 0:
+            first_ts = frame.index[0]
+            last_ts = frame.index[-1]
             # MPC-style strategies read prices ~24h ahead of the current
             # simulation step. Fetch an extra day so the final simulation day
             # has the lookahead prices available.
@@ -359,16 +359,15 @@ class SimulationService:
                 run,
                 sid,
                 frame,
-                solar_df,
-                load_df,
                 config_snapshot,
                 on_progress,
                 on_strategy_done,
                 on_run_done,
                 strategy_ids,
                 daily_forecasts,
-                hourly_ghi_forecasts,
                 pvpc_prices,
+                history,
+                ghi,
             )
 
         return run_id
@@ -378,16 +377,15 @@ class SimulationService:
         run: SimulationRun,
         strategy_id: str,
         frame: pd.DataFrame,
-        solar_df: pd.DataFrame,
-        load_df: pd.DataFrame,
         config: SystemConfig,
         on_progress: Optional[ProgressCallback],
         on_strategy_done: Optional[StrategyDoneCallback],
         on_run_done: Optional[RunDoneCallback],
         all_strategy_ids: List[str],
         daily_forecasts: Optional[Dict] = None,
-        hourly_ghi_forecasts: Optional[Dict] = None,
         pvpc_prices: Optional[Dict[datetime, float]] = None,
+        history: Optional[pd.DataFrame] = None,
+        ghi: Optional[HourlyGhi] = None,
     ) -> None:
         result = run.strategies[strategy_id]
         result.status = "running"
@@ -403,61 +401,13 @@ class SimulationService:
 
             if strategy_id == "forecast_charge":
                 strategy = strategy_cls(battery, grid, tariff, daily_forecasts)
-            elif strategy_id == "mpc":
-                load_forecaster = LoadForecaster(load_df)
-                solar_forecaster = SolarForecaster(hourly_ghi_forecasts or {})
-                strategy = strategy_cls(
-                    battery, grid, tariff,
-                    load_forecaster=load_forecaster,
-                    solar_forecaster=solar_forecaster,
-                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
+            elif strategy_id in MPC_VARIANTS:
+                strategy = build_mpc(
+                    strategy_id, battery, grid, tariff, frame, history=history, ghi=ghi,
                     horizon_hours=config.tariff.mpc_horizon_hours,
-                )
-            elif strategy_id == "mpc_calibrated":
-                load_forecaster = LoadForecaster(load_df)
-                ghi_fc = hourly_ghi_forecasts or {}
-                monthly_factors = learn_monthly_ghi_factors(solar_df, ghi_fc)
-                solar_forecaster = CalibratedSolarForecaster(ghi_fc, monthly_factors)
-                strategy = strategy_cls(
-                    battery, grid, tariff,
-                    load_forecaster=load_forecaster,
-                    solar_forecaster=solar_forecaster,
                     cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
-                    horizon_hours=config.tariff.mpc_horizon_hours,
-                )
-            elif strategy_id == "mpc_5min":
-                load_forecaster = LoadForecaster(load_df)
-                ghi_fc = hourly_ghi_forecasts or {}
-                monthly_factors = learn_monthly_ghi_factors(solar_df, ghi_fc)
-                solar_forecaster = CalibratedSolarForecaster(ghi_fc, monthly_factors)
-                strategy = strategy_cls(
-                    battery, grid, tariff,
-                    load_forecaster=load_forecaster,
-                    solar_forecaster=solar_forecaster,
-                    step_minutes=5, resolve_minutes=5,
-                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
-                    horizon_hours=config.tariff.mpc_horizon_hours,
-                )
-            elif strategy_id == "mpc_5min_perfect":
-                load_forecaster = LoadForecaster(load_df)
-                solar_forecaster = PerfectSolarForecaster(solar_df)
-                strategy = strategy_cls(
-                    battery, grid, tariff,
-                    load_forecaster=load_forecaster,
-                    solar_forecaster=solar_forecaster,
-                    step_minutes=5, resolve_minutes=5,
-                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
-                    horizon_hours=config.tariff.mpc_horizon_hours,
-                )
-            elif strategy_id == "mpc_perfect":
-                load_forecaster = LoadForecaster(load_df)
-                solar_forecaster = PerfectSolarForecaster(solar_df)
-                strategy = strategy_cls(
-                    battery, grid, tariff,
-                    load_forecaster=load_forecaster,
-                    solar_forecaster=solar_forecaster,
-                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
-                    horizon_hours=config.tariff.mpc_horizon_hours,
+                    min_battery_level=config.strategy.min_battery_level,
+                    max_charge_power=config.strategy.max_charge_power,
                 )
             elif strategy_id == "dqn_agent":
                 import os
