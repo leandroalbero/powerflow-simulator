@@ -217,11 +217,16 @@ class PvpcService:
         returned datetimes include explicit UTC offsets, so we always trust
         the response's offset rather than the request-side assumption.
         """
-        start_madrid = start_utc.astimezone(_MADRID_TZ)
-        end_madrid = end_utc.astimezone(_MADRID_TZ)
+        end_param = _ree_local(end_utc)
+        request_start = start_utc
+        # REE answers HTTP 400 when start_date == end_date (a one-hour window, or two UTC hours that
+        # share a wall-clock label on the DST fall-back day). Earlier hours are always published, so
+        # widen backwards and keep only the requested hours.
+        while _ree_local(request_start) >= end_param:
+            request_start -= timedelta(hours=1)
         params = (
-            f"?start_date={start_madrid.strftime('%Y-%m-%dT%H:%M')}"
-            f"&end_date={end_madrid.strftime('%Y-%m-%dT%H:%M')}"
+            f"?start_date={_ree_local(request_start)}"
+            f"&end_date={end_param}"
             f"&time_trunc=hour"
         )
         url = REE_ENDPOINT + params
@@ -239,7 +244,8 @@ class PvpcService:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RuntimeError(f"PVPC fetch failed: invalid JSON from REE: {exc}") from exc
 
-        return _parse_ree_response(doc)
+        prices = _parse_ree_response(doc)
+        return {ts: p for ts, p in prices.items() if start_utc <= ts <= end_utc}
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +295,10 @@ def _parse_ree_response(doc: dict) -> Dict[datetime, float]:
     if not out:
         raise RuntimeError("PVPC fetch failed: PVPC values array was empty")
     return out
+
+
+def _ree_local(ts_utc: datetime) -> str:
+    return ts_utc.astimezone(_MADRID_TZ).strftime("%Y-%m-%dT%H:%M")
 
 
 def _unpublished_from() -> datetime:
