@@ -441,3 +441,48 @@ class TestNetMeter:
         realised = run(frame, oracle, tariff).metrics["adjusted_cost"]
         assert realised == pytest.approx(lp_adj, abs=max(0.02 * abs(lp_adj), 0.10))
 
+
+class TestBelowFloorStart:
+    def test_lp_does_not_discharge_below_floor_or_reenter_the_band(self):
+        n = 72
+        hours = np.arange(n) % 24
+        solar = np.where((hours >= 9) & (hours < 17), 3.0, 0.0)
+        load = np.full(n, 0.8)
+        imp_r = np.where(hours < 8, 0.085, np.where((hours >= 18) & (hours < 22), 0.197, 0.135))
+        r = solve_oracle_lp(solar=solar, load=load, import_rates=imp_r, export_rates=np.full(n, 0.08), dt=1.0,
+                            battery_capacity=10.0, max_charge_rate=3.0, max_discharge_rate=3.0,
+                            efficiency=0.95, initial_soc=0.02, min_soc_frac=0.3,
+                            max_grid_import=5.5, max_grid_export=5.5)
+        assert r.success
+        reached = np.flatnonzero(r.soc >= 3.0 - 1e-6)
+        assert reached.size
+        k = reached[0]
+        assert np.all(r.discharge[:k + 1] <= 1e-9)
+        assert np.all(r.soc[k:] >= 3.0 - 1e-6)
+        assert r.discharge[k + 1:].max() > 0.1
+
+    def test_never_reaching_floor_means_never_discharging(self):
+        n = 12
+        solar = np.zeros(n)
+        solar[:2] = 0.5
+        load = np.where(np.arange(n) < 2, 0.0, 1.0)
+        r = solve_oracle_lp(solar=solar, load=load, import_rates=np.full(n, 0.2),
+                            export_rates=np.full(n, 0.08), dt=1.0, battery_capacity=10.0, max_charge_rate=3.0,
+                            max_discharge_rate=3.0, efficiency=0.95, initial_soc=0.2, min_soc_frac=0.3)
+        assert r.success
+        assert r.soc.max() < 3.0
+        assert np.all(r.discharge <= 1e-9)
+
+    def test_oracle_replay_from_below_floor(self):
+        frame = synthetic_frame("2026-03-02", days=3, outage=False, spike=False)
+        battery = Battery(capacity=10.0, max_charge_rate=4.5, max_discharge_rate=4.6, efficiency=0.9,
+                          initial_soc=0.02)
+        tariff = make_td20()
+        oracle = OracleStrategy(battery, Grid(max_import=5.5, max_export=5.5), tariff, frame,
+                                min_battery_level=0.3)
+        lp = oracle.lp_result
+        k = np.flatnonzero(lp.soc >= 3.0 - 1e-6)[0]
+        assert np.all(lp.soc[k:] >= 3.0 - 1e-6)
+        lp_adj = lp.total_cost - oracle.terminal_value_eur_kwh * (lp.soc[-1] - 0.2)
+        realised = run(frame, oracle, tariff).metrics["adjusted_cost"]
+        assert realised == pytest.approx(lp_adj, abs=max(0.02 * abs(lp_adj), 0.10))

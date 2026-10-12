@@ -135,8 +135,10 @@ def solve_oracle_lp(
         np.maximum(solar, 0.0),
         np.full(n, battery_capacity),
     ])
-    if initial_soc * battery_capacity < lb[5 * n]:
-        lb[5 * n:] = np.minimum(lb[5 * n:], initial_soc * battery_capacity)
+    floor = lb[5 * n]
+    below_floor = initial_soc * battery_capacity < floor
+    if below_floor:
+        lb[5 * n:] = initial_soc * battery_capacity
 
     def solve(lo: np.ndarray, hi: np.ndarray) -> Optional[np.ndarray]:
         r = linprog(c, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=np.column_stack([lo, hi]),
@@ -146,6 +148,23 @@ def solve_oracle_lp(
     x = solve(lb, ub)
     if x is None:
         return _empty_result(n, False)
+
+    if below_floor:
+        # The battery cannot discharge below the floor, and once it is back above it may not
+        # drop under it again; a single relaxed lb would let the plan cycle in the band.
+        reached = np.flatnonzero(x[i_soc] >= floor - _EPS)
+        k = int(reached[0]) if reached.size else n
+        lb2, ub2 = lb.copy(), ub.copy()
+        ub2[n:n + min(k + 1, n)] = 0.0
+        lb2[5 * n + k:] = floor
+        x2 = solve(lb2, ub2)
+        if x2 is None:
+            ub2[n:2 * n] = 0.0
+            lb2[5 * n:] = initial_soc * battery_capacity
+            x2 = solve(lb2, ub2)
+        if x2 is None:
+            return _empty_result(n, False)
+        lb, ub, x = lb2, ub2, x2
 
     wash = import_rates <= export_rates + 1e-12
     if wash.any() and np.any(wash & (np.minimum(x[i_imp], x[i_exp]) > _EPS)):
