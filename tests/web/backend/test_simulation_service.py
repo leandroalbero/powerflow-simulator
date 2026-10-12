@@ -205,6 +205,24 @@ def test_pvpc_window_stops_at_end_of_tomorrow(data):
     assert pd.Timestamp(start) == frame.index[0]
 
 
+def test_pvpc_window_end_of_tomorrow_follows_the_calendar(data):
+    sim = SimulationService(data)
+    # Frame end plus the lookahead must sit past every injected tomorrow, or the clamp is invisible.
+    frame = pd.DataFrame(index=pd.DatetimeIndex([
+        pd.Timestamp("2026-01-01", tz="Europe/Madrid"),
+        pd.Timestamp("2026-12-31 12:00", tz="Europe/Madrid"),
+    ]))
+    cases = [
+        ("2026-10-24 21:00", "2026-10-25 23:00:00+01:00"),
+        ("2026-03-28 21:00", "2026-03-29 23:00:00+02:00"),
+        ("2026-06-15 21:00", "2026-06-16 23:00:00+02:00"),
+    ]
+    for now_s, expected in cases:
+        now = pd.Timestamp(now_s, tz="Europe/Madrid")
+        _start, end = sim._pvpc_window(frame, SystemConfig(), now=now)
+        assert pd.Timestamp(end) == pd.Timestamp(expected), now_s
+
+
 def test_daterange_model_accepts_dates():
     assert DateRange(start="2026-03-04", end="2026-03-05").start == "2026-03-04"
 

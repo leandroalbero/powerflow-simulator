@@ -4,7 +4,7 @@ import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, cast
 
@@ -217,6 +217,23 @@ class RunInputs:
     pvpc_prices: Optional[Dict[datetime, float]] = None
 
 
+def _end_of_tomorrow(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    """23:00 Europe/Madrid on the calendar day after ``now``.
+
+    ``Timedelta(days=2)`` is 48 elapsed hours and is an hour off on DST eves.
+    """
+    if now is None:
+        now = pd.Timestamp.now(tz="Europe/Madrid")
+    else:
+        now = pd.Timestamp(now)
+        if now.tzinfo is None:
+            now = now.tz_localize("Europe/Madrid")
+        else:
+            now = now.tz_convert("Europe/Madrid")
+    day = now.date() + timedelta(days=2)
+    return pd.Timestamp(day).tz_localize("Europe/Madrid") - pd.Timedelta(hours=1)
+
+
 class SimulationService:
     """Manages simulation runs in background threads."""
 
@@ -351,14 +368,14 @@ class SimulationService:
         if bounds[0] is not None and bounds[1] is not None and bounds[0] >= bounds[1]:
             raise ValueError(f"start ({start}) must not be after end ({end})")
 
-    def _pvpc_window(self, frame: pd.DataFrame, config: SystemConfig) -> Optional[tuple]:
+    def _pvpc_window(self, frame: pd.DataFrame, config: SystemConfig,
+                     now: Optional[pd.Timestamp] = None) -> Optional[tuple]:
         if len(frame) == 0:
             return None
         lookahead = pd.Timedelta(hours=max(24, config.tariff.mpc_horizon_hours))
         needed_end = frame.index[-1] + lookahead
         # Prices are published for tomorrow at the latest; PvpcTariff falls back for later hours.
-        tomorrow_end = (pd.Timestamp.now(tz="Europe/Madrid").normalize() + pd.Timedelta(days=2)
-                        - pd.Timedelta(hours=1))
+        tomorrow_end = _end_of_tomorrow(now)
         end = min(needed_end, tomorrow_end)
         start = frame.index[0]
         if end < start:
