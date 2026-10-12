@@ -13,12 +13,10 @@ import pandas as pd
 import pytz
 
 from src.domain.battery.models import Battery
-from src.domain.energy_load.model import EnergyLoad
-from src.domain.energy_simulator.models import EnergySimulator
+from src.domain.energy_simulator.models import run as simulate
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.power_tariff.pvpc import PvpcTariff
-from src.domain.solar_generator.solar_generator import SolarGenerator
 from src.domain.strategy.forecast_loader import load_daily_forecasts
 from src.domain.strategy.model import (
     ForceChargeAtNightStrategy,
@@ -307,7 +305,10 @@ class SimulationService:
         config_snapshot = self.config
 
         # Fetch data once (shared across strategies — read only)
-        solar_df, load_df = self.data_service.get_filtered_data(start, end)
+        frame = self.data_service.get_frame(start, end)
+        valid_rows = frame[frame["valid"]]
+        solar_df = pd.DataFrame({"state": valid_rows["pv_kw"] * 1000.0})
+        load_df = pd.DataFrame({"state": valid_rows["load_kw"] * 1000.0})
 
         # Load forecasts once if needed (shared across threads)
         daily_forecasts = (
@@ -358,6 +359,7 @@ class SimulationService:
                 self._run_strategy,
                 run,
                 sid,
+                frame,
                 solar_df,
                 load_df,
                 config_snapshot,
@@ -376,6 +378,7 @@ class SimulationService:
         self,
         run: SimulationRun,
         strategy_id: str,
+        frame: pd.DataFrame,
         solar_df: pd.DataFrame,
         load_df: pd.DataFrame,
         config: SystemConfig,
@@ -394,9 +397,6 @@ class SimulationService:
             tariff = self._build_tariff(config, prices=pvpc_prices)
             battery = self._build_battery(config)
             grid = self._build_grid(config)
-
-            load = EnergyLoad(load_df)
-            solar = SolarGenerator(solar_df)
 
             strategy_cls = _STRATEGY_CLASSES.get(strategy_id)
             if strategy_cls is None and strategy_id != "dqn_agent":
@@ -472,18 +472,13 @@ class SimulationService:
                 strategy = DqnStrategyCls(battery, grid, tariff, agent=agent)
             elif strategy_id == "oracle":
                 # Resample to 5-min (inverter granularity) for tight LP
-                solar_5m = solar_df.resample("5min").mean().fillna(0.0)
-                load_5m = load_df.resample("5min").mean().fillna(0.0)
-                common_idx = solar_5m.index.intersection(load_5m.index)
-                solar_kw = solar_5m.loc[common_idx, "state"].values / 1000.0
-                load_kw = load_5m.loc[common_idx, "state"].values / 1000.0
-                hours_arr = np.array([ts.hour for ts in common_idx])
-                durations = np.full(len(common_idx), 5.0 / 60.0)  # 5 min each
+                slots = frame[["pv_kw", "load_kw"]].resample("5min").mean().fillna(0.0)
                 strategy = strategy_cls(
                     battery, grid, tariff,
-                    solar=solar_kw, load=load_kw,
-                    hours=hours_arr, durations=durations,
-                    timestamps=list(common_idx),
+                    solar=slots["pv_kw"].to_numpy(), load=slots["load_kw"].to_numpy(),
+                    hours=np.array([ts.hour for ts in slots.index]),
+                    durations=np.full(len(slots), 5.0 / 60.0),
+                    timestamps=list(slots.index),
                 )
             else:
                 strategy = strategy_cls(battery, grid, tariff)
@@ -493,39 +488,23 @@ class SimulationService:
             strategy.max_charge_power = sc.max_charge_power
             if hasattr(strategy, 'valley_charge_target'):
                 strategy.valley_charge_target = sc.valley_charge_target
-            sim = EnergySimulator(battery, load, grid, tariff, solar, strategy=strategy)
 
-            timestamps = load_df.index
-            total = len(timestamps)
-            prev_timestamp = None
-            last_reported = -1
+            def progress(pct: int) -> None:
+                result.progress = pct
+                if on_progress is not None:
+                    on_progress(strategy_id, pct)
 
-            for i, timestamp in enumerate(timestamps):
-                if hasattr(strategy, 'current_date'):
-                    strategy.current_date = timestamp.date()
-                if hasattr(strategy, 'set_timestamp'):
-                    strategy.set_timestamp(timestamp)
-                sim.step(timestamp, prev_timestamp)
-                prev_timestamp = timestamp
-
-                # Report progress every ~1%
-                if total > 0:
-                    pct = int((i + 1) * 100 / total)
-                    if pct != last_reported:
-                        last_reported = pct
-                        result.progress = pct
-                        if on_progress is not None:
-                            on_progress(strategy_id, pct)
-
-            metrics = sim.get_metrics()
-
+            sim = simulate(frame, strategy, tariff, on_progress=progress)
+            metrics = sim.metrics
+            ts_arr = sim.timeseries
+            keep = frame["valid"].to_numpy()
             timeseries = {
-                "timestamps": [t.isoformat() for t in sim.timestamps],
-                "battery_level": list(sim.battery_levels),
-                "grid_import": list(sim.grid_imports),
-                "grid_export": list(sim.grid_exports),
-                "solar_power": list(sim.solar_powers),
-                "house_consumption": list(sim.house_loads),
+                "timestamps": [t.isoformat() for t in frame.index[keep]],
+                "battery_level": ts_arr["battery_level_kwh"][keep].tolist(),
+                "grid_import": ts_arr["grid_import_kw"][keep].tolist(),
+                "grid_export": ts_arr["grid_export_kw"][keep].tolist(),
+                "solar_power": ts_arr["solar_kw"][keep].tolist(),
+                "house_consumption": ts_arr["load_kw"][keep].tolist(),
             }
 
             with run.lock:
