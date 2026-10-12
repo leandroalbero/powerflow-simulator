@@ -456,7 +456,10 @@ class SimulationService:
 
     def _drain_progress(self, queue) -> None:
         while True:
-            item = queue.get()
+            try:
+                item = queue.get()
+            except (EOFError, OSError):
+                return
             if item is None:
                 return
             run_id, strategy_id, pct = item

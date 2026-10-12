@@ -51,8 +51,11 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     # --- shutdown ---
     sim_service._executor.shutdown(wait=False)
     if pool is not None:
-        if sim_service._progress_q is not None:
-            sim_service._progress_q.put(None)
+        try:
+            if sim_service._progress_q is not None:
+                sim_service._progress_q.put(None)
+        except (EOFError, ConnectionRefusedError, OSError):
+            pass
         pool.shutdown()
     sim_service.history.close()
 
