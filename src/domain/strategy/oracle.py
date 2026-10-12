@@ -1,7 +1,6 @@
 """Oracle strategy: LP-based optimal battery scheduling with perfect foresight."""
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 from scipy.optimize import linprog  # type: ignore[import-untyped]
@@ -234,7 +233,7 @@ class OracleStrategy(BaseEnergyStrategy):
             battery_capacity=battery.capacity,
             max_charge_rate=battery.max_charge_rate,
             max_discharge_rate=battery.max_discharge_rate,
-            efficiency=battery.efficiency,
+            efficiency=battery.charge_efficiency,
             initial_soc=battery.current_charge / battery.capacity,
             min_soc_frac=self.min_battery_level,
             max_grid_import=grid.max_import,

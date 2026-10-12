@@ -1,7 +1,8 @@
 """MPC strategy: rolling-horizon LP with solar/load forecasts."""
 
 import csv
-from datetime import date as date_type, datetime, timedelta
+from datetime import date as date_type
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -247,7 +248,6 @@ class MpcStrategy(BaseEnergyStrategy):
         load_fc = self._load_forecaster.forecast_24h(ts, n, sm)
 
         step_times = [ts + timedelta(minutes=i * sm) for i in range(n)]
-        hours = np.array([t.hour for t in step_times])
 
         # Build rates with weekend awareness (Spain 2.0TD: valley all day on weekends)
         import_rates = np.empty(n)
@@ -268,7 +268,7 @@ class MpcStrategy(BaseEnergyStrategy):
             battery_capacity=self.battery.capacity,
             max_charge_rate=self.battery.max_charge_rate,
             max_discharge_rate=self.battery.max_discharge_rate,
-            efficiency=self.battery.efficiency,
+            efficiency=self.battery.charge_efficiency,
             initial_soc=self.battery.current_charge / self.battery.capacity,
             min_soc_frac=self.min_battery_level,
             max_grid_import=self.grid.max_import,

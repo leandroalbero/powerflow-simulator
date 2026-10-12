@@ -263,16 +263,15 @@ class SimulationService:
 
     def _build_battery(self, config: Optional[SystemConfig] = None) -> Battery:
         bc = (config or self.config).battery
-        battery = Battery(
+        return Battery(
             capacity=bc.capacity,
             max_charge_rate=bc.max_charge_rate,
             max_discharge_rate=bc.max_discharge_rate,
             efficiency=bc.efficiency,
+            initial_soc=bc.initial_soc,
+            taper_start=bc.taper_start,
+            taper_factor=bc.taper_factor,
         )
-        battery.current_charge = battery.capacity * bc.initial_soc
-        battery._charge_taper_start = bc.taper_start
-        battery._taper_factor = bc.taper_factor
-        return battery
 
     def _build_grid(self, config: Optional[SystemConfig] = None) -> Grid:
         gc = (config or self.config).grid
@@ -455,6 +454,7 @@ class SimulationService:
                 )
             elif strategy_id == "dqn_agent":
                 import os
+
                 from src.domain.strategy.dqn.agent import DqnAgent
                 from src.domain.strategy.dqn_strategy import DqnStrategy as DqnStrategyCls
                 agent = DqnAgent(state_dim=16, action_dim=9)
