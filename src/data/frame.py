@@ -37,12 +37,11 @@ EntityReader = Callable[[str, Optional[pd.Timestamp], Optional[pd.Timestamp]], O
 
 def store_reader(key: str, start: Optional[pd.Timestamp], end: Optional[pd.Timestamp]) -> Optional[pd.DataFrame]:
     # Imported lazily: the parquet store is owned by the data layer and may be absent.
-    from src.data.store import read_entity  # type: ignore[import-not-found]
+    from src.data.store import ENTITIES, read_entity  # type: ignore[import-not-found]
 
-    try:
-        return read_entity(key, start=start, end=end)
-    except (FileNotFoundError, KeyError):
+    if key not in ENTITIES:
         return None
+    return read_entity(key, start=start, end=end)
 
 
 def memory_reader(entities: Mapping[str, pd.DataFrame], fallback: Optional[EntityReader] = None) -> EntityReader:
