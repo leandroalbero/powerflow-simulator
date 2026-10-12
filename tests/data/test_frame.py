@@ -147,3 +147,41 @@ def test_four_year_frame_is_fast():
 def test_default_reader_uses_store(two_days):
     f = build_power_frame("2026-03-02", "2026-03-03")
     assert len(f) == 2 * 1440
+
+
+def test_fixture_files_match_store_on_disk_format(two_days):
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(two_days / "influx" / "load.parquet")
+    assert table.schema.names == ["ts", "mean", "count"]
+    assert str(table.schema.field("ts").type) == "timestamp[ns, tz=UTC]"
+
+
+def _fake_store(monkeypatch, read_entity):
+    import sys
+    import types
+
+    mod = types.ModuleType("src.data.store")
+    mod.read_entity = read_entity
+    monkeypatch.setitem(sys.modules, "src.data.store", mod)
+
+
+def test_store_reader_treats_unknown_entity_as_missing(monkeypatch):
+    from src.data.frame import store_reader
+
+    def read_entity(key, start=None, end=None):
+        raise KeyError(key)
+
+    _fake_store(monkeypatch, read_entity)
+    assert store_reader("ev", None, None) is None
+
+
+def test_store_reader_propagates_malformed_file_errors(monkeypatch):
+    from src.data.frame import store_reader
+
+    def read_entity(key, start=None, end=None):
+        raise KeyError("ts")
+
+    _fake_store(monkeypatch, read_entity)
+    with pytest.raises(KeyError, match="ts"):
+        store_reader("load", None, None)

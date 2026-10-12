@@ -41,8 +41,14 @@ def store_reader(key: str, start: Optional[pd.Timestamp], end: Optional[pd.Times
 
     try:
         return read_entity(key, start=start, end=end)
-    except (FileNotFoundError, KeyError):
+    except FileNotFoundError:
         return None
+    except KeyError as exc:
+        # Only an unknown entity means "no data"; a KeyError from a malformed file must not
+        # silently turn into an empty frame.
+        if exc.args[:1] == (key,):
+            return None
+        raise
 
 
 def memory_reader(entities: Mapping[str, pd.DataFrame], fallback: Optional[EntityReader] = None) -> EntityReader:
