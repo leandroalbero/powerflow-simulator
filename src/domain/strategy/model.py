@@ -1,11 +1,11 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateType
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateBlock, RateType
 
 GHI_TO_PV_FACTOR = 4.592
 DEFAULT_CHARGE_TARGET = 1.0
@@ -102,12 +102,6 @@ class SelfConsumeStrategy(BaseEnergyStrategy):
         self._handle_remaining_solar(flows, duration)
         self._handle_remaining_load(flows, duration, force_discharge=True)
         return flows
-
-
-class RateBlock(TypedDict):
-    start: int
-    end: int
-    rate: Rate
 
 
 class BaseRateAwareStrategy(BaseEnergyStrategy):
