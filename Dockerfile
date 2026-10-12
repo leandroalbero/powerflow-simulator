@@ -24,8 +24,8 @@ COPY web/backend/ ./web/backend/
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/web/frontend/dist ./web/frontend/dist
 
-# Copy data
-COPY data/*.csv ./data/
+# Data is a mounted volume (./data:/app/data), not baked into the image.
+RUN mkdir -p /app/data
 
 EXPOSE 8000
 

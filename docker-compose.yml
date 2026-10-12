@@ -3,6 +3,8 @@ services:
     build: .
     ports:
       - "8000:8000"
-    # Mount your full data directory to override sample data:
-    # volumes:
-    #   - ./data:/app/data
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - path: .env
+        required: false
