@@ -12,6 +12,11 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      // Capability detection reads the backend's route list.
+      '/openapi.json': {
+        target: process.env.API_TARGET ?? 'http://localhost:8000',
+        changeOrigin: true,
+      },
     },
   },
   build: {
