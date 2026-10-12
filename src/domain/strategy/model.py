@@ -281,10 +281,12 @@ class ForceChargeValleyAndPrePeakStrategy(BaseRateAwareStrategy):
     """Grid-charge in valley blocks and in shoulder blocks that precede a peak; discharge at peak."""
 
     def _should_charge(self) -> bool:
-        if self._neighbour_block(-1)["rate"].rate_type == RateType.VALLEY:
-            return False
         if self._is_type(RateType.VALLEY):
             return self._pricier_ahead()
+        # Only shoulders skip after a valley: the previous block can be yesterday's all-day
+        # off-peak block (Monday, day after a holiday), which never charged.
+        if self._neighbour_block(-1)["rate"].rate_type == RateType.VALLEY:
+            return False
         return self._is_type(RateType.PLAIN) and self._neighbour_block(1)["rate"].rate_type == RateType.PEAK
 
     def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:

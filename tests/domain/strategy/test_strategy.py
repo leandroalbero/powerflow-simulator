@@ -185,6 +185,13 @@ class TestStrategies:
         assert step(s, at(WEEKDAY, 19), 0.0, 1.0).battery_discharge == pytest.approx(DT)
         assert step(s, at(WEEKDAY, 23), 0.0, 1.0).battery_discharge == 0.0
 
+    @pytest.mark.parametrize("day", ["2026-10-05", "2026-10-13"], ids=["monday", "after_holiday"])
+    def test_force_valleys_pre_peak_charges_in_valley_after_offpeak_day(self, battery, grid, td20, day):
+        s = ForceChargeValleyAndPrePeakStrategy(battery, grid, td20)
+        assert step(s, at(day, 3), 0.0, 0.5).battery_charge_from_grid > 0
+        after_valley = step(s, at(day, 8, 30), 0.0, 1.0)
+        assert after_valley.battery_charge_from_grid == 0.0 and after_valley.battery_discharge == 0.0
+
     def test_valley_charge_peak_discharge(self, battery, grid, td20):
         s = ValleyChargePeakDischargeStrategy(battery, grid, td20)
         assert step(s, at(WEEKDAY, 3), 0.0, 0.5).battery_charge_from_grid > 0
