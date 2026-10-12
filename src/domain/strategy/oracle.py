@@ -138,12 +138,34 @@ def solve_oracle_lp(
     if initial_soc * battery_capacity < lb[5 * n]:
         lb[5 * n:] = np.minimum(lb[5 * n:], initial_soc * battery_capacity)
 
-    result = linprog(c, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=np.column_stack([lb, ub]),
-                     method="highs", options={"presolve": True, "time_limit": 600})
-    if not result.success:
+    def solve(lo: np.ndarray, hi: np.ndarray) -> Optional[np.ndarray]:
+        r = linprog(c, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=np.column_stack([lo, hi]),
+                    method="highs", options={"presolve": True, "time_limit": 600})
+        return r.x if r.success else None
+
+    x = solve(lb, ub)
+    if x is None:
         return _empty_result(n, False)
 
-    x = result.x
+    wash = import_rates <= export_rates + 1e-12
+    if wash.any() and np.any(wash & (np.minimum(x[i_imp], x[i_exp]) > _EPS)):
+        # A net meter cannot import and export in the same slot; with import cheaper than export the
+        # LP would do both and earn the spread, mispricing grid charging and export. Fixing each
+        # slot's direction to the netted first solution keeps that solution feasible.
+        net = x[i_imp] - x[i_exp]
+        # A slot with zero net (e.g. washing exactly the solar surplus into the battery) keeps its natural
+        # direction; forcing it to import mode would forbid exporting the surplus.
+        importing = np.where(np.abs(net) > 1e-9, net > 0, load > solar)
+        ub2 = ub.copy()
+        ub2[3 * n:4 * n] = np.where(wash & importing, 0.0, ub2[3 * n:4 * n])
+        ub2[2 * n:3 * n] = np.where(wash & ~importing, 0.0, ub2[2 * n:3 * n])
+        x2 = solve(lb, ub2)
+        if x2 is not None:
+            x = x2
+
+    x = x.copy()
+    net = x[i_imp] - x[i_exp]
+    x[i_imp], x[i_exp] = np.maximum(net, 0.0), np.maximum(-net, 0.0)
     grid_cost = float(np.sum((x[i_imp] * import_rates - x[i_exp] * export_rates) * dt_arr))
     return OracleLpResult(
         success=True, total_cost=grid_cost,
