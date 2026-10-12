@@ -49,13 +49,7 @@ git clone https://github.com/leandroalbero/powerflow-simulator.git
 cd powerflow-simulator
 docker compose up --build
 ```
-Open http://localhost:8000 — the image includes the full dataset (~2 years of 1-minute resolution data).
-
-To use your own dataset, mount a volume in `docker-compose.yml`:
-```yaml
-volumes:
-  - ./data:/app/data
-```
+Open http://localhost:8000. The image does not contain the dataset. `docker-compose.yml` mounts `./data` at `/app/data`. Fetch it first (see Data).
 
 ## Local Development
 ```bash
@@ -75,12 +69,22 @@ make web-dev
 Backend runs on http://localhost:8000, frontend dev server on http://localhost:5173.
 
 ## Data
-Input CSVs need a `last_changed` datetime index and a `state` column (values in Watts):
-```csv
-"last_changed","state"
-"2024-01-01T00:00:00.000+01:00","1424.67"
+Sensor history is not in git. Copy the env template, fill the InfluxDB 1.8 credentials, and fetch:
+
+```bash
+cp .env.example .env
+make fetch-data
 ```
-The `data/` folder contains real data — high-res (1-minute) and low-res (1-hour) versions.
+
+`make fetch-data` (`python -m src.data.refresh`) writes one zstd parquet per entity under `data/influx/`:
+
+| file | columns |
+|---|---|
+| `data/influx/<key>.parquet` | `ts` timestamp[ns, UTC], minute start, unique, strictly increasing; `mean` float64; `count` int32 raw samples in that minute |
+
+Rows exist only for minutes that had at least one sample. `data/influx/manifest.json` records `source`, `updated_at`, and per entity `entity_id`, `measurement`, `first_ts`, `last_ts`, `rows`. Keys: `pv`, `load`, `battery`, `grid`, `soc`, `ev`. Incremental runs re-fetch the last 3 hours. `--full` replaces from 2022-08-25.
+
+Irradiance CSVs in `data/irradiance/` are refreshed in the same command (Open-Meteo). Pass `--no-with-irradiance` to skip them.
 
 ## Programmatic Usage
 ```python
