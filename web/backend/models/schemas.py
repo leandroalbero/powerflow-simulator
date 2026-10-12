@@ -15,11 +15,11 @@ class StrategyInfo(BaseModel):
 # --- Battery / Grid / Tariff config ---
 
 class BatteryConfig(BaseModel):
-    capacity: float = Field(5.4, gt=0, description="Battery capacity in kWh")
-    max_charge_rate: float = Field(2.1, gt=0, description="Max charge rate in kW")
-    max_discharge_rate: float = Field(2.1, gt=0, description="Max discharge rate in kW")
-    efficiency: float = Field(0.95, gt=0, le=1.0, description="Round-trip efficiency")
-    initial_soc: float = Field(0.1, ge=0, le=1.0, description="Initial state of charge (0-1)")
+    capacity: float = Field(15.36, gt=0, description="Battery capacity in kWh")
+    max_charge_rate: float = Field(4.5, gt=0, description="Max charge rate in kW")
+    max_discharge_rate: float = Field(4.6, gt=0, description="Max discharge rate in kW")
+    efficiency: float = Field(0.90, gt=0, le=1.0, description="Round-trip efficiency")
+    initial_soc: float = Field(0.5, ge=0, le=1.0, description="Initial state of charge (0-1)")
     taper_start: float = Field(0.9, gt=0, le=1.0, description="SoC threshold where charge tapering begins")
     taper_factor: float = Field(0.7, ge=0, le=1.0, description="Tapering intensity (0=no taper, 1=full taper)")
     cycle_cost_eur_kwh: float = Field(
@@ -33,8 +33,8 @@ class BatteryConfig(BaseModel):
 
 
 class GridConfig(BaseModel):
-    max_import: float = Field(5.0, gt=0, description="Max grid import in kW")
-    max_export: float = Field(5.0, gt=0, description="Max grid export in kW")
+    max_import: float = Field(5.5, gt=0, description="Max grid import in kW (caps grid charging; load is always served)")
+    max_export: float = Field(5.5, gt=0, description="Max grid export in kW")
 
 
 class TariffRate(BaseModel):
@@ -88,7 +88,7 @@ class TariffConfig(BaseModel):
 
 class StrategyConfig(BaseModel):
     min_battery_level: float = Field(0.1, ge=0, le=1.0, description="Minimum SoC before discharge stops")
-    max_charge_power: float = Field(2.05, gt=0, description="Max grid charge power in kW")
+    max_charge_power: float = Field(4.5, gt=0, description="Max grid charge power in kW (clipped to the battery's max charge rate)")
     valley_charge_target: float = Field(1.0, gt=0, le=1.0, description="Target SoC during valley charging")
 
 

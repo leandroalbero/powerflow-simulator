@@ -61,8 +61,9 @@ if __name__ == '__main__':
     file_date = start[:7].replace('-', '_')
     for name, cls in STRATEGIES.items():
         tariff = build_tariff()
-        battery = Battery(capacity=5.4, max_charge_rate=2.1, max_discharge_rate=2.1, initial_soc=0.1)
-        strategy = cls(battery, Grid(max_import=5.0, max_export=5.0), tariff)
+        battery = Battery(capacity=15.36, max_charge_rate=4.5, max_discharge_rate=4.6, efficiency=0.90,
+                          initial_soc=0.5)
+        strategy = cls(battery, Grid(max_import=5.5, max_export=5.5), tariff)
         result = run(frame, strategy, tariff)
         metrics = {k: v for k, v in result.metrics.items() if k != 'monthly'}
         results_by_strategy[name] = metrics
