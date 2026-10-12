@@ -52,14 +52,15 @@ class PvpcService:
     # -- public ------------------------------------------------------------------
 
     def get_prices(
-        self, start: datetime, end: datetime
+        self, start: datetime, end: datetime, strict: bool = True
     ) -> Dict[datetime, float]:
         """Return {utc_hour: price_eur_kwh} for every hour in [start, end].
 
         ``start`` and ``end`` may be Madrid-local (tz-aware) or naive (assumed
         Madrid). Missing hours are fetched from REE in ≤30-day windows and
         inserted into the SQLite cache. Already-cached hours never trigger
-        HTTP calls.
+        HTTP calls. With ``strict=False`` hours REE has not published are
+        left out instead of raising.
         """
         start_utc = _normalise_to_utc_hour(start)
         end_utc = _normalise_to_utc_hour(end)
@@ -85,10 +86,13 @@ class PvpcService:
                 len(all_hours), start_utc.isoformat(), end_utc.isoformat(),
             )
 
-        # Final result: only hours actually requested; raise if still missing.
+        # Final result: only hours actually requested; raise if still missing
+        # (non-strict callers rely on PvpcTariff's fallback for unpublished hours).
         result: Dict[datetime, float] = {}
         for h in all_hours:
             if h not in cached:
+                if not strict:
+                    continue
                 raise RuntimeError(
                     f"PVPC fetch failed: hour {h.isoformat()} still missing "
                     "after REE fetch"

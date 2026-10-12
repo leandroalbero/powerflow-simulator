@@ -1,30 +1,48 @@
-"""Oracle strategy: LP-based optimal battery scheduling with perfect foresight."""
+"""Oracle strategy: LP-based optimal battery scheduling with perfect foresight.
+
+The LP runs on the simulation frame's own grid aggregated to 5-minute slots
+(``slot = (ts - lp_start) // 5 min``) and is replayed by timestamp through
+``_settle`` against the actual 1-minute data, so its cost is realised exactly
+like every other strategy's.
+"""
 
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 from scipy.optimize import linprog  # type: ignore[import-untyped]
-from scipy.sparse import diags, hstack, vstack  # type: ignore[import-untyped]
+from scipy.sparse import csr_matrix, diags, hstack, vstack  # type: ignore[import-untyped]
 from scipy.sparse import eye as speye  # type: ignore[import-untyped]
 
 from src.domain.battery.models import Battery
+from src.domain.energy_simulator.models import price_arrays
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
-from src.domain.strategy.model import BaseEnergyStrategy, EnergyFlow
+from src.domain.strategy.model import BaseEnergyStrategy, Decision
+
+SLOT_MINUTES = 5
+_EPS = 1e-6
 
 
 @dataclass
 class OracleLpResult:
-    """Result from solving the oracle LP."""
+    """Result from solving the oracle LP (powers in kW per step, soc in kWh at step end)."""
 
     success: bool
     total_cost: float
-    charge: np.ndarray       # kW per step
-    discharge: np.ndarray    # kW per step
-    grid_import: np.ndarray  # kW per step
-    grid_export: np.ndarray  # kW per step
-    soc: np.ndarray          # kWh per step
+    charge: np.ndarray
+    discharge: np.ndarray
+    grid_import: np.ndarray
+    grid_export: np.ndarray
+    soc: np.ndarray
+    curtail: Optional[np.ndarray] = None
+
+
+def _empty_result(n: int, success: bool) -> OracleLpResult:
+    z = np.zeros(n)
+    return OracleLpResult(success=success, total_cost=0.0, charge=z, discharge=z.copy(),
+                          grid_import=z.copy(), grid_export=z.copy(), soc=z.copy(), curtail=z.copy())
 
 
 def solve_oracle_lp(
@@ -43,155 +61,132 @@ def solve_oracle_lp(
     max_grid_export: float = 5.0,
     cycle_cost_eur_kwh: float = 0.0,
     terminal_value_eur_kwh: float = 0.0,
+    discharge_efficiency: Optional[float] = None,
+    taper_start: Optional[float] = None,
+    taper_factor: float = 0.0,
+    active: Optional[np.ndarray] = None,
 ) -> OracleLpResult:
-    """Solve for the cost-minimizing battery schedule with perfect foresight.
+    """Cost-minimising battery schedule with perfect foresight.
 
-    Args:
-        solar: Solar generation power per step (kW).
-        load: House load power per step (kW).
-        import_rates: Grid import price per step (EUR/kWh).
-        export_rates: Grid export price per step (EUR/kWh).
-        dt: Duration of each timestep (hours). Scalar or per-step array.
-        battery_capacity: Battery capacity (kWh).
-        max_charge_rate: Max charge power from grid (kW).
-        max_discharge_rate: Max discharge power (kW).
-        efficiency: One-way battery efficiency (0-1).
-        initial_soc: Initial state of charge as fraction (0-1).
-        min_soc_frac: Minimum SoC as fraction of capacity.
-        max_grid_import: Grid import power limit (kW).
-        max_grid_export: Grid export power limit (kW).
-
-    Returns:
-        OracleLpResult with optimal schedule and cost.
+    ``efficiency`` is the ONE-WAY charge efficiency (``discharge_efficiency``
+    defaults to it). ``initial_soc``/``min_soc_frac`` are fractions of capacity.
+    The import cap binds controllable import only: a step may import up to
+    ``max(max_grid_import, load - solar)``. ``terminal_value_eur_kwh`` rewards
+    energy stored at the end (not a cash flow). ``taper_start``/``taper_factor``
+    add the battery's charge-power taper as a linear constraint on the previous
+    step's SoC. ``active`` = False forces charge = discharge = 0 for that step.
     """
     n = len(solar)
     if n == 0:
-        return OracleLpResult(
-            success=True, total_cost=0.0,
-            charge=np.array([]), discharge=np.array([]),
-            grid_import=np.array([]), grid_export=np.array([]),
-            soc=np.array([]),
-        )
+        return _empty_result(0, True)
 
-    # Support both scalar and per-step dt
     dt_arr = np.broadcast_to(np.asarray(dt, dtype=float), n)
+    eta_c = efficiency
+    eta_d = efficiency if discharge_efficiency is None else discharge_efficiency
+    nv = 6 * n
+    i_ch, i_dis, i_imp, i_exp, i_cur, i_soc = (slice(k * n, (k + 1) * n) for k in range(6))
 
-    # Variable layout: [charge(n), discharge(n), grid_import(n), grid_export(n), soc(n)]
-    nc = 5 * n
-    idx_ch = slice(0, n)
-    idx_dis = slice(n, 2 * n)
-    idx_imp = slice(2 * n, 3 * n)
-    idx_exp = slice(3 * n, 4 * n)
-    idx_soc = slice(4 * n, 5 * n)
-
-    # Objective: min Σ (grid_import[t] * rate_import[t] - grid_export[t] * rate_export[t]) * dt[t]
-    # Optional battery-wear penalty: half the per-kWh cycling cost on charge
-    # and half on discharge (so a full round-trip of 1 kWh costs
-    # `cycle_cost_eur_kwh`). The wear term is subtracted from the reported
-    # total_cost so callers see pure grid cost comparable to non-LP strategies.
-    c = np.zeros(nc)
-    c[idx_imp] = import_rates * dt_arr
-    c[idx_exp] = -export_rates * dt_arr
+    c = np.zeros(nv)
+    c[i_imp] = import_rates * dt_arr
+    c[i_exp] = -export_rates * dt_arr
     if cycle_cost_eur_kwh > 0:
-        half_wear = 0.5 * cycle_cost_eur_kwh
-        c[idx_ch] += half_wear * dt_arr
-        c[idx_dis] += half_wear * dt_arr
-    # Terminal cost-to-go: reward energy left in the battery at the horizon end so a
-    # finite-horizon (rolling) LP neither dumps the battery at the boundary nor
-    # grid-charges to hoard energy it can't use. Worth ~the avoided import price the
-    # stored energy will displace next. Subtracted from the objective (a reward); it
-    # is NOT a cash flow so it does not enter the reported grid cost below.
-    if terminal_value_eur_kwh > 0:
-        c[5 * n - 1] -= terminal_value_eur_kwh
+        c[i_ch] += 0.5 * cycle_cost_eur_kwh * dt_arr
+        c[i_dis] += 0.5 * cycle_cost_eur_kwh * dt_arr
+    if terminal_value_eur_kwh:
+        c[6 * n - 1] -= terminal_value_eur_kwh
 
-    # Equality constraints built with sparse diagonal ops (vectorized, no Python loop).
-    #
-    # Row block 1 (energy balance, n rows):
-    #   -charge + discharge + grid_import - grid_export = load - solar
-    # Row block 2 (battery dynamics, n rows):
-    #   soc[t] - soc[t-1] - charge[t]*eff*dt[t] + discharge[t]/eff*dt[t] = 0
-    #   For t=0: soc[0] - charge[0]*eff*dt[0] + discharge[0]/eff*dt[0] = initial_soc_kwh
-
-    I = speye(n, format="csr")  # noqa: E741
-    Z = speye(n, format="csr") * 0  # zero block
-    D = diags(dt_arr, 0, format="csr")  # per-step duration diagonal
-
-    # Energy balance: [-I, +I, +I, -I, 0] @ [ch, dis, imp, exp, soc] = load - solar
-    A_bal = hstack([-I, I, I, -I, Z], format="csr")
+    eye = speye(n, format="csr")
+    zero = csr_matrix((n, n))
+    dmat = diags(dt_arr, 0, format="csr")
+    # balance: -ch + dis + imp - exp - curtail = load - solar
+    a_bal = hstack([-eye, eye, eye, -eye, -eye, zero], format="csr")
     b_bal = load - solar
-
-    # Battery dynamics with per-step durations
-    soc_block = speye(n, format="csr") + diags([-1.0], [-1], shape=(n, n), format="csr")
-    A_dyn = hstack([
-        -efficiency * D,           # charge * eff * dt[t]
-        (1.0 / efficiency) * D,    # discharge / eff * dt[t]
-        Z, Z,                      # grid_import, grid_export (zero)
-        soc_block,                 # soc
-    ], format="csr")
+    # dynamics: soc[t] - soc[t-1] - ch*eta_c*dt + dis/eta_d*dt = 0
+    soc_diff = eye - diags([1.0], [-1], shape=(n, n), format="csr")
+    a_dyn = hstack([-eta_c * dmat, (1.0 / eta_d) * dmat, zero, zero, zero, soc_diff], format="csr")
     b_dyn = np.zeros(n)
     b_dyn[0] = initial_soc * battery_capacity
-
-    A_eq_csr = vstack([A_bal, A_dyn], format="csr")
+    a_eq = vstack([a_bal, a_dyn], format="csr")
     b_eq = np.concatenate([b_bal, b_dyn])
 
-    # Bounds (vectorized) — includes grid import/export caps
-    min_soc = min_soc_frac * battery_capacity
-    lb = np.concatenate([
-        np.zeros(n),                          # charge >= 0
-        np.zeros(n),                          # discharge >= 0
-        np.zeros(n),                          # grid_import >= 0
-        np.zeros(n),                          # grid_export >= 0
-        np.full(n, min_soc),                  # soc >= min_soc
-    ])
-    # Grid import must cover any net load that exceeds battery discharge.
-    # Use max(grid_cap, peak_net_load) to ensure feasibility.
-    min_grid_needed = np.maximum(load - solar - max_discharge_rate, 0)
-    effective_grid_import = np.maximum(max_grid_import, min_grid_needed)
+    a_ub = b_ub = None
+    if taper_start is not None and taper_factor > 0 and taper_start < 1.0:
+        # ch[t] <= max_c * ((1 - f) + f * (cap - soc[t-1]) / ((1 - ts) * cap))
+        k = max_charge_rate * taper_factor / ((1.0 - taper_start) * battery_capacity)
+        rhs = max_charge_rate * ((1.0 - taper_factor) + taper_factor / (1.0 - taper_start))
+        prev_soc = diags([1.0], [-1], shape=(n, n), format="csr")
+        a_ub = hstack([eye, zero, zero, zero, zero, k * prev_soc], format="csr")
+        b_ub = np.full(n, rhs)
+        b_ub[0] -= k * initial_soc * battery_capacity
 
+    act = np.ones(n, dtype=bool) if active is None else np.asarray(active, dtype=bool)
+    lb = np.concatenate([np.zeros(5 * n), np.full(n, min_soc_frac * battery_capacity)])
     ub = np.concatenate([
-        np.full(n, max_charge_rate),          # charge <= max_charge_rate
-        np.full(n, max_discharge_rate),       # discharge <= max_discharge_rate
-        effective_grid_import,                # grid_import <= max(cap, needed)
-        np.full(n, max_grid_export),          # grid_export <= grid cap
-        np.full(n, battery_capacity),         # soc <= capacity
+        np.where(act, max_charge_rate, 0.0),
+        np.where(act, max_discharge_rate, 0.0),
+        np.maximum(max_grid_import, load - solar),
+        np.full(n, max_grid_export),
+        np.maximum(solar, 0.0),
+        np.full(n, battery_capacity),
     ])
-    bounds = list(zip(lb, ub))
+    if initial_soc * battery_capacity < lb[5 * n]:
+        lb[5 * n:] = np.minimum(lb[5 * n:], initial_soc * battery_capacity)
 
-    result = linprog(
-        c, A_eq=A_eq_csr, b_eq=b_eq, bounds=bounds,
-        method="highs", options={"presolve": True, "time_limit": 300},
-    )
-
+    result = linprog(c, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=np.column_stack([lb, ub]),
+                     method="highs", options={"presolve": True, "time_limit": 600})
     if not result.success:
-        return OracleLpResult(
-            success=False, total_cost=0.0,
-            charge=np.zeros(n), discharge=np.zeros(n),
-            grid_import=np.zeros(n), grid_export=np.zeros(n),
-            soc=np.zeros(n),
-        )
+        return _empty_result(n, False)
 
     x = result.x
-    # Report pure grid cost (strip wear penalty so it's comparable to other strategies).
-    grid_cost = float(
-        np.sum((x[idx_imp] * import_rates - x[idx_exp] * export_rates) * dt_arr)
-    )
+    grid_cost = float(np.sum((x[i_imp] * import_rates - x[i_exp] * export_rates) * dt_arr))
     return OracleLpResult(
-        success=True,
-        total_cost=grid_cost,
-        charge=x[idx_ch],
-        discharge=x[idx_dis],
-        grid_import=x[idx_imp],
-        grid_export=x[idx_exp],
-        soc=x[idx_soc],
+        success=True, total_cost=grid_cost,
+        charge=x[i_ch], discharge=x[i_dis], grid_import=x[i_imp], grid_export=x[i_exp],
+        soc=x[i_soc], curtail=x[i_cur],
+    )
+
+
+@dataclass
+class SlotSeries:
+    start_ns: int
+    slot_ns: int
+    solar: np.ndarray
+    load: np.ndarray
+    dt: np.ndarray
+    import_rates: np.ndarray
+    export_rates: np.ndarray
+    first_row: np.ndarray
+
+
+def aggregate_slots(frame: pd.DataFrame, import_price: np.ndarray, export_price: np.ndarray,
+                    slot_minutes: int = SLOT_MINUTES) -> SlotSeries:
+    """Mean pv/load over the valid minutes of each slot; a slot's duration counts valid minutes only."""
+    ns = frame.index.asi8
+    slot_ns = slot_minutes * 60 * 1_000_000_000
+    start_ns = int(ns[0] - ns[0] % slot_ns)
+    sidx = (ns - start_ns) // slot_ns
+    n = int(sidx[-1]) + 1
+    valid = frame["valid"].to_numpy(dtype=bool)
+    pv = np.where(valid, frame["pv_kw"].to_numpy(dtype=float), 0.0)
+    load = np.where(valid, np.nan_to_num(frame["load_kw"].to_numpy(dtype=float)), 0.0)
+    cnt = np.bincount(sidx, weights=valid.astype(float), minlength=n)
+    safe = np.maximum(cnt, 1.0)
+    _, first = np.unique(sidx, return_index=True)
+    return SlotSeries(
+        start_ns=start_ns, slot_ns=slot_ns,
+        solar=np.bincount(sidx, weights=pv, minlength=n) / safe,
+        load=np.bincount(sidx, weights=load, minlength=n) / safe,
+        dt=cnt / 60.0,
+        import_rates=import_price[first], export_rates=export_price[first], first_row=first,
     )
 
 
 class OracleStrategy(BaseEnergyStrategy):
-    """Strategy that replays LP-optimal decisions step by step.
+    """Replays the perfect-foresight LP plan for the frame, by timestamp.
 
-    Unlike other strategies, this requires the full simulation timeseries
-    upfront. It solves the LP at construction time and then replays the
-    precomputed schedule on each call to calculate_energy_flows().
+    Within each 5-minute slot the replay holds the planned grid exchange and
+    lets the battery absorb the sub-slot deviations of the actual minutes; the
+    battery is only touched through ``_settle``.
     """
 
     def __init__(
@@ -199,84 +194,77 @@ class OracleStrategy(BaseEnergyStrategy):
         battery: Battery,
         grid: Grid,
         tariff: PowerTariff,
-        solar: np.ndarray,
-        load: np.ndarray,
-        hours: np.ndarray,
-        durations: np.ndarray,
-        timestamps: list | None = None,
+        frame: pd.DataFrame,
+        min_battery_level: float = 0.1,
+        max_charge_power: Optional[float] = None,
+        cycle_cost_eur_kwh: float = 0.0,
+        chunk_days: int = 31,
+        overlap_days: int = 3,
     ):
-        super().__init__(battery, grid, tariff)
-        self._elapsed_hours = 0.0
-        self._n_lp = len(solar)
+        super().__init__(battery, grid, tariff, min_battery_level, max_charge_power)
+        import_price, export_price = price_arrays(tariff, frame.index)
+        valid = frame["valid"].to_numpy(dtype=bool)
+        mean_import = float(import_price[valid].mean()) if valid.any() else 0.0
+        # Same valuation of stored energy as the simulator's adjusted_cost, so the plan neither dumps nor hoards.
+        self.terminal_value_eur_kwh = mean_import * battery.discharge_efficiency
+        self.slots = aggregate_slots(frame, import_price, export_price)
+        self.lp_result = self._solve(cycle_cost_eur_kwh, chunk_days, overlap_days)
 
-        # Build rates with weekend awareness if timestamps provided
-        if timestamps is not None:
-            import_rates = np.empty(len(hours))
-            export_rates = np.empty(len(hours))
-            for i, ts in enumerate(timestamps):
-                tariff.update_datetime(ts)
-                import_rates[i] = tariff.get_import_rate(int(hours[i]) % 24)
-                export_rates[i] = tariff.get_export_rate(int(hours[i]) % 24)
-        else:
-            import_rates = np.array([
-                tariff.get_import_rate(int(h) % 24) for h in hours
-            ])
-            export_rates = np.array([
-                tariff.get_export_rate(int(h) % 24) for h in hours
-            ])
+    def _solve(self, cycle_cost: float, chunk_days: int, overlap_days: int) -> OracleLpResult:
+        s = self.slots
+        n = len(s.solar)
+        per_day = 24 * 60 // SLOT_MINUTES
+        chunk, overlap = chunk_days * per_day, overlap_days * per_day
+        b = self.battery
+        out = {k: np.zeros(n) for k in ("charge", "discharge", "grid_import", "grid_export", "soc", "curtail")}
+        soc_frac = b.current_charge / b.capacity
+        cost = 0.0
+        a = 0
+        while a < n:
+            end = min(n, a + chunk)
+            stop = n if n - end < per_day else min(n, end + overlap)
+            if stop == n:
+                end = n
+            sl = slice(a, stop)
+            r = solve_oracle_lp(
+                solar=s.solar[sl], load=s.load[sl], import_rates=s.import_rates[sl],
+                export_rates=s.export_rates[sl], dt=s.dt[sl], battery_capacity=b.capacity,
+                max_charge_rate=b.max_charge_rate,
+                max_discharge_rate=b.max_discharge_rate, efficiency=b.charge_efficiency,
+                discharge_efficiency=b.discharge_efficiency, initial_soc=soc_frac,
+                min_soc_frac=self.min_battery_level, max_grid_import=self.grid.max_import,
+                max_grid_export=self.grid.max_export, cycle_cost_eur_kwh=cycle_cost,
+                terminal_value_eur_kwh=self.terminal_value_eur_kwh, taper_start=b.taper_start,
+                taper_factor=b.taper_factor, active=s.dt[sl] > 0,
+            )
+            if not r.success:
+                return _empty_result(n, False)
+            keep = end - a
+            for k in out:
+                out[k][a:end] = getattr(r, k)[:keep]
+            cost += float(np.sum((r.grid_import[:keep] * s.import_rates[a:end]
+                                  - r.grid_export[:keep] * s.export_rates[a:end]) * s.dt[a:end]))
+            soc_frac = r.soc[keep - 1] / b.capacity
+            a = end
+        return OracleLpResult(success=True, total_cost=cost, **out)
 
-        self.lp_result = solve_oracle_lp(
-            solar=solar,
-            load=load,
-            import_rates=import_rates,
-            export_rates=export_rates,
-            dt=durations,
-            battery_capacity=battery.capacity,
-            max_charge_rate=battery.max_charge_rate,
-            max_discharge_rate=battery.max_discharge_rate,
-            efficiency=battery.efficiency,
-            initial_soc=battery.current_charge / battery.capacity,
-            min_soc_frac=self.min_battery_level,
-            max_grid_import=grid.max_import,
-            max_grid_export=grid.max_export,
-        )
+    def _slot(self) -> int:
+        if self.now is None:
+            raise RuntimeError("OracleStrategy needs strategy.now set before each step")
+        return int((pd.Timestamp(self.now).value - self.slots.start_ns) // self.slots.slot_ns)
 
-        # Precompute cumulative hours for LP step lookup
-        self._lp_cum_hours = np.cumsum(durations)
-
-    def calculate_energy_flows(
-        self, solar_power: float, load_power: float, hour: int, duration: float,
-    ) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        # Map simulator's minute-resolution calls to the correct LP hourly step
-        t = int(np.searchsorted(self._lp_cum_hours, self._elapsed_hours, side="right"))
-        t = min(t, self._n_lp - 1)
-        self._elapsed_hours += duration
-
-        if t >= self._n_lp or not self.lp_result.success:
-            flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration)
-            return flows
-
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
         lp = self.lp_result
-        flows = EnergyFlow()
-
-        solar_energy = solar_power * duration
-        load_energy = load_power * duration
-        flows.direct_solar = min(solar_energy, load_energy)
-
-        # Replay LP decisions — power levels from LP, scaled to this sub-step duration.
-        # LP decided charge/discharge at power level X (kW) for the full hour.
-        # We apply the same power level for this sub-step.
-        flows.battery_charge = float(lp.charge[t])
-        flows.battery_discharge = float(lp.discharge[t])
-        flows.grid_import = float(lp.grid_import[t])
-        flows.grid_export = float(lp.grid_export[t])
-
-        # Keep battery SoC in sync for timeseries tracking
-        self.battery.current_charge = float(lp.soc[t])
-
-        return flows
+        i = self._slot()
+        if not lp.success or not 0 <= i < len(lp.charge):
+            return self._self_consume(solar_kw, load_kw)
+        ch, dis = float(lp.charge[i]), float(lp.discharge[i])
+        planned_grid = float(lp.grid_import[i] - lp.grid_export[i])
+        cmd = planned_grid + solar_kw - load_kw
+        if dis <= _EPS and planned_grid > _EPS:
+            # The plan imports and keeps the battery for later: do not spend it on sub-slot spikes.
+            cmd = max(cmd, 0.0)
+        plan_surplus = max(0.0, float(self.slots.solar[i] - self.slots.load[i]))
+        plan_deficit = max(0.0, float(self.slots.load[i] - self.slots.solar[i]))
+        return Decision(cmd, allow_grid_charge=ch > plan_surplus + _EPS,
+                        allow_export_discharge=dis > plan_deficit + _EPS)

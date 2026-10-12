@@ -1,8 +1,9 @@
 import asyncio
 import json
-from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
+import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
 from web.backend.models.schemas import (
@@ -13,7 +14,7 @@ from web.backend.models.schemas import (
     StrategyResult,
     TimeseriesResponse,
 )
-from web.backend.services.downsampler import downsample_timeseries
+from web.backend.services.downsampler import downsample_indices
 from web.backend.services.simulation_service import SimulationService
 
 router = APIRouter(prefix="/api", tags=["simulation"])
@@ -26,20 +27,18 @@ router = APIRouter(prefix="/api", tags=["simulation"])
 def start_simulation(body: SimulationRequest, request: Request) -> SimulationStartResponse:
     sim_service: SimulationService = request.app.state.sim_service
 
-    # Validate strategy ids
-    known = {s.id for s in sim_service.list_strategies()}
-    unknown = set(body.strategies) - known
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"Unknown strategies: {sorted(unknown)}")
-
     start = body.date_range.start if body.date_range else None
     end = body.date_range.end if body.date_range else None
 
-    run_id = sim_service.start_run(
-        strategy_ids=body.strategies,
-        start=start,
-        end=end,
-    )
+    try:
+        run_id = sim_service.start_run(
+            strategy_ids=body.strategies,
+            start=start,
+            end=end,
+            config=body.config,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     return SimulationStartResponse(run_id=run_id, status="running")
 
@@ -87,43 +86,50 @@ def get_timeseries(
             detail=f"No timeseries for run={run_id}, strategy={strategy}",
         )
 
-    timestamps = ts_data["timestamps"]
+    ts_ms = ts_data["ts"]
     columns = {
-        "battery_level": ts_data["battery_level"],
-        "grid_import": ts_data["grid_import"],
-        "grid_export": ts_data["grid_export"],
-        "solar_power": ts_data["solar_power"],
-        "house_consumption": ts_data["house_consumption"],
+        "battery_level": ts_data["battery_level_kwh"],
+        "grid_import": ts_data["grid_import_kw"],
+        "grid_export": ts_data["grid_export_kw"],
+        "solar_power": ts_data["solar_kw"],
+        "house_consumption": ts_data["load_kw"],
     }
 
-    # Optional time-range filter (compare as datetimes to handle DST offsets)
-    if start or end:
-        start_dt = datetime.fromisoformat(start) if start else None
-        end_dt = datetime.fromisoformat(end) if end else None
-        filtered_indices = []
-        for i, ts_str in enumerate(timestamps):
-            ts_dt = datetime.fromisoformat(ts_str)
-            if start_dt and ts_dt < start_dt:
-                continue
-            if end_dt and ts_dt > end_dt:
-                continue
-            filtered_indices.append(i)
-
-        timestamps = [timestamps[i] for i in filtered_indices]
-        columns = {
-            k: [v[i] for i in filtered_indices] for k, v in columns.items()
-        }
+    mask = np.ones(len(ts_ms), dtype=bool)
+    try:
+        if start:
+            mask &= ts_ms >= _epoch_ms(start)
+        if end:
+            mask &= ts_ms <= _epoch_ms(end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid time filter: {exc}")
+    ts_ms = ts_ms[mask]
+    columns = {k: np.asarray(v, dtype=float)[mask] for k, v in columns.items()}
 
     # Skip downsampling for single-day windows (~1440 points at 1-min resolution)
-    is_single_day = len(timestamps) <= 1500
-    if not is_single_day:
-        timestamps, columns = downsample_timeseries(timestamps, columns, max_points)
+    if len(ts_ms) > 1500:
+        idx = downsample_indices(columns, max_points)
+        ts_ms = ts_ms[idx]
+        columns = {k: v[idx] for k, v in columns.items()}
 
+    timestamps = pd.to_datetime(ts_ms, unit="ms", utc=True).tz_convert("Europe/Madrid")
     return TimeseriesResponse(
-        timestamps=timestamps,
-        point_count=len(timestamps),
-        **columns,
+        timestamps=[t.isoformat() for t in timestamps],
+        point_count=len(ts_ms),
+        **{k: _nan_to_none(v) for k, v in columns.items()},
     )
+
+
+def _epoch_ms(value: str) -> int:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("Europe/Madrid", ambiguous=True, nonexistent="shift_forward")
+    return int(ts.value // 1_000_000)
+
+
+def _nan_to_none(values: np.ndarray) -> List[Optional[float]]:
+    """JSON has no NaN (Starlette serialises with allow_nan=False): gaps become null."""
+    return [None if v != v else float(v) for v in values.tolist()]
 
 
 # --- WebSocket for live progress ---

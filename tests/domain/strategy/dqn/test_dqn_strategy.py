@@ -1,14 +1,13 @@
-import numpy as np
+import pandas as pd
 import pytest
 import pytz
-import pandas as pd
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection
-from src.domain.strategy.model import EnergyFlow
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate
 from src.domain.strategy.dqn.agent import DqnAgent
 from src.domain.strategy.dqn_strategy import DqnStrategy
+from src.domain.strategy.model import EnergyFlow
 
 LOCAL_TZ = pytz.timezone("Europe/Madrid")
 
@@ -56,3 +55,21 @@ class TestDqnStrategy:
         strategy.set_timestamp(ts)
         flows = strategy.calculate_energy_flows(3.0, 1.5, 10, 1.0 / 60.0)
         assert isinstance(flows, EnergyFlow)
+
+    def test_missing_policy_raises_clear_error(self, battery, grid, tariff, tmp_path, monkeypatch):
+        from src.domain.strategy import dqn_strategy
+
+        monkeypatch.setattr(dqn_strategy, "REPO_ROOT", tmp_path)
+        with pytest.raises(FileNotFoundError, match="DQN policy not trained: output_files/dqn_policy.pt missing"):
+            dqn_strategy.load_dqn_strategy(battery, grid, tariff)
+
+    def test_loads_trained_policy_from_repo_relative_path(self, battery, grid, tariff, agent, tmp_path, monkeypatch):
+        from src.domain.strategy import dqn_strategy
+
+        (tmp_path / "output_files").mkdir()
+        agent.save(str(tmp_path / "output_files" / "dqn_policy.pt"))
+        monkeypatch.setattr(dqn_strategy, "REPO_ROOT", tmp_path)
+        strategy = dqn_strategy.load_dqn_strategy(battery, grid, tariff, min_battery_level=0.2)
+        assert strategy.min_battery_level == 0.2
+        strategy.set_timestamp(pd.Timestamp("2024-06-15 10:00", tz=LOCAL_TZ))
+        assert isinstance(strategy.calculate_energy_flows(3.0, 1.5, 10, 1.0 / 60.0), EnergyFlow)

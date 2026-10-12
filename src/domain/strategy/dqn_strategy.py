@@ -1,16 +1,17 @@
 """DQN strategy: learned policy for battery control."""
 
 import math
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
-import pandas as pd
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, local_date_hour
 from src.domain.strategy.dqn.agent import DqnAgent
 from src.domain.strategy.dqn.environment import ACTIONS, PEAK_HOURS, VALLEY_HOURS
-from src.domain.strategy.model import BaseEnergyStrategy, EnergyFlow
+from src.domain.strategy.model import BaseEnergyStrategy, Decision
 
 
 class DqnStrategy(BaseEnergyStrategy):
@@ -25,17 +26,17 @@ class DqnStrategy(BaseEnergyStrategy):
     ) -> None:
         super().__init__(battery, grid, tariff)
         self._agent = agent
-        self._current_ts: pd.Timestamp | None = None
         self._load_avg_buffer: list[float] = []
 
-    def set_timestamp(self, ts: pd.Timestamp) -> None:
-        self._current_ts = ts
-
-    def _build_state(self, solar_power: float, load_power: float, hour: int, duration: float) -> np.ndarray:
-        ts = self._current_ts
-        dow = ts.weekday() if ts is not None else 0
-        month = ts.month if ts is not None else 6
-        rate = self.tariff.get_import_rate(hour % 24)
+    def _build_state(self, solar_power: float, load_power: float, duration: float) -> np.ndarray:
+        ts = self.now
+        if ts is not None:
+            local_day, hour = local_date_hour(ts)
+            dow, month = local_day.weekday(), local_day.month
+            rate = self.tariff.rate_at(ts, EnergyDirection.IMPORT).price
+        else:
+            hour, dow, month = 0, 0, 6
+            rate = self.tariff.get_import_rate(0)
 
         self._load_avg_buffer.append(load_power)
         if len(self._load_avg_buffer) > 240:  # ~4h at 1-min resolution
@@ -73,46 +74,28 @@ class DqnStrategy(BaseEnergyStrategy):
             duration,
         ], dtype=np.float32)
 
-    def calculate_energy_flows(
-        self, solar_power: float, load_power: float, hour: int, duration: float,
-    ) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        state = self._build_state(solar_power, load_power, hour, duration)
-        action_idx = self._agent.select_action(state, epsilon=0.0)
-        action_val = float(ACTIONS[action_idx])
-
-        flows = EnergyFlow()
-        solar_energy = solar_power * duration
-        load_energy = load_power * duration
-        flows.direct_solar = min(solar_energy, load_energy)
-
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        state = self._build_state(solar_kw, load_kw, dt_h)
+        action_val = float(ACTIONS[self._agent.select_action(state, epsilon=0.0)])
         if action_val > 0:
-            charge_power = action_val * self.battery.max_charge_rate
-            actual = float(self.battery.charge(charge_power, duration))
-            flows.battery_charge = actual
-        elif action_val < 0:
-            discharge_power = -action_val * self.battery.max_discharge_rate
-            actual = float(self.battery.discharge(discharge_power, duration))
-            flows.battery_discharge = actual
+            return Decision(action_val * self.battery.max_charge_rate, allow_grid_charge=True)
+        return Decision(action_val * self.battery.max_discharge_rate)
 
-        remaining_load = load_energy - flows.direct_solar - flows.battery_discharge * duration
-        if remaining_load > 1e-6:
-            imported = float(self.grid.import_power(remaining_load / duration, duration))
-            flows.grid_import += imported
 
-        # Grid import for battery charging
-        if flows.battery_charge > 0:
-            charge_from_solar = min(solar_energy - flows.direct_solar, flows.battery_charge * duration)
-            charge_from_grid = flows.battery_charge * duration - max(0, charge_from_solar)
-            if charge_from_grid > 1e-6:
-                imported = float(self.grid.import_power(charge_from_grid / duration, duration))
-                flows.grid_import += imported
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_POLICY = Path("output_files") / "dqn_policy.pt"
 
-        remaining_solar = solar_energy - flows.direct_solar - flows.battery_charge * duration
-        if remaining_solar > 1e-6:
-            exported = float(self.grid.export_power(remaining_solar / duration, duration))
-            flows.grid_export = exported
 
-        return flows
+def load_dqn_strategy(battery: Battery, grid: Grid, tariff: PowerTariff,
+                      policy_path: Optional[Path] = None, **kwargs) -> DqnStrategy:
+    """DqnStrategy with the trained policy; refuses to run untrained (random) weights."""
+    path = Path(policy_path) if policy_path is not None else REPO_ROOT / DEFAULT_POLICY
+    if not path.exists():
+        shown = DEFAULT_POLICY if policy_path is None else path
+        raise FileNotFoundError(f"DQN policy not trained: {shown.as_posix()} missing")
+    agent = DqnAgent(state_dim=16, action_dim=9)
+    agent.load(str(path))
+    strategy = DqnStrategy(battery, grid, tariff, agent=agent)
+    for key, value in kwargs.items():
+        setattr(strategy, key, value)
+    return strategy
