@@ -210,11 +210,25 @@ def test_non_strict_skips_unpublished_window(tmp_path):
     ):
         assert len(svc.get_prices(start, _MADRID.localize(datetime(2024, 1, 2, 23, 0)))) == 48
 
-    # Every missing hour is unpublished: REE answers 502 for the whole window.
+    # "Tomorrow" is 2024-01-03 and every missing hour is in it: REE answers 502 for the whole window.
     bad_gateway = HTTPError("https://apidatos.ree.es", 502, "Bad Gateway", {}, BytesIO(b""))
     end = _MADRID.localize(datetime(2024, 1, 3, 23, 0))
-    with patch("web.backend.services.pvpc_service.urllib.request.urlopen", side_effect=bad_gateway):
+    tomorrow = _MADRID.localize(datetime(2024, 1, 3)).astimezone(_UTC)
+    with patch("web.backend.services.pvpc_service._unpublished_from", return_value=tomorrow), \
+            patch("web.backend.services.pvpc_service.urllib.request.urlopen", side_effect=bad_gateway):
         prices = svc.get_prices(start, end, strict=False)
         assert len(prices) == 48
         with pytest.raises(RuntimeError, match="PVPC fetch failed"):
             svc.get_prices(start, end)
+
+
+def test_non_strict_still_raises_for_published_hours(tmp_path):
+    from urllib.error import URLError
+
+    svc = PvpcService(db_path=tmp_path / "pvpc.db")
+    tomorrow = _MADRID.localize(datetime(2024, 1, 3)).astimezone(_UTC)
+    with patch("web.backend.services.pvpc_service._unpublished_from", return_value=tomorrow), \
+            patch("web.backend.services.pvpc_service.urllib.request.urlopen", side_effect=URLError("down")):
+        with pytest.raises(RuntimeError, match="PVPC fetch failed"):
+            svc.get_prices(_MADRID.localize(datetime(2024, 1, 2, 0, 0)),
+                           _MADRID.localize(datetime(2024, 1, 3, 23, 0)), strict=False)

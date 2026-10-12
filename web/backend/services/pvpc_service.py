@@ -168,9 +168,11 @@ class PvpcService:
         """Group missing hours into contiguous ranges and fetch each.
 
         Ranges are split into ``MAX_WINDOW_DAYS`` windows (REE returns at
-        most ~31 days per request). With ``strict=False`` a failed window is
-        logged and skipped: REE answers HTTP 502 for a window that holds
-        only unpublished hours (e.g. tomorrow before ~20:15 local).
+        most ~31 days per request). With ``strict=False`` a failed window
+        that starts tomorrow (local) or later is logged and skipped: REE
+        answers HTTP 502 for a window holding only unpublished hours (e.g.
+        tomorrow before ~20:15). Earlier hours are published, so a failure
+        there still raises rather than silently pricing them by fallback.
         """
         if not missing_hours:
             return {}
@@ -189,6 +191,7 @@ class PvpcService:
         ranges.append((run_start, run_end))
 
         out: Dict[datetime, float] = {}
+        unpublished_from = _unpublished_from()
         for run_start, run_end in ranges:
             cursor = run_start
             while cursor <= run_end:
@@ -196,7 +199,7 @@ class PvpcService:
                 try:
                     out.update(self._fetch_window(cursor, window_end))
                 except RuntimeError as exc:
-                    if strict:
+                    if strict or cursor < unpublished_from:
                         raise
                     logger.warning(
                         "PVPC prices unavailable for %s..%s, using tariff fallback: %s",
@@ -286,6 +289,12 @@ def _parse_ree_response(doc: dict) -> Dict[datetime, float]:
     if not out:
         raise RuntimeError("PVPC fetch failed: PVPC values array was empty")
     return out
+
+
+def _unpublished_from() -> datetime:
+    """UTC start of tomorrow (local): the earliest hour REE may not have published yet."""
+    tomorrow = datetime.now(_MADRID_TZ).date() + timedelta(days=1)
+    return _MADRID_TZ.localize(datetime(tomorrow.year, tomorrow.month, tomorrow.day)).astimezone(_UTC)
 
 
 def _normalise_to_utc_hour(dt: datetime) -> datetime:
