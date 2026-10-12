@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
+from src.data.frame import to_utc_bound
 from web.backend.models.schemas import (
     RunSummary,
     SimulationRequest,
@@ -98,10 +99,10 @@ def get_timeseries(
     mask = np.ones(len(ts_ms), dtype=bool)
     try:
         if start:
-            mask &= ts_ms >= _epoch_ms(start)
+            mask &= ts_ms >= _epoch_ms(start, is_end=False)
         if end:
-            mask &= ts_ms <= _epoch_ms(end)
-    except ValueError as exc:
+            mask &= ts_ms < _epoch_ms(end, is_end=True)
+    except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"Invalid time filter: {exc}")
     ts_ms = ts_ms[mask]
     columns = {k: np.asarray(v, dtype=float)[mask] for k, v in columns.items()}
@@ -120,11 +121,12 @@ def get_timeseries(
     )
 
 
-def _epoch_ms(value: str) -> int:
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("Europe/Madrid", ambiguous=True, nonexistent="shift_forward")
-    return int(ts.value // 1_000_000)
+def _epoch_ms(value: str, is_end: bool) -> int:
+    """Same bound convention as /simulate: a date-only end is the whole local day; the end is exclusive."""
+    bound = to_utc_bound(value, is_end=is_end)
+    if bound is None:
+        raise ValueError(f"empty bound {value!r}")
+    return int(bound.value // 1_000_000)
 
 
 def _nan_to_none(values: np.ndarray) -> List[Optional[float]]:
@@ -162,35 +164,30 @@ async def ws_run_progress(websocket: WebSocket, run_id: str) -> None:
     try:
         while True:
             changed = False
+            # One snapshot under the run lock: the service finalises run.status under the same
+            # lock after the last strategy, so a finished run here implies every strategy's
+            # done message (with its metrics) goes out in this pass, before run_complete.
+            with run.lock:
+                run_done = run.status in ("completed", "failed")
+                snapshot = [(sid, r.status, r.progress, r.metrics, r.error) for sid, r in run.strategies.items()]
 
-            for sid, result in run.strategies.items():
-                # Nothing to do yet
-                if result.status == "pending":
-                    continue
-
-                # Stream progress percentage
-                if result.status == "running":
-                    prev = last_pcts.get(sid, -1)
-                    if result.progress != prev:
-                        last_pcts[sid] = result.progress
-                        await websocket.send_text(json.dumps({
-                            "strategy": sid, "percent": result.progress,
-                        }))
+            for sid, status, progress, metrics, error in snapshot:
+                if status == "running":
+                    if progress != last_pcts.get(sid, -1):
+                        last_pcts[sid] = progress
+                        await websocket.send_text(json.dumps({"strategy": sid, "percent": progress}))
                         changed = True
-
-                # Strategy finished
-                if result.status in ("completed", "failed") and sid not in sent_done:
-                    msg: Dict[str, Any] = {"strategy": sid, "status": result.status}
-                    if result.metrics is not None:
-                        msg["metrics"] = result.metrics
-                    if result.error is not None:
-                        msg["error"] = result.error
+                elif status in ("completed", "failed") and sid not in sent_done:
+                    msg: Dict[str, Any] = {"strategy": sid, "status": status}
+                    if metrics is not None:
+                        msg["metrics"] = metrics
+                    if error is not None:
+                        msg["error"] = error
                     await websocket.send_text(json.dumps(msg))
                     sent_done.add(sid)
                     changed = True
 
-            # Check if entire run is done
-            if run.status in ("completed", "failed"):
+            if run_done:
                 await websocket.send_json({"status": "run_complete"})
                 break
 

@@ -185,3 +185,17 @@ def test_energy_balance_for_planning_strategies(sid):
     gc = ts["grid_charge_kw"][v]
     assert np.all(gc <= np.maximum(0.0, 5.5 - (ts["grid_import_kw"][v] - gc)) + 1e-9)
     assert res.metrics["unserved_kwh"] == 0.0
+
+
+@pytest.mark.parametrize("sid", ["no_battery", "self_consume"])
+def test_self_consumption_rate_excludes_curtailed_solar(frame, sid):
+    battery = Battery(capacity=10.0, max_charge_rate=4.5, max_discharge_rate=4.6, efficiency=0.9, initial_soc=0.5)
+    tariff = make_td20()
+    strategy = HEURISTICS[sid](battery, Grid(max_import=5.5, max_export=1.0), tariff, min_battery_level=0.1)
+    m = run(frame, strategy, tariff).metrics
+    solar = m["total_solar_generated"]
+    assert m["curtailed_kwh"] > 0.05 * solar
+    expected = 100.0 * (solar - m["total_solar_exported"] - m["curtailed_kwh"]) / solar
+    assert m["self_consumption_rate"] == pytest.approx(expected, abs=1e-4)
+    if sid == "no_battery":
+        assert m["self_consumption_rate"] == pytest.approx(100.0 * m["total_solar_consumed"] / solar, abs=1e-3)

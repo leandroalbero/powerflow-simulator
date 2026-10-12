@@ -111,6 +111,7 @@ class ConfigResponse(BaseModel):
     tariff: TariffConfig
     strategy: StrategyConfig
     data_date_range: Optional[DateRange] = None
+    exclude_ev: bool = False
 
 
 # --- Simulation ---

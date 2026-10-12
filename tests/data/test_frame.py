@@ -147,3 +147,78 @@ def test_four_year_frame_is_fast():
 def test_default_reader_uses_store(two_days):
     f = build_power_frame("2026-03-02", "2026-03-03")
     assert len(f) == 2 * 1440
+
+
+def test_fixture_files_match_store_on_disk_format(two_days):
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(two_days / "influx" / "load.parquet")
+    assert table.schema.names == ["ts", "mean", "count"]
+    assert str(table.schema.field("ts").type) == "timestamp[ns, tz=UTC]"
+
+
+def _fake_store(monkeypatch, read_entity):
+    import sys
+    import types
+
+    mod = types.ModuleType("src.data.store")
+    mod.read_entity = read_entity
+    monkeypatch.setitem(sys.modules, "src.data.store", mod)
+
+
+def test_store_reader_treats_unknown_entity_as_missing(monkeypatch):
+    from src.data.frame import store_reader
+
+    def read_entity(key, start=None, end=None):
+        raise KeyError(key)
+
+    _fake_store(monkeypatch, read_entity)
+    assert store_reader("ev", None, None) is None
+
+
+def test_store_reader_propagates_malformed_file_errors(monkeypatch):
+    from src.data.frame import store_reader
+
+    def read_entity(key, start=None, end=None):
+        raise KeyError("ts")
+
+    _fake_store(monkeypatch, read_entity)
+    with pytest.raises(KeyError, match="ts"):
+        store_reader("load", None, None)
+
+
+@pytest.fixture
+def edge_outage(data_dir):
+    # Load 2026-03-01 .. 2026-03-02 19:08 local, then nothing until 2026-03-05 12:00 local, then a day more.
+    before = _minutes("2026-02-28T23:00:00Z", 1440 + 19 * 60 + 8)
+    after = _minutes("2026-03-05T11:00:00Z", 1440)
+    write_entity(data_dir, "load", before + after, [500.0] * (len(before) + len(after)))
+    return data_dir
+
+
+def test_outage_at_window_end_stays_as_invalid_rows(edge_outage):
+    f = build_power_frame("2026-03-02", "2026-03-02", reader=parquet_reader(edge_outage))
+    assert len(f) == 1440
+    assert f.index[-1] == pd.Timestamp("2026-03-02 23:59", tz="Europe/Madrid")
+    assert f["valid"].sum() == 19 * 60 + 8 + 15
+    assert frame_coverage(f)["excluded_hours"] == pytest.approx((1440 - (19 * 60 + 23)) / 60)
+
+
+def test_outage_at_window_start_stays_as_invalid_rows(edge_outage):
+    f = build_power_frame("2026-03-03", "2026-03-05", reader=parquet_reader(edge_outage))
+    assert len(f) == 3 * 1440
+    assert f.index[0] == pd.Timestamp("2026-03-03 00:00", tz="Europe/Madrid")
+    assert f["valid"].sum() == 12 * 60
+    assert not f["valid"].iloc[: 2 * 1440 + 12 * 60].any()
+
+
+def test_window_entirely_inside_outage_is_all_invalid(edge_outage):
+    f = build_power_frame("2026-03-03", "2026-03-04", reader=parquet_reader(edge_outage))
+    assert len(f) == 2 * 1440
+    assert not f["valid"].any()
+
+
+def test_clamp_uses_global_data_span(edge_outage):
+    f = build_power_frame("2026-02-20", "2026-03-20", reader=parquet_reader(edge_outage))
+    assert f.index[0] == pd.Timestamp("2026-03-01 00:00", tz="Europe/Madrid")
+    assert f.index[-1] == pd.Timestamp("2026-03-06 11:59", tz="Europe/Madrid")
