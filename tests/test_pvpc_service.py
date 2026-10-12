@@ -197,3 +197,24 @@ def test_parse_ree_response_missing_pvpc_raises():
     payload = {"included": [{"type": "Mercado SPOT Diario", "attributes": {"values": []}}]}
     with pytest.raises(RuntimeError, match="no PVPC series"):
         _parse_ree_response(payload)
+
+
+def test_non_strict_skips_unpublished_window(tmp_path):
+    from urllib.error import HTTPError
+
+    svc = PvpcService(db_path=tmp_path / "pvpc.db")
+    start = _MADRID.localize(datetime(2024, 1, 1, 0, 0))
+    with patch(
+        "web.backend.services.pvpc_service.urllib.request.urlopen",
+        return_value=_urlopen_mock(_ree_payload(_madrid_hours(datetime(2024, 1, 1, 0, 0), 48))),
+    ):
+        assert len(svc.get_prices(start, _MADRID.localize(datetime(2024, 1, 2, 23, 0)))) == 48
+
+    # Every missing hour is unpublished: REE answers 502 for the whole window.
+    bad_gateway = HTTPError("https://apidatos.ree.es", 502, "Bad Gateway", {}, BytesIO(b""))
+    end = _MADRID.localize(datetime(2024, 1, 3, 23, 0))
+    with patch("web.backend.services.pvpc_service.urllib.request.urlopen", side_effect=bad_gateway):
+        prices = svc.get_prices(start, end, strict=False)
+        assert len(prices) == 48
+        with pytest.raises(RuntimeError, match="PVPC fetch failed"):
+            svc.get_prices(start, end)

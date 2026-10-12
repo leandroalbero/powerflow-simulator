@@ -76,7 +76,7 @@ class PvpcService:
                 "PVPC cache miss: %d hours missing between %s and %s",
                 len(missing), start_utc.isoformat(), end_utc.isoformat(),
             )
-            fetched = self._fetch_missing(missing)
+            fetched = self._fetch_missing(missing, strict=strict)
             with self._write_lock:
                 self._insert_prices(fetched)
             cached.update(fetched)
@@ -163,12 +163,14 @@ class PvpcService:
     # -- fetching ----------------------------------------------------------------
 
     def _fetch_missing(
-        self, missing_hours: List[datetime]
+        self, missing_hours: List[datetime], strict: bool = True
     ) -> Dict[datetime, float]:
         """Group missing hours into contiguous ranges and fetch each.
 
-        Ranges are widened to full-day boundaries and split into 30-day
-        windows — REE returns at most ~31 days per request.
+        Ranges are split into ``MAX_WINDOW_DAYS`` windows (REE returns at
+        most ~31 days per request). With ``strict=False`` a failed window is
+        logged and skipped: REE answers HTTP 502 for a window that holds
+        only unpublished hours (e.g. tomorrow before ~20:15 local).
         """
         if not missing_hours:
             return {}
@@ -191,7 +193,15 @@ class PvpcService:
             cursor = run_start
             while cursor <= run_end:
                 window_end = min(cursor + timedelta(days=MAX_WINDOW_DAYS) - timedelta(hours=1), run_end)
-                out.update(self._fetch_window(cursor, window_end))
+                try:
+                    out.update(self._fetch_window(cursor, window_end))
+                except RuntimeError as exc:
+                    if strict:
+                        raise
+                    logger.warning(
+                        "PVPC prices unavailable for %s..%s, using tariff fallback: %s",
+                        cursor.isoformat(), window_end.isoformat(), exc,
+                    )
                 cursor = window_end + timedelta(hours=1)
         return out
 
