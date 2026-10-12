@@ -10,7 +10,7 @@ from scipy.sparse import eye as speye  # type: ignore[import-untyped]
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
-from src.domain.strategy.model import BaseEnergyStrategy, EnergyFlow
+from src.domain.strategy.model import BaseEnergyStrategy, Decision, EnergyFlow
 
 
 @dataclass
@@ -255,27 +255,19 @@ class OracleStrategy(BaseEnergyStrategy):
         self._elapsed_hours += duration
 
         if t >= self._n_lp or not self.lp_result.success:
-            flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration)
-            return flows
+            return self._settle(solar_power, load_power, 0.0, duration, allow_grid_charge=False)
 
         lp = self.lp_result
         flows = EnergyFlow()
+        flows.direct_solar = min(solar_power, load_power) * duration
+        flows.battery_charge = float(lp.charge[t]) * duration
+        flows.battery_discharge = float(lp.discharge[t]) * duration
+        flows.grid_import = float(lp.grid_import[t]) * duration
+        flows.grid_export = float(lp.grid_export[t]) * duration
 
-        solar_energy = solar_power * duration
-        load_energy = load_power * duration
-        flows.direct_solar = min(solar_energy, load_energy)
-
-        # Replay LP decisions — power levels from LP, scaled to this sub-step duration.
-        # LP decided charge/discharge at power level X (kW) for the full hour.
-        # We apply the same power level for this sub-step.
-        flows.battery_charge = float(lp.charge[t])
-        flows.battery_discharge = float(lp.discharge[t])
-        flows.grid_import = float(lp.grid_import[t])
-        flows.grid_export = float(lp.grid_export[t])
-
-        # Keep battery SoC in sync for timeseries tracking
         self.battery.current_charge = float(lp.soc[t])
 
         return flows
+
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        return Decision(0.0)

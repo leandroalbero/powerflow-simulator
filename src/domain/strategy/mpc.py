@@ -11,7 +11,7 @@ import pandas as pd
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
-from src.domain.strategy.model import BaseEnergyStrategy, EnergyFlow
+from src.domain.strategy.model import BaseEnergyStrategy, Decision
 from src.domain.strategy.oracle import solve_oracle_lp
 
 
@@ -227,12 +227,11 @@ class MpcStrategy(BaseEnergyStrategy):
         self._terminal_value_eur_kwh = terminal_value_eur_kwh
         self._cached_plan: dict[str, np.ndarray] | None = None
         self._plan_start: pd.Timestamp | None = None
-        self._current_ts: pd.Timestamp | None = None
         self._solve_count = 0
 
-    def set_timestamp(self, ts: pd.Timestamp) -> None:
-        """Called by the simulator before each step to set the current time."""
-        self._current_ts = ts
+    @property
+    def _current_ts(self) -> pd.Timestamp | None:
+        return self.now
 
     def _should_resolve(self) -> bool:
         if self._cached_plan is None or self._plan_start is None:
@@ -279,6 +278,8 @@ class MpcStrategy(BaseEnergyStrategy):
 
         if result.success:
             self._cached_plan = {
+                "solar": solar_fc,
+                "load": load_fc,
                 "charge": result.charge,
                 "discharge": result.discharge,
                 "grid_import": result.grid_import,
@@ -294,46 +295,18 @@ class MpcStrategy(BaseEnergyStrategy):
         elapsed_min = (self._current_ts - self._plan_start).total_seconds() / 60.0
         return min(int(elapsed_min / self._step_minutes), self._horizon_steps - 1)
 
-    def calculate_energy_flows(
-        self, solar_power: float, load_power: float, hour: int, duration: float,
-    ) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
         if self._current_ts is not None and self._should_resolve():
             self._solve_horizon()
 
         if self._cached_plan is None:
-            flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration, force_discharge=True)
-            return flows
+            return self._self_consume(solar_kw, load_kw)
 
+        # Apply the plan's net battery command to the ACTUAL battery against ACTUAL
+        # solar/load; the plan was built on forecasts, so realised flows differ.
         t = self._get_plan_step()
         plan = self._cached_plan
-        flows = EnergyFlow()
-
-        solar_energy = solar_power * duration
-        load_energy = load_power * duration
-        flows.direct_solar = min(solar_energy, load_energy)
-
-        # Apply the plan's battery command to the ACTUAL battery against ACTUAL
-        # solar/load — the plan was built on forecasts, so realised flows differ.
-        # Recording realised flows (and letting SOC follow the physical battery, which
-        # the next re-solve reads back as initial_soc) is what makes the simulator's
-        # cost accounting trustworthy. The old code recorded the *planned* flows and
-        # force-wrote SOC to the plan, so cost reflected a forecast that never
-        # happened (and the MPC could even "beat" the perfect-foresight oracle).
-        net_batt = float(plan["charge"][t] - plan["discharge"][t])  # +charge kW
-        if net_batt > 1e-6:
-            flows.battery_charge = float(self.battery.charge(net_batt, duration))
-        elif net_batt < -1e-6:
-            flows.battery_discharge = float(self.battery.discharge(-net_batt, duration))
-
-        net_kw = load_power - solar_power + flows.battery_charge - flows.battery_discharge
-        if net_kw >= 0:
-            flows.grid_import = float(self.grid.import_power(net_kw, duration))
-        else:
-            flows.grid_export = float(self.grid.export_power(-net_kw, duration))
-
-        return flows
+        charge = float(plan["charge"][t])
+        net_batt = charge - float(plan["discharge"][t])
+        planned_surplus = max(0.0, float(plan["solar"][t]) - float(plan["load"][t]))
+        return Decision(net_batt, allow_grid_charge=charge > planned_surplus + 1e-6)

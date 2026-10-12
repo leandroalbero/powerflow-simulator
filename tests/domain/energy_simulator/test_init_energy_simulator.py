@@ -8,19 +8,20 @@ from src.domain.energy_load.model import EnergyLoad
 from src.domain.grid.model import Grid
 from src.domain.power_tariff.model import PowerTariff
 from src.domain.solar_generator.solar_generator import SolarGenerator
-from src.domain.strategy.model import BaseEnergyStrategy, EnergyFlow
+from src.domain.strategy.model import BaseEnergyStrategy, Decision, EnergyFlow
 
 
 class MockStrategy(BaseEnergyStrategy):
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        return Decision(0.0)
+
     def calculate_energy_flows(self, solar_power: float, load_power: float, hour: int, duration: float) -> EnergyFlow:
         if solar_power < 0:
             raise ValueError("Solar generation cannot be negative")
         return EnergyFlow(
-            direct_solar=min(solar_power, load_power),
-            battery_charge=0.0,
-            battery_discharge=0.0,
-            grid_import=max(0, load_power - solar_power),
-            grid_export=max(0, solar_power - load_power)
+            direct_solar=min(solar_power, load_power) * duration,
+            grid_import=max(0, load_power - solar_power) * duration,
+            grid_export=max(0, solar_power - load_power) * duration,
         )
 
 
@@ -30,6 +31,7 @@ class TestEnergySimulator:
         battery = Mock(spec=Battery)
         battery.capacity = 10.0
         battery.current_charge = 5.0
+        battery.max_charge_rate = 2.0
 
         load = Mock(spec=EnergyLoad)
         grid = Mock(spec=Grid)

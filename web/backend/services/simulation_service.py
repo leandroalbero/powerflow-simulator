@@ -25,6 +25,7 @@ from src.domain.strategy.model import (
     ForceChargeAtValleyStrategy,
     ForceChargeValleyAndPrePeakStrategy,
     ForecastChargeStrategy,
+    NoBatteryStrategy,
     SelfConsumeStrategy,
     SmartDischargeStrategy,
     ValleyChargePeakDischargeStrategy,
@@ -52,6 +53,12 @@ logger = logging.getLogger(__name__)
 # --- Strategy registry ---
 
 STRATEGY_REGISTRY: List[StrategyInfo] = [
+    StrategyInfo(
+        id="no_battery",
+        name="No Battery",
+        description="Baseline without a battery: solar covers load directly, the rest is "
+        "imported or exported. Every other strategy is compared against this.",
+    ),
     StrategyInfo(
         id="self_consume",
         name="Self Consume",
@@ -142,6 +149,7 @@ STRATEGY_MAP = {s.id: s for s in STRATEGY_REGISTRY}
 
 # Maps strategy id -> domain strategy class
 _STRATEGY_CLASSES = {
+    "no_battery": NoBatteryStrategy,
     "self_consume": SelfConsumeStrategy,
     "charge_night": ForceChargeAtNightStrategy,
     "force_valleys": ForceChargeAtValleyStrategy,

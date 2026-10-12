@@ -1,18 +1,44 @@
+"""Battery strategies.
+
+Every strategy only DECIDES a battery command for the step from the tariff
+state at ``self.now``; :meth:`BaseEnergyStrategy._settle` turns that command
+into physically consistent flows against the actual solar/load.
+"""
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import date
-from typing import Dict, List, Optional
+from datetime import date, datetime
+from typing import Dict, List, NamedTuple, Optional
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateBlock, RateType
+from src.domain.power_tariff.model import (
+    EnergyDirection,
+    PowerTariff,
+    Rate,
+    RateBlock,
+    RateType,
+    local_date_hour,
+)
 
 GHI_TO_PV_FACTOR = 4.592
 DEFAULT_CHARGE_TARGET = 1.0
+_EPS = 1e-9
 
 
 @dataclass
 class EnergyFlow:
+    """Energy exchanged during one step. Every field is in kWh for that step.
+
+    ``battery_charge`` is AC energy drawn into the battery (from solar surplus
+    first, then ``battery_charge_from_grid``); ``battery_discharge`` is AC
+    energy delivered by it. Per step:
+    solar + grid_import + battery_discharge
+        == (load - unserved) + grid_export + battery_charge + curtailed.
+    ``over_limit`` is the part of grid_import above the grid's max_import,
+    caused by load alone (grid charging is never allowed to exceed the cap).
+    """
+
     direct_solar: float = 0.0
     battery_charge: float = 0.0
     battery_discharge: float = 0.0
@@ -20,448 +46,306 @@ class EnergyFlow:
     grid_export: float = 0.0
     remaining_solar: float = 0.0
     remaining_load: float = 0.0
+    unserved: float = 0.0
+    curtailed: float = 0.0
+    battery_charge_from_grid: float = 0.0
+    over_limit: float = 0.0
+
+
+class Decision(NamedTuple):
+    battery_cmd_kw: float  # > 0 charge, < 0 discharge
+    allow_grid_charge: bool = False
+    allow_export_discharge: bool = False
 
 
 class BaseEnergyStrategy(ABC):
-    def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
+    def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff,
+                 min_battery_level: float = 0.1, max_charge_power: Optional[float] = None):
         self.battery = battery
         self.grid = grid
         self.tariff = tariff
-        self.min_battery_level = 0.1
-        self.max_charge_power = 2.05
+        self.min_battery_level = min_battery_level
+        self.max_charge_power = battery.max_charge_rate if max_charge_power is None else max_charge_power
+        self.now: Optional[datetime] = None
 
-    @abstractmethod
+    def set_timestamp(self, ts: datetime) -> None:
+        self.now = ts
+
+    @property
+    def grid_charge_power(self) -> float:
+        return max(0.0, min(self.max_charge_power, self.battery.max_charge_rate))
+
     def calculate_energy_flows(self, solar_power: float, load_power: float,
                                hour: int, duration: float) -> EnergyFlow:
+        """Decide and settle one step; powers in kW, ``duration`` in hours, result in kWh."""
         if duration == 0:
             raise ZeroDivisionError("Duration cannot be zero")
-        return EnergyFlow()
+        decision = self._decide(max(0.0, solar_power), max(0.0, load_power), duration)
+        return self._settle(max(0.0, solar_power), max(0.0, load_power), decision.battery_cmd_kw, duration,
+                            decision.allow_grid_charge, decision.allow_export_discharge)
 
-    def _get_rate(self, hour: int, direction: EnergyDirection) -> Rate:
-        return self.tariff.get_rate(hour % 24, direction)
+    @abstractmethod
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        """Battery command for the step at ``self.now``."""
 
-    def _calculate_initial_flows(self, solar_energy: float, load_energy: float) -> EnergyFlow:
-        flows = EnergyFlow()
-        solar_energy = max(0.0, solar_energy)
-        load_energy = max(0.0, load_energy)
+    # -- the one settle primitive ------------------------------------------------
 
-        flows.direct_solar = min(solar_energy, load_energy)
-        flows.remaining_solar = solar_energy - flows.direct_solar
-        flows.remaining_load = load_energy - flows.direct_solar
-        return flows
+    def _settle(self, solar_kw: float, load_kw: float, battery_cmd_kw: float, dt_h: float,
+                allow_grid_charge: bool, allow_export_discharge: bool = False) -> EnergyFlow:
+        if dt_h <= 0:
+            raise ZeroDivisionError("Duration must be positive")
+        solar = max(0.0, solar_kw)
+        load = max(0.0, load_kw)
+        direct = min(solar, load)
+        surplus = solar - direct
+        deficit = load - direct
+        max_import = self.grid.max_import
+        max_export = self.grid.max_export
 
-    def _handle_remaining_solar(self, flows: EnergyFlow, duration: float) -> None:
-        if flows.remaining_solar > 0:
-            solar_charged = float(self.battery.charge(flows.remaining_solar / duration, duration))
-            flows.battery_charge = solar_charged
-            flows.remaining_solar -= solar_charged * duration
+        discharged = charged = from_solar = from_grid = 0.0
+        if battery_cmd_kw < -_EPS:
+            want = -battery_cmd_kw
+            if allow_export_discharge:
+                want = min(want, deficit + max(0.0, max_export - surplus))
+            else:
+                want = min(want, deficit)
+            if want > _EPS:
+                floor = self.min_battery_level * self.battery.capacity
+                discharged = self.battery.discharge(want, dt_h, floor_kwh=floor)
+        elif battery_cmd_kw > _EPS:
+            solar_part = min(battery_cmd_kw, surplus)
+            grid_part = 0.0
+            if allow_grid_charge:
+                # The import cap only constrains controllable import: load is always served.
+                grid_part = max(0.0, min(battery_cmd_kw - solar_part, max_import - deficit))
+            if solar_part + grid_part > _EPS:
+                charged = self.battery.charge(solar_part + grid_part, dt_h)
+                from_solar = min(charged, solar_part)
+                from_grid = charged - from_solar
 
-            if flows.remaining_solar > 0:
-                exported = float(self.grid.export_power(flows.remaining_solar / duration, duration))
-                flows.grid_export = exported
-                flows.remaining_solar -= exported * duration
-
-    def _handle_remaining_load(self, flows: EnergyFlow, duration: float,
-                               force_discharge: bool = False) -> None:
-        if flows.remaining_load > 0:
-            if force_discharge:
-                discharged = float(self._discharge_battery(flows.remaining_load, duration))
-                flows.battery_discharge = discharged
-                flows.remaining_load -= discharged * duration
-
-            if flows.remaining_load > 0:
-                import_req = flows.remaining_load / duration
-                imported = float(self.grid.import_power(import_req, duration))
-                flows.grid_import += imported
-                flows.remaining_load -= imported * duration
-
-    def _discharge_battery(self, energy_needed: float, duration: float) -> float:
-        battery_level = self.battery.current_charge / self.battery.capacity
-        available_energy = (battery_level - self.min_battery_level) * self.battery.capacity
-        max_discharge = min(
-            energy_needed / duration,
-            self.battery.max_discharge_rate,
-            available_energy / duration
+        to_load = min(discharged, deficit)
+        load_import = deficit - to_load
+        export_avail = (surplus - from_solar) + (discharged - to_load)
+        export = min(export_avail, max_export)
+        return EnergyFlow(
+            direct_solar=direct * dt_h,
+            battery_charge=charged * dt_h,
+            battery_discharge=discharged * dt_h,
+            grid_import=(load_import + from_grid) * dt_h,
+            grid_export=export * dt_h,
+            curtailed=(export_avail - export) * dt_h,
+            battery_charge_from_grid=from_grid * dt_h,
+            over_limit=max(0.0, load_import - max_import) * dt_h,
         )
-        return float(self.battery.discharge(max_discharge, duration))
 
-    def _charge_battery(self, target_charge_energy: float, duration: float) -> float:
-        import_req = min(target_charge_energy / duration, self.max_charge_power)
-        actual_imported = float(self.grid.import_power(import_req, duration))
-        actual_charged = float(self.battery.charge(actual_imported, duration))
-        return actual_charged
+    # -- common decisions --------------------------------------------------------
+
+    @staticmethod
+    def _self_consume(solar_kw: float, load_kw: float) -> Decision:
+        return Decision(solar_kw - load_kw)
+
+    @staticmethod
+    def _hold(solar_kw: float, load_kw: float) -> Decision:
+        """Keep the battery for later: absorb solar surplus, never discharge."""
+        return Decision(max(0.0, solar_kw - load_kw))
+
+    def _grid_charge_to(self, target_frac: float, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        """Charge towards ``target_frac`` of capacity, solar surplus first, topping up from the grid."""
+        surplus = max(0.0, solar_kw - load_kw)
+        need_kwh = target_frac * self.battery.capacity - self.battery.current_charge
+        if need_kwh <= _EPS:
+            return Decision(surplus)
+        need_kw = need_kwh / (self.battery.charge_efficiency * dt_h)
+        grid_kw = min(max(0.0, need_kw - surplus), self.grid_charge_power)
+        return Decision(surplus + grid_kw, allow_grid_charge=grid_kw > _EPS)
+
+    def _local_date(self) -> date:
+        if self.now is None:
+            raise RuntimeError(f"{type(self).__name__} needs strategy.now set before each step")
+        return local_date_hour(self.now)[0]
+
+
+class NoBatteryStrategy(BaseEnergyStrategy):
+    """Baseline: the battery never moves."""
+
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        return Decision(0.0)
 
 
 class SelfConsumeStrategy(BaseEnergyStrategy):
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-        self._handle_remaining_solar(flows, duration)
-        self._handle_remaining_load(flows, duration, force_discharge=True)
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        return self._self_consume(solar_kw, load_kw)
 
 
 class BaseRateAwareStrategy(BaseEnergyStrategy):
-    def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
-        super().__init__(battery, grid, tariff)
-        self.valley_charge_target = 1.0
-        self._initialize_rates()
-        self.rate_blocks = self._build_rate_blocks()
+    """Strategies driven by the import rate blocks of the CURRENT local day."""
 
-    def _initialize_rates(self) -> None:
-        import_rates = sorted(
-            [rate for rate in self.tariff.rate_schedule.values()
-             if rate.energy_direction == EnergyDirection.IMPORT],
-            key=lambda x: x.price
-        )
+    def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff,
+                 min_battery_level: float = 0.1, max_charge_power: Optional[float] = None,
+                 valley_charge_target: float = 1.0):
+        super().__init__(battery, grid, tariff, min_battery_level, max_charge_power)
+        self.valley_charge_target = valley_charge_target
+        self._validate_tariff()
 
+    def _validate_tariff(self) -> None:
+        import_rates = [rate for rate in self.tariff.rate_schedule.values()
+                        if rate.energy_direction == EnergyDirection.IMPORT]
         if len(import_rates) < 3:
             raise ValueError("Tariff must have at least 3 different rates for this strategy")
 
-        self.valley_rate = import_rates[0]
-        self.shoulder_rate = import_rates[1]
-        self.peak_rate = import_rates[-1]
+    # -- block helpers -----------------------------------------------------------
 
-    def _build_rate_blocks(self) -> List[RateBlock]:
-        blocks: List[RateBlock] = []
-        current_block_start = 0
-        current_rate = self._get_rate(0, EnergyDirection.IMPORT)
+    def _blocks(self, d: Optional[date] = None) -> List[RateBlock]:
+        return self.tariff.day_rate_blocks(d or self._local_date())
 
-        for hour in range(25):
-            if hour == 24:
-                blocks.append(RateBlock(
-                    start=current_block_start,
-                    end=hour,
-                    rate=current_rate
-                ))
-                break
+    def _current_index(self, blocks: List[RateBlock]) -> int:
+        hour = local_date_hour(self.now)[1]
+        for i, block in enumerate(blocks):
+            if block["start"] <= hour < block["end"]:
+                return i
+        return len(blocks) - 1
 
-            hour_rate = self._get_rate(hour, EnergyDirection.IMPORT)
+    def _neighbour_block(self, offset: int) -> RateBlock:
+        """Block ``offset`` positions from the current one, crossing into the previous/next day."""
+        d = self._local_date()
+        blocks = self._blocks(d)
+        i = self._current_index(blocks) + offset
+        if i >= len(blocks):
+            return self._blocks(date.fromordinal(d.toordinal() + 1))[0]
+        if i < 0:
+            return self._blocks(date.fromordinal(d.toordinal() - 1))[-1]
+        return blocks[i]
 
-            if hour_rate.price != current_rate.price or hour_rate.rate_type != current_rate.rate_type:
-                blocks.append(RateBlock(
-                    start=current_block_start,
-                    end=hour,
-                    rate=current_rate
-                ))
-                current_block_start = hour
-                current_rate = hour_rate
+    def _current_rate(self) -> Rate:
+        return self.tariff.rate_at(self.now, EnergyDirection.IMPORT)
 
-        return blocks
+    def _is_type(self, rate_type: RateType) -> bool:
+        return self._current_rate().rate_type == rate_type
 
-    def _get_current_block(self, hour: int) -> RateBlock:
-        normalized_hour = hour % 24
-        for block in self.rate_blocks:
-            if block['start'] <= normalized_hour < block['end']:
-                return block
-        return self.rate_blocks[-1]
+    def _single_rate_day(self) -> bool:
+        return len({b["rate"].price for b in self._blocks()}) == 1
 
-    def _get_next_block(self, hour: int) -> RateBlock:
-        current_block = self._get_current_block(hour)
-        for i, block in enumerate(self.rate_blocks):
-            if block == current_block:
-                return self.rate_blocks[(i + 1) % len(self.rate_blocks)]
-        return self.rate_blocks[0]
+    def _pricier_ahead(self) -> bool:
+        """True when a strictly pricier import block follows today, or tomorrow before its first valley block."""
+        d = self._local_date()
+        blocks = self._blocks(d)
+        price = self._current_rate().price
+        if any(b["rate"].price > price + _EPS for b in blocks[self._current_index(blocks) + 1:]):
+            return True
+        for b in self._blocks(date.fromordinal(d.toordinal() + 1)):
+            if b["rate"].rate_type == RateType.VALLEY:
+                return False
+            if b["rate"].price > price + _EPS:
+                return True
+        return False
 
-    def _is_peak_block(self, block: RateBlock) -> bool:
-        return block['rate'].rate_type == RateType.PEAK
+    def _valley_charge_due(self) -> bool:
+        return self._is_type(RateType.VALLEY) and self._pricier_ahead()
 
-    def _handle_charging_period(self, flows: EnergyFlow, duration: float) -> None:
-        battery_level = self.battery.current_charge / self.battery.capacity
-
-        if battery_level < self.valley_charge_target:
-            charge_needed_kWh = (
-                self.battery.capacity * self.valley_charge_target - self.battery.current_charge)
-            max_charge_per_step = min(
-                self.max_charge_power * duration,
-                self.battery.max_charge_rate * duration
-            )
-            charge_energy = min(max_charge_per_step, charge_needed_kWh)
-            actual_charged = self._charge_battery(charge_energy, duration)
-            flows.battery_charge += actual_charged
-            flows.grid_import += actual_charged
-
-        if flows.remaining_solar > 0:
-            exported = float(self.grid.export_power(flows.remaining_solar / duration, duration))
-            flows.grid_export = exported
-            flows.remaining_solar -= exported * duration
-
-        self._handle_remaining_load(flows, duration)
+    def _idle(self, solar_kw: float, load_kw: float) -> Decision:
+        """Outside a strategy's active windows: hold for later, unless the day has a single price."""
+        if self._single_rate_day():
+            return self._self_consume(solar_kw, load_kw)
+        return self._hold(solar_kw, load_kw)
 
 
 class ForceChargeAtNightStrategy(BaseRateAwareStrategy):
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
+    """Grid-charge to the target in the valley, self-consume the rest of the day."""
 
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-        current_rate = self._get_rate(hour % 24, EnergyDirection.IMPORT)
-        is_valley = current_rate.rate_type == RateType.VALLEY
-
-        if is_valley:
-            self._handle_remaining_solar(flows, duration)
-            battery_level = self.battery.current_charge / self.battery.capacity
-
-            if battery_level < self.valley_charge_target:
-                charge_needed_kwh = (self.battery.capacity * self.valley_charge_target -
-                                     self.battery.current_charge)
-                max_charge_per_step = min(
-                    self.max_charge_power * duration,
-                    self.battery.max_charge_rate * duration
-                )
-                charge_energy = min(max_charge_per_step, charge_needed_kwh)
-
-                actual_charged = self._charge_battery(charge_energy, duration)
-                flows.battery_charge += actual_charged
-                flows.grid_import += actual_charged
-
-            self._handle_remaining_load(flows, duration)
-        else:
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration, force_discharge=True)
-
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._valley_charge_due():
+            return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
+        return self._self_consume(solar_kw, load_kw)
 
 
 class ForceChargeAtValleyStrategy(BaseRateAwareStrategy):
-    def _is_before_peak(self, hour: int) -> bool:
-        current_rate = self._get_rate(hour, EnergyDirection.IMPORT)
-        next_rate = self._get_rate((hour + 1) % 24, EnergyDirection.IMPORT)
-        return (current_rate.rate_type == RateType.PLAIN and
-                next_rate.rate_type == RateType.PEAK)
+    """Grid-charge in the last hour of a shoulder block right before a peak; discharge only at peak."""
 
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
+    def _is_pre_peak_hour(self) -> bool:
+        if not self._is_type(RateType.PLAIN):
+            return False
+        blocks = self._blocks()
+        current = blocks[self._current_index(blocks)]
+        hour = local_date_hour(self.now)[1]
+        return hour == current["end"] - 1 and self._neighbour_block(1)["rate"].rate_type == RateType.PEAK
 
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-
-        if hour < 0 or hour >= 24:
-            actual_charged = self._charge_battery(flows.remaining_solar, duration)
-            flows.battery_charge += actual_charged
-            flows.grid_import += actual_charged
-            return flows
-
-        is_pre_peak_valley = self._is_before_peak(hour % 24)
-
-        if is_pre_peak_valley:
-            self._handle_charging_period(flows, duration)
-        else:
-            self._handle_remaining_solar(flows, duration)
-            current_block = self._get_current_block(hour % 24)
-            force_discharge = self._is_peak_block(current_block)
-            self._handle_remaining_load(flows, duration, force_discharge=force_discharge)
-
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._is_pre_peak_hour():
+            return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
+        if self._is_type(RateType.PEAK):
+            return self._self_consume(solar_kw, load_kw)
+        return self._idle(solar_kw, load_kw)
 
 
 class ForceChargeValleyAndPrePeakStrategy(BaseRateAwareStrategy):
-    def _is_valley_block(self, block: RateBlock) -> bool:
-        return block['rate'].rate_type == RateType.VALLEY
+    """Grid-charge in valley blocks and in shoulder blocks that precede a peak; discharge at peak."""
 
-    def _is_before_peak_block(self, block: RateBlock) -> bool:
-        next_block = self._get_next_block(int(block['end'] - 1))
-        return (block['rate'].rate_type == RateType.PLAIN and
-                self._is_peak_block(next_block))
-
-    def _is_after_valley_block(self, hour: int) -> bool:
-        current_block = self._get_current_block(hour)
-        for i, block in enumerate(self.rate_blocks):
-            if block == current_block:
-                prev_block = self.rate_blocks[i - 1] if i > 0 else self.rate_blocks[-1]
-                return self._is_valley_block(prev_block)
-        return False
-
-    def _should_charge(self, hour: int) -> bool:
-        current_block = self._get_current_block(hour)
-        normalized_hour = hour % 24
-
-        if self._is_after_valley_block(normalized_hour):
+    def _should_charge(self) -> bool:
+        if self._neighbour_block(-1)["rate"].rate_type == RateType.VALLEY:
             return False
+        if self._is_type(RateType.VALLEY):
+            return self._pricier_ahead()
+        return self._is_type(RateType.PLAIN) and self._neighbour_block(1)["rate"].rate_type == RateType.PEAK
 
-        if self._is_valley_block(current_block):
-            next_block = self._get_next_block(normalized_hour)
-            return not self._is_valley_block(next_block) or self.battery.charge_level < self.valley_charge_target
-
-        return self._is_before_peak_block(current_block)
-
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-
-        if hour < 0 or hour >= 24:
-            actual_charged = self._charge_battery(flows.remaining_solar, duration)
-            flows.battery_charge += actual_charged
-            flows.grid_import += actual_charged
-            return flows
-
-        normalized_hour = hour % 24
-        should_charge = self._should_charge(normalized_hour)
-        current_block = self._get_current_block(normalized_hour)
-
-        if should_charge:
-            self._handle_charging_period(flows, duration)
-        else:
-            self._handle_remaining_solar(flows, duration)
-            force_discharge = self._is_peak_block(current_block)
-            self._handle_remaining_load(flows, duration, force_discharge=force_discharge)
-
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._should_charge():
+            return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
+        if self._is_type(RateType.PEAK):
+            return self._self_consume(solar_kw, load_kw)
+        return self._idle(solar_kw, load_kw)
 
 
 class ValleyChargePeakDischargeStrategy(BaseRateAwareStrategy):
     """Charge at valley rate, discharge only during peak hours."""
 
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-        current_rate = self._get_rate(hour % 24, EnergyDirection.IMPORT)
-        is_valley = current_rate.rate_type == RateType.VALLEY
-        is_peak = current_rate.rate_type == RateType.PEAK
-
-        if is_valley:
-            self._handle_remaining_solar(flows, duration)
-            battery_level = self.battery.current_charge / self.battery.capacity
-
-            if battery_level < self.valley_charge_target:
-                charge_needed_kwh = (self.battery.capacity * self.valley_charge_target -
-                                     self.battery.current_charge)
-                max_charge_per_step = min(
-                    self.max_charge_power * duration,
-                    self.battery.max_charge_rate * duration
-                )
-                charge_energy = min(max_charge_per_step, charge_needed_kwh)
-
-                actual_charged = self._charge_battery(charge_energy, duration)
-                flows.battery_charge += actual_charged
-                flows.grid_import += actual_charged
-
-            self._handle_remaining_load(flows, duration)
-        else:
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration, force_discharge=is_peak)
-
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._valley_charge_due():
+            return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
+        if self._is_type(RateType.PEAK):
+            return self._self_consume(solar_kw, load_kw)
+        return self._idle(solar_kw, load_kw)
 
 
 class SmartDischargeStrategy(BaseRateAwareStrategy):
-    """Charge at valley. Discharge everywhere except afternoon shoulder.
+    """Charge at valley. Discharge everywhere except a shoulder sandwiched between two peaks.
 
-    Hold battery through shoulder between peaks to preserve it for evening peak
-    (highest value, no solar). Discharge all other non-valley hours.
+    Holding through that shoulder preserves the battery for the evening peak
+    (highest value, no solar).
     """
 
-    def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff):
-        super().__init__(battery, grid, tariff)
-        # Find shoulder blocks sandwiched between two peak blocks
-        self._hold_blocks: List[RateBlock] = []
-        for i, block in enumerate(self.rate_blocks):
-            if block['rate'].rate_type != RateType.PLAIN:
-                continue
-            prev_block = self.rate_blocks[i - 1] if i > 0 else self.rate_blocks[-1]
-            next_block = self.rate_blocks[(i + 1) % len(self.rate_blocks)]
-            if self._is_peak_block(prev_block) and self._is_peak_block(next_block):
-                self._hold_blocks.append(block)
+    def _is_hold_period(self) -> bool:
+        return (self._is_type(RateType.PLAIN)
+                and self._neighbour_block(-1)["rate"].rate_type == RateType.PEAK
+                and self._neighbour_block(1)["rate"].rate_type == RateType.PEAK)
 
-    def _is_hold_period(self, hour: int) -> bool:
-        block = self._get_current_block(hour % 24)
-        return block in self._hold_blocks
-
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-        current_rate = self._get_rate(hour % 24, EnergyDirection.IMPORT)
-        is_valley = current_rate.rate_type == RateType.VALLEY
-
-        if is_valley:
-            self._handle_remaining_solar(flows, duration)
-            battery_level = self.battery.current_charge / self.battery.capacity
-
-            if battery_level < self.valley_charge_target:
-                charge_needed_kwh = (self.battery.capacity * self.valley_charge_target -
-                                     self.battery.current_charge)
-                max_charge_per_step = min(
-                    self.max_charge_power * duration,
-                    self.battery.max_charge_rate * duration
-                )
-                charge_energy = min(max_charge_per_step, charge_needed_kwh)
-
-                actual_charged = self._charge_battery(charge_energy, duration)
-                flows.battery_charge += actual_charged
-                flows.grid_import += actual_charged
-
-            self._handle_remaining_load(flows, duration)
-        else:
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration,
-                                        force_discharge=not self._is_hold_period(hour))
-
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._valley_charge_due():
+            return self._grid_charge_to(self.valley_charge_target, solar_kw, load_kw, dt_h)
+        if self._is_type(RateType.VALLEY) or self._is_hold_period():
+            return self._idle(solar_kw, load_kw)
+        return self._self_consume(solar_kw, load_kw)
 
 
 class ForecastChargeStrategy(BaseRateAwareStrategy):
-    """Like ForceChargeAtNight, but varies night charge target based on solar forecast."""
+    """Like ForceChargeAtNight, but the valley target shrinks with the day's solar forecast."""
 
     def __init__(self, battery: Battery, grid: Grid, tariff: PowerTariff,
-                 daily_forecasts: Dict[date, float]):
-        super().__init__(battery, grid, tariff)
+                 daily_forecasts: Dict[date, float], min_battery_level: float = 0.1,
+                 max_charge_power: Optional[float] = None, valley_charge_target: float = 1.0,
+                 ghi_to_pv_factor: float = GHI_TO_PV_FACTOR):
+        super().__init__(battery, grid, tariff, min_battery_level, max_charge_power, valley_charge_target)
         self.daily_forecasts = daily_forecasts
-        self.current_date: Optional[date] = None
+        self.ghi_to_pv_factor = ghi_to_pv_factor
 
     def _get_charge_target(self) -> float:
-        if self.current_date is None:
-            return DEFAULT_CHARGE_TARGET
-        daily_ghi = self.daily_forecasts.get(self.current_date)
+        daily_ghi = self.daily_forecasts.get(self._local_date())
         if daily_ghi is None:
             return DEFAULT_CHARGE_TARGET
-        expected_solar_kwh = daily_ghi * GHI_TO_PV_FACTOR / 1000
+        expected_solar_kwh = daily_ghi * self.ghi_to_pv_factor / 1000
         target = 1.0 - (expected_solar_kwh / self.battery.capacity)
-        return max(0.1, min(1.0, target))
+        return max(self.min_battery_level, min(1.0, target))
 
-    def calculate_energy_flows(self, solar_power: float, load_power: float,
-                               hour: int, duration: float) -> EnergyFlow:
-        if duration == 0:
-            raise ZeroDivisionError("Duration cannot be zero")
-
-        flows = self._calculate_initial_flows(solar_power * duration, load_power * duration)
-        current_rate = self._get_rate(hour % 24, EnergyDirection.IMPORT)
-        is_valley = current_rate.rate_type == RateType.VALLEY
-
-        if is_valley:
-            self._handle_remaining_solar(flows, duration)
-            charge_target = self._get_charge_target()
-            battery_level = self.battery.current_charge / self.battery.capacity
-
-            if battery_level < charge_target:
-                charge_needed_kwh = (self.battery.capacity * charge_target -
-                                     self.battery.current_charge)
-                max_charge_per_step = min(
-                    self.max_charge_power * duration,
-                    self.battery.max_charge_rate * duration
-                )
-                charge_energy = min(max_charge_per_step, charge_needed_kwh)
-
-                actual_charged = self._charge_battery(charge_energy, duration)
-                flows.battery_charge += actual_charged
-                flows.grid_import += actual_charged
-
-            self._handle_remaining_load(flows, duration)
-        else:
-            self._handle_remaining_solar(flows, duration)
-            self._handle_remaining_load(flows, duration, force_discharge=True)
-
-        return flows
+    def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
+        if self._valley_charge_due():
+            return self._grid_charge_to(self._get_charge_target(), solar_kw, load_kw, dt_h)
+        return self._self_consume(solar_kw, load_kw)

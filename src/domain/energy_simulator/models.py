@@ -75,27 +75,28 @@ class EnergySimulator:
         self.total_solar_generated += solar_energy
         self.total_house_consumption += load_power * duration
 
+        self.strategy.now = timestamp
         flows = self.strategy.calculate_energy_flows(solar_power, load_power, hour, duration)
 
         self._update_metrics(flows, hour, duration)
 
         self.timestamps.append(timestamp)
         self.battery_levels.append(self.battery.current_charge)
-        self.grid_imports.append(flows.grid_import)
-        self.grid_exports.append(flows.grid_export)
+        self.grid_imports.append(flows.grid_import / duration)
+        self.grid_exports.append(flows.grid_export / duration)
         self.solar_powers.append(solar_power)      # Store solar power
         self.house_loads.append(load_power)        # Store house consumption
 
     def _update_metrics(self, flows: EnergyFlow, hour: int, duration: float) -> None:
         self.total_solar_consumed += flows.direct_solar
-        self.total_battery_in += flows.battery_charge * duration
-        self.total_battery_out += flows.battery_discharge * duration
+        self.total_battery_in += flows.battery_charge
+        self.total_battery_out += flows.battery_discharge
 
-        self.total_grid_imported += flows.grid_import * duration
-        self.total_solar_exported += flows.grid_export * duration
+        self.total_grid_imported += flows.grid_import
+        self.total_solar_exported += flows.grid_export
 
-        self.total_cost += flows.grid_import * duration * self.tariff.get_import_rate(hour)
-        self.total_cost -= flows.grid_export * duration * self.tariff.get_export_rate(hour)
+        self.total_cost += flows.grid_import * self.tariff.get_import_rate(hour)
+        self.total_cost -= flows.grid_export * self.tariff.get_export_rate(hour)
 
     def get_metrics(self) -> Dict:
         metrics = {'total_cost': round(self.total_cost, 2),
