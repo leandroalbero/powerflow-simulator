@@ -16,3 +16,4 @@ ipdb
 fastapi
 uvicorn[standard]
 python-multipart
+httpx2

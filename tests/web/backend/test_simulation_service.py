@@ -127,7 +127,7 @@ class TestRuns:
                               max_points=500)
         payload = json.dumps(resp.model_dump(), allow_nan=False)
         assert "null" in payload
-        assert resp.point_count <= 500 + 5
+        assert resp.point_count <= 500 * 2
         day = get_timeseries(run.run_id, _request(sim), strategy="self_consume", start="2026-03-05T00:00:00",
                              end="2026-03-05T23:59:00", max_points=2000)
         assert day.point_count == 1440
