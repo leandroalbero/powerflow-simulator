@@ -93,7 +93,7 @@ def csv_to_entity_frame(source: Union[bytes, str, Path]) -> pd.DataFrame:
     return samples_to_entity_frame(s)
 
 
-def _to_utc_bound(value: DateLike, is_end: bool) -> Optional[pd.Timestamp]:
+def to_utc_bound(value: DateLike, is_end: bool) -> Optional[pd.Timestamp]:
     """Convert a user bound to a UTC instant; the returned end is exclusive."""
     if value is None:
         return None
@@ -162,8 +162,8 @@ def build_power_frame(
     The range is clamped to the span covered by load data.
     """
     reader = reader or store_reader
-    start_utc = _to_utc_bound(start, is_end=False)
-    end_utc = _to_utc_bound(end, is_end=True)
+    start_utc = to_utc_bound(start, is_end=False)
+    end_utc = to_utc_bound(end, is_end=True)
 
     def lookback(key: str) -> Optional[pd.Timestamp]:
         if start_utc is None:

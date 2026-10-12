@@ -1,9 +1,7 @@
-from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
-
 
 # --- Strategy ---
 
@@ -11,6 +9,7 @@ class StrategyInfo(BaseModel):
     id: str
     name: str
     description: str
+    group: Literal["core", "advanced", "experimental"] = "advanced"
 
 
 # --- Battery / Grid / Tariff config ---
@@ -98,6 +97,7 @@ class SystemConfig(BaseModel):
     grid: GridConfig = Field(default_factory=GridConfig)
     tariff: TariffConfig = Field(default_factory=TariffConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    exclude_ev: bool = Field(False, description="Subtract the EV charger's power from the house load")
 
 
 class DateRange(BaseModel):
@@ -118,6 +118,8 @@ class ConfigResponse(BaseModel):
 class SimulationRequest(BaseModel):
     strategies: List[str]
     date_range: Optional[DateRange] = None
+    config: Optional[SystemConfig] = Field(
+        None, description="Configuration for this run; defaults to the server's current config")
 
 
 class SimulationStartResponse(BaseModel):
@@ -129,6 +131,18 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class MonthlyMetrics(BaseModel):
+    month: str
+    cost: float
+    import_kwh: float
+    export_kwh: float
+    import_cost: float
+    export_revenue: float
+    solar_kwh: float
+    load_kwh: float
+    battery_out_kwh: float
 
 
 class StrategyMetrics(BaseModel):
@@ -144,6 +158,22 @@ class StrategyMetrics(BaseModel):
     battery_capacity: float
     self_consumption_rate: float
     solar_fraction: float
+    import_cost: Optional[float] = None
+    export_revenue: Optional[float] = None
+    adjusted_cost: Optional[float] = None
+    terminal_value_eur: Optional[float] = None
+    stored_energy_delta_kwh: Optional[float] = None
+    initial_battery_kwh: Optional[float] = None
+    final_battery_kwh: Optional[float] = None
+    unserved_kwh: Optional[float] = None
+    curtailed_kwh: Optional[float] = None
+    over_limit_kwh: Optional[float] = None
+    grid_charge_kwh: Optional[float] = None
+    valid_hours: Optional[float] = None
+    excluded_hours: Optional[float] = None
+    equivalent_full_cycles: Optional[float] = None
+    ev_kwh: Optional[float] = None
+    monthly: Optional[List[MonthlyMetrics]] = None
 
 
 class StrategyResult(BaseModel):
@@ -161,15 +191,21 @@ class RunSummary(BaseModel):
 
 class TimeseriesResponse(BaseModel):
     timestamps: List[str]
-    battery_level: List[float]
-    grid_import: List[float]
-    grid_export: List[float]
-    solar_power: List[float]
-    house_consumption: List[float]
+    battery_level: List[Optional[float]]
+    grid_import: List[Optional[float]]
+    grid_export: List[Optional[float]]
+    solar_power: List[Optional[float]]
+    house_consumption: List[Optional[float]]
     point_count: int
 
 
 # --- Data info ---
+
+class DataGap(BaseModel):
+    start: str
+    end: str
+    hours: float
+
 
 class DataInfo(BaseModel):
     solar_file_loaded: bool = False
@@ -177,3 +213,11 @@ class DataInfo(BaseModel):
     date_range: Optional[DateRange] = None
     solar_point_count: int = 0
     load_point_count: int = 0
+    data_from: Optional[str] = None
+    data_until: Optional[str] = None
+    coverage: Optional[float] = Field(None, description="Fraction of minutes with known house load")
+    gaps: List[DataGap] = Field(default_factory=list, description="Load outages of an hour or more")
+    manifest_updated_at: Optional[str] = None
+    entities: List[str] = Field(default_factory=list)
+    source: Optional[str] = Field(None, description="'store' (parquet) or 'csv'")
+    uploads: List[str] = Field(default_factory=list, description="Entities overridden by an uploaded CSV")

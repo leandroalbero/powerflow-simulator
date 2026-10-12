@@ -8,9 +8,11 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, cast
 
+import numpy as np
 import pandas as pd
 import pytz
 
+from src.data.frame import to_utc_bound
 from src.domain.battery.models import Battery
 from src.domain.energy_simulator.models import run as simulate
 from src.domain.grid.model import Grid
@@ -19,6 +21,7 @@ from src.domain.power_tariff.pvpc import PvpcTariff
 from src.domain.strategy.forecast_loader import load_daily_forecasts
 from src.domain.strategy.irradiance import HourlyGhi, load_irradiance
 from src.domain.strategy.model import (
+    BaseRateAwareStrategy,
     ForceChargeAtNightStrategy,
     ForceChargeAtValleyStrategy,
     ForceChargeValleyAndPrePeakStrategy,
@@ -48,90 +51,105 @@ STRATEGY_REGISTRY: List[StrategyInfo] = [
         name="No Battery",
         description="Baseline without a battery: solar covers load directly, the rest is "
         "imported or exported. Every other strategy is compared against this.",
+        group="core",
     ),
     StrategyInfo(
         id="self_consume",
         name="Self Consume",
         description="Maximise self-consumption of solar energy. "
         "Excess solar charges battery, deficit discharges battery, then imports from grid.",
+        group="core",
     ),
     StrategyInfo(
         id="charge_night",
         name="Force Charge at Night",
         description="Charge the battery from grid during cheapest night-time valley rate. "
         "Discharge during the day to reduce peak-rate imports.",
+        group="core",
     ),
     StrategyInfo(
         id="force_valleys",
         name="Force Charge at Valleys",
         description="Charge battery from grid during pre-peak shoulder periods. "
         "Discharge only during peak-rate hours.",
+        group="advanced",
     ),
     StrategyInfo(
         id="force_valleys_pre_peak",
         name="Force Charge Valleys & Pre-Peak",
         description="Charge battery during valley and pre-peak shoulder windows. "
         "Discharge during peak hours for maximum savings.",
+        group="advanced",
     ),
     StrategyInfo(
         id="forecast_charge",
         name="Forecast Charge",
         description="Uses day-ahead solar irradiance forecasts to set night charge target. "
         "Skips charging on sunny days, charges fully on cloudy days.",
+        group="core",
     ),
     StrategyInfo(
         id="smart_discharge",
         name="Smart Discharge",
         description="Charge at valley, discharge morning shoulder + evening peak. "
         "Morning discharge creates room for solar; holds battery for evening when solar is gone.",
+        group="advanced",
     ),
     StrategyInfo(
         id="valley_charge_peak_discharge",
         name="Valley Charge, Peak Discharge",
         description="Charge at cheapest valley rate, discharge only during peak-rate hours. "
         "Preserves battery for highest-value periods instead of wasting on shoulder.",
+        group="advanced",
     ),
     StrategyInfo(
         id="oracle",
         name="Oracle Optimizer",
         description="Computes the theoretical minimum cost using linear programming with "
         "perfect foresight. Not deployable — serves as a benchmark.",
+        group="core",
     ),
     StrategyInfo(
         id="mpc",
         name="Model Predictive Control",
         description="Rolling 24h LP with solar forecasts and learned load profiles. "
         "Re-solves every 15 minutes. Deployable in real-time.",
+        group="core",
     ),
     StrategyInfo(
         id="mpc_calibrated",
         name="MPC (Calibrated Solar)",
         description="MPC with monthly-calibrated GHI forecast. Learns seasonal correction "
         "factors from historical actual-vs-forecast data to fix systematic bias.",
+        group="advanced",
     ),
     StrategyInfo(
         id="mpc_5min",
         name="MPC 5-min (Calibrated)",
         description="MPC at 5-min resolution with calibrated solar forecast. "
         "Finer battery control and faster re-solving for better load tracking.",
+        group="advanced",
     ),
     StrategyInfo(
         id="mpc_5min_perfect",
         name="MPC 5-min (Perfect Solar)",
         description="MPC at 5-min resolution with perfect solar foresight. "
         "Shows the ceiling for high-resolution MPC.",
+        group="advanced",
     ),
     StrategyInfo(
         id="mpc_perfect",
         name="MPC (Perfect Solar)",
         description="MPC with perfect solar foresight — uses actual solar data instead of "
         "GHI forecast. Shows MPC ceiling without forecast error.",
+        group="core",
     ),
     StrategyInfo(
         id="dqn_agent",
-        name="DQN Agent",
+        name="DQN Agent (experimental)",
         description="Deep Q-Network reinforcement learning agent trained on historical data. "
-        "Uses learned policy for charge/discharge decisions.",
+        "Uses learned policy for charge/discharge decisions. Requires a trained policy file.",
+        group="experimental",
     ),
 ]
 
@@ -165,7 +183,7 @@ class StrategyRunResult:
     status: str = "pending"  # pending | running | completed | failed
     progress: int = 0  # 0-100 percent
     metrics: Optional[Dict[str, Any]] = None
-    timeseries: Optional[Dict[str, list]] = None
+    timeseries: Optional[Dict[str, np.ndarray]] = None
     error: Optional[str] = None
 
 
@@ -175,6 +193,9 @@ class SimulationRun:
     status: str = "running"  # running | completed | failed
     strategies: Dict[str, StrategyRunResult] = field(default_factory=dict)
     lock: Lock = field(default_factory=Lock)
+    start: Optional[str] = None
+    end: Optional[str] = None
+    config: Optional[SystemConfig] = None
 
 
 # Progress callback type: (strategy_id, percent 0-100)
@@ -183,6 +204,17 @@ ProgressCallback = Callable[[str, int], None]
 StrategyDoneCallback = Callable[[str, str, Optional[Dict[str, Any]]], None]
 # Run-done callback: ()
 RunDoneCallback = Callable[[], None]
+
+HISTORY_DAYS = 60
+
+
+@dataclass
+class RunInputs:
+    frame: pd.DataFrame
+    history: Optional[pd.DataFrame] = None
+    daily_forecasts: Optional[Dict] = None
+    ghi: Optional[HourlyGhi] = None
+    pvpc_prices: Optional[Dict[datetime, float]] = None
 
 
 class SimulationService:
@@ -242,21 +274,11 @@ class SimulationService:
 
         schedule = {}
         for r in config.tariff.rates:
-            direction = (
-                EnergyDirection.IMPORT
-                if r.direction == "import"
-                else EnergyDirection.EXPORT
-            )
-            schedule[(r.start_hour, r.end_hour)] = Rate(
-                price=r.price, energy_direction=direction
-            )
+            direction = EnergyDirection.IMPORT if r.direction == "import" else EnergyDirection.EXPORT
+            schedule[(r.start_hour, r.end_hour)] = Rate(price=r.price, energy_direction=direction)
         weekend = None
         if config.tariff.weekend_rate is not None:
-            wr = config.tariff.weekend_rate
-            weekend = Rate(
-                price=wr.price,
-                energy_direction=EnergyDirection.IMPORT if wr.direction == "import" else EnergyDirection.EXPORT,
-            )
+            weekend = Rate(price=config.tariff.weekend_rate.price, energy_direction=EnergyDirection.IMPORT)
         return PowerTariff(rate_schedule=schedule, weekend_rate=weekend)
 
     def _build_battery(self, config: Optional[SystemConfig] = None) -> Battery:
@@ -275,193 +297,174 @@ class SimulationService:
         gc = (config or self.config).grid
         return Grid(max_import=gc.max_import, max_export=gc.max_export)
 
+    def _build_strategy(self, strategy_id: str, config: SystemConfig, inputs: RunInputs, tariff: PowerTariff):
+        battery = self._build_battery(config)
+        grid = self._build_grid(config)
+        sc = config.strategy
+        common = dict(min_battery_level=sc.min_battery_level, max_charge_power=sc.max_charge_power)
+        if strategy_id in MPC_VARIANTS:
+            return build_mpc(
+                strategy_id, battery, grid, tariff, inputs.frame, history=inputs.history, ghi=inputs.ghi,
+                horizon_hours=config.tariff.mpc_horizon_hours,
+                cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh, **common,
+            )
+        if strategy_id == "oracle":
+            return OracleStrategy(battery, grid, tariff, inputs.frame,
+                                  cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh, **common)
+        if strategy_id == "dqn_agent":
+            from src.domain.strategy.dqn_strategy import load_dqn_strategy
+
+            return load_dqn_strategy(battery, grid, tariff, min_battery_level=sc.min_battery_level)
+        if strategy_id == "forecast_charge":
+            return ForecastChargeStrategy(battery, grid, tariff, inputs.daily_forecasts or {},
+                                          valley_charge_target=sc.valley_charge_target, **common)
+        cls = _STRATEGY_CLASSES[strategy_id]
+        if issubclass(cls, BaseRateAwareStrategy):
+            return cls(battery, grid, tariff, valley_charge_target=sc.valley_charge_target, **common)
+        return cls(battery, grid, tariff, **common)
+
     # --- run simulation ---
 
-    def _history_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def _history_frame(self, frame: pd.DataFrame, exclude_ev: bool) -> pd.DataFrame:
         """Frame from up to 60 days before the run start to its end, for out-of-sample forecasters."""
         if len(frame) == 0:
             return frame
-        first = frame.index[0]
-        start = (first - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
-        return self.data_service.get_frame(start, frame.index[-1].strftime("%Y-%m-%d"))
+        start = (frame.index[0] - pd.Timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+        return self.data_service.get_frame(start, frame.index[-1].strftime("%Y-%m-%d"), exclude_ev=exclude_ev)
+
+    @staticmethod
+    def validate_request(strategy_ids: List[str], start: Optional[str], end: Optional[str]) -> None:
+        if not strategy_ids:
+            raise ValueError("Select at least one strategy")
+        unknown = sorted(set(strategy_ids) - set(STRATEGY_MAP))
+        if unknown:
+            raise ValueError(f"Unknown strategies: {unknown}")
+        if len(set(strategy_ids)) != len(strategy_ids):
+            raise ValueError("Duplicate strategies in request")
+        bounds = []
+        for label, value in (("start", start), ("end", end)):
+            try:
+                bounds.append(to_utc_bound(value, is_end=False))
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"Invalid {label} date {value!r}: expected YYYY-MM-DD or ISO datetime") from exc
+        if bounds[0] is not None and bounds[1] is not None and bounds[0] > bounds[1]:
+            raise ValueError(f"start ({start}) must not be after end ({end})")
+
+    def _pvpc_window(self, frame: pd.DataFrame, config: SystemConfig) -> Optional[tuple]:
+        if len(frame) == 0:
+            return None
+        lookahead = pd.Timedelta(hours=max(24, config.tariff.mpc_horizon_hours))
+        needed_end = frame.index[-1] + lookahead
+        # Prices are published for tomorrow at the latest; PvpcTariff falls back for later hours.
+        tomorrow_end = (pd.Timestamp.now(tz="Europe/Madrid").normalize() + pd.Timedelta(days=2)
+                        - pd.Timedelta(hours=1))
+        end = min(needed_end, tomorrow_end)
+        start = frame.index[0]
+        if end < start:
+            end = start
+        return start.to_pydatetime(), end.to_pydatetime()
 
     def start_run(
         self,
         strategy_ids: List[str],
         start: Optional[str] = None,
         end: Optional[str] = None,
+        config: Optional[SystemConfig] = None,
         on_progress: Optional[ProgressCallback] = None,
         on_strategy_done: Optional[StrategyDoneCallback] = None,
         on_run_done: Optional[RunDoneCallback] = None,
     ) -> str:
-        """Start a simulation run. Returns the run_id."""
+        """Validate and start a simulation run; returns the run_id. Raises ValueError for bad requests."""
+        self.validate_request(strategy_ids, start, end)
+        # Snapshot config so threads don't race with PUT /api/config
+        config_snapshot = (config or self.config).model_copy(deep=True)
+
+        frame = self.data_service.get_frame(start, end, exclude_ev=config_snapshot.exclude_ev)
+        if len(frame) == 0 or not frame["valid"].any():
+            raise ValueError(f"No data between {start or 'the beginning'} and {end or 'the end'}")
+
         run_id = uuid.uuid4().hex[:12]
-        run = SimulationRun(run_id=run_id)
+        run = SimulationRun(run_id=run_id, start=start, end=end, config=config_snapshot)
         for sid in strategy_ids:
             run.strategies[sid] = StrategyRunResult(strategy_id=sid)
         self.runs[run_id] = run
 
-        # Snapshot config so threads don't race with PUT /api/config
-        config_snapshot = self.config
-
-        # Fetch data once (shared across strategies — read only)
-        frame = self.data_service.get_frame(start, end)
-        needs_mpc = any(s in MPC_VARIANTS for s in strategy_ids)
-        history = self._history_frame(frame) if needs_mpc else None
-
-        # Load forecasts once if needed (shared across threads)
-        daily_forecasts = (
-            load_daily_forecasts() if "forecast_charge" in strategy_ids else None
-        )
-        ghi = (
-            HourlyGhi(load_irradiance())
-            if any(MPC_VARIANTS[s].solar != "perfect" for s in strategy_ids if s in MPC_VARIANTS)
-            else None
-        )
-
-        # Pre-fetch PVPC prices synchronously so failures short-circuit the
-        # whole run with a clear message instead of surfacing per-thread. All
-        # strategy threads then share the same price dict.
-        pvpc_prices: Optional[Dict[datetime, float]] = None
-        if config_snapshot.tariff.use_pvpc and len(frame.index) > 0:
-            first_ts = frame.index[0]
-            last_ts = frame.index[-1]
-            # MPC-style strategies read prices ~24h ahead of the current
-            # simulation step. Fetch an extra day so the final simulation day
-            # has the lookahead prices available.
-            # +2 days minimum, or horizon+1 day whichever is larger (48h MPC
-            # horizon needs extra lookahead on the final simulation day).
-            horizon_buffer_days = max(2, config_snapshot.tariff.mpc_horizon_hours // 24 + 1)
-            last_ts_ext = last_ts + pd.Timedelta(days=horizon_buffer_days)
-            try:
-                pvpc_prices = self.pvpc_service.get_prices(
-                    first_ts.to_pydatetime(), last_ts_ext.to_pydatetime()
-                )
-            except Exception as exc:
-                logger.exception("PVPC fetch failed for run %s", run_id)
-                err = f"PVPC fetch failed: {exc}"
-                with run.lock:
-                    for sid in strategy_ids:
-                        sr = run.strategies[sid]
-                        sr.status = "failed"
-                        sr.error = err
-                    run.status = "failed"
-                if on_strategy_done is not None:
-                    for sid in strategy_ids:
-                        on_strategy_done(sid, "failed", None)
-                if on_run_done is not None:
-                    on_run_done()
-                return run_id
+        inputs = RunInputs(frame=frame)
+        try:
+            if any(s in MPC_VARIANTS for s in strategy_ids):
+                inputs.history = self._history_frame(frame, config_snapshot.exclude_ev)
+            if "forecast_charge" in strategy_ids:
+                inputs.daily_forecasts = load_daily_forecasts()
+            if any(MPC_VARIANTS[s].solar != "perfect" for s in strategy_ids if s in MPC_VARIANTS):
+                inputs.ghi = HourlyGhi(load_irradiance())
+            if config_snapshot.tariff.use_pvpc:
+                window = self._pvpc_window(frame, config_snapshot)
+                if window is not None:
+                    inputs.pvpc_prices = self.pvpc_service.get_prices(*window, strict=False)
+        except Exception as exc:
+            logger.exception("Preparing run %s failed", run_id)
+            self._fail_run(run, strategy_ids, f"{type(exc).__name__}: {exc}", on_strategy_done, on_run_done)
+            return run_id
 
         for sid in strategy_ids:
             self._executor.submit(
-                self._run_strategy,
-                run,
-                sid,
-                frame,
-                config_snapshot,
-                on_progress,
-                on_strategy_done,
-                on_run_done,
-                strategy_ids,
-                daily_forecasts,
-                pvpc_prices,
-                history,
-                ghi,
+                self._run_strategy, run, sid, inputs, config_snapshot,
+                on_progress, on_strategy_done, on_run_done, strategy_ids,
             )
-
         return run_id
+
+    @staticmethod
+    def _fail_run(run: SimulationRun, strategy_ids: List[str], error: str,
+                  on_strategy_done: Optional[StrategyDoneCallback], on_run_done: Optional[RunDoneCallback]) -> None:
+        with run.lock:
+            for sid in strategy_ids:
+                run.strategies[sid].status = "failed"
+                run.strategies[sid].error = error
+            run.status = "failed"
+        if on_strategy_done is not None:
+            for sid in strategy_ids:
+                on_strategy_done(sid, "failed", None)
+        if on_run_done is not None:
+            on_run_done()
 
     def _run_strategy(
         self,
         run: SimulationRun,
         strategy_id: str,
-        frame: pd.DataFrame,
+        inputs: RunInputs,
         config: SystemConfig,
         on_progress: Optional[ProgressCallback],
         on_strategy_done: Optional[StrategyDoneCallback],
         on_run_done: Optional[RunDoneCallback],
         all_strategy_ids: List[str],
-        daily_forecasts: Optional[Dict] = None,
-        pvpc_prices: Optional[Dict[datetime, float]] = None,
-        history: Optional[pd.DataFrame] = None,
-        ghi: Optional[HourlyGhi] = None,
     ) -> None:
         result = run.strategies[strategy_id]
         result.status = "running"
 
         try:
-            tariff = self._build_tariff(config, prices=pvpc_prices)
-            battery = self._build_battery(config)
-            grid = self._build_grid(config)
-
-            strategy_cls = _STRATEGY_CLASSES.get(strategy_id)
-            if strategy_cls is None and strategy_id != "dqn_agent":
-                raise ValueError(f"Unknown strategy: {strategy_id}")
-
-            if strategy_id == "forecast_charge":
-                strategy = strategy_cls(battery, grid, tariff, daily_forecasts)
-            elif strategy_id in MPC_VARIANTS:
-                strategy = build_mpc(
-                    strategy_id, battery, grid, tariff, frame, history=history, ghi=ghi,
-                    horizon_hours=config.tariff.mpc_horizon_hours,
-                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
-                    min_battery_level=config.strategy.min_battery_level,
-                    max_charge_power=config.strategy.max_charge_power,
-                )
-            elif strategy_id == "dqn_agent":
-                from src.domain.strategy.dqn_strategy import load_dqn_strategy
-
-                strategy = load_dqn_strategy(
-                    battery, grid, tariff,
-                    min_battery_level=config.strategy.min_battery_level,
-                )
-            elif strategy_id == "oracle":
-                strategy = strategy_cls(
-                    battery, grid, tariff, frame,
-                    min_battery_level=config.strategy.min_battery_level,
-                    max_charge_power=config.strategy.max_charge_power,
-                    cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh,
-                )
-            else:
-                strategy = strategy_cls(battery, grid, tariff)
-            # Apply strategy config
-            sc = config.strategy
-            strategy.min_battery_level = sc.min_battery_level
-            strategy.max_charge_power = sc.max_charge_power
-            if hasattr(strategy, 'valley_charge_target'):
-                strategy.valley_charge_target = sc.valley_charge_target
+            tariff = self._build_tariff(config, prices=inputs.pvpc_prices)
+            strategy = self._build_strategy(strategy_id, config, inputs, tariff)
 
             def progress(pct: int) -> None:
                 result.progress = pct
                 if on_progress is not None:
                     on_progress(strategy_id, pct)
 
-            sim = simulate(frame, strategy, tariff, on_progress=progress)
-            metrics = sim.metrics
-            ts_arr = sim.timeseries
-            keep = frame["valid"].to_numpy()
-            timeseries = {
-                "timestamps": [t.isoformat() for t in frame.index[keep]],
-                "battery_level": ts_arr["battery_level_kwh"][keep].tolist(),
-                "grid_import": ts_arr["grid_import_kw"][keep].tolist(),
-                "grid_export": ts_arr["grid_export_kw"][keep].tolist(),
-                "solar_power": ts_arr["solar_kw"][keep].tolist(),
-                "house_consumption": ts_arr["load_kw"][keep].tolist(),
-            }
+            sim = simulate(inputs.frame, strategy, tariff, on_progress=progress)
 
             with run.lock:
                 result.status = "completed"
-                result.metrics = metrics
-                result.timeseries = timeseries
+                result.metrics = sim.metrics
+                result.timeseries = sim.timeseries
 
             if on_strategy_done is not None:
-                on_strategy_done(strategy_id, "completed", metrics)
+                on_strategy_done(strategy_id, "completed", sim.metrics)
 
         except Exception as e:
+            logger.exception("Strategy %s failed in run %s", strategy_id, run.run_id)
             with run.lock:
                 result.status = "failed"
-                result.error = str(e)
+                result.error = str(e) or type(e).__name__
 
             if on_strategy_done is not None:
                 on_strategy_done(strategy_id, "failed", None)
@@ -489,9 +492,8 @@ class SimulationService:
     def get_run(self, run_id: str) -> Optional[SimulationRun]:
         return self.runs.get(run_id)
 
-    def get_run_timeseries(
-        self, run_id: str, strategy_id: str
-    ) -> Optional[Dict[str, list]]:
+    def get_run_timeseries(self, run_id: str, strategy_id: str) -> Optional[Dict[str, np.ndarray]]:
+        """Raw per-minute numpy arrays (``ts`` epoch ms; NaN on invalid minutes)."""
         run = self.runs.get(run_id)
         if run is None:
             return None

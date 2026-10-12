@@ -73,47 +73,45 @@ def lttb_downsample(
     return x[indices], y[indices]
 
 
+def downsample_indices(columns: dict, max_points: int = 2000) -> np.ndarray:
+    """Row indices to keep so every column fits in about ``max_points`` points.
+
+    LTTB runs on the valid (non-NaN) rows of the highest-variance column; the
+    first row of every NaN run is kept as well so charts still break at gaps.
+    """
+    arrays = [np.asarray(v, dtype=np.float64) for v in columns.values()]
+    n = len(arrays[0]) if arrays else 0
+    if n <= max_points:
+        return np.arange(n)
+
+    best_var = -1.0
+    ref_y = np.zeros(n)
+    for arr in arrays:
+        v = float(np.nanvar(arr)) if np.isfinite(arr).any() else 0.0
+        if v > best_var:
+            best_var = v
+            ref_y = arr
+
+    finite = np.isfinite(ref_y)
+    gap_starts = np.flatnonzero(~finite & np.concatenate(([True], finite[:-1])))
+    valid_idx = np.flatnonzero(finite)
+    budget = max(2, max_points - len(gap_starts))
+    if len(valid_idx) > budget:
+        x_down, _ = lttb_downsample(valid_idx.astype(np.float64), ref_y[valid_idx], budget)
+        keep = x_down.astype(np.intp)
+    else:
+        keep = valid_idx
+    return np.union1d(keep, gap_starts)
+
+
 def downsample_timeseries(
     timestamps: List[str],
     columns: dict,
     max_points: int = 2000,
 ) -> Tuple[List[str], dict]:
-    """Downsample multiple parallel timeseries columns.
-
-    Parameters
-    ----------
-    timestamps : list of ISO timestamp strings
-    columns : dict mapping column name -> list[float]
-    max_points : target point count
-
-    Returns
-    -------
-    (timestamps_out, columns_out) with each list trimmed to <= max_points
-    """
-    n = len(timestamps)
-    if n <= max_points:
+    """Downsample parallel timeseries columns (NaN-aware); see :func:`downsample_indices`."""
+    idx = downsample_indices(columns, max_points)
+    if len(idx) == len(timestamps):
         return timestamps, columns
-
-    x = np.arange(n, dtype=np.float64)
-
-    # Use the column with the highest variance as the reference for index selection
-    # so the most interesting features are preserved.
-    best_var = -1.0
-    ref_y: np.ndarray = np.zeros(n)
-    for col_values in columns.values():
-        arr = np.asarray(col_values, dtype=np.float64)
-        v = float(np.var(arr))
-        if v > best_var:
-            best_var = v
-            ref_y = arr
-
-    x_down, _ = lttb_downsample(x, ref_y, max_points)
-    indices = x_down.astype(int)
-
-    ts_out = [timestamps[i] for i in indices]
-    cols_out = {}
-    for name, values in columns.items():
-        arr = np.asarray(values, dtype=np.float64)
-        cols_out[name] = arr[indices].tolist()
-
-    return ts_out, cols_out
+    return ([timestamps[i] for i in idx],
+            {name: np.asarray(values, dtype=np.float64)[idx].tolist() for name, values in columns.items()})
