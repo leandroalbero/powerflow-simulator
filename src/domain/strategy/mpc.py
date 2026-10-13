@@ -7,8 +7,8 @@ Horizon prices are pure ``tariff.rate_at`` lookups.
 """
 
 from dataclasses import dataclass
-from datetime import date
-from typing import Dict, Optional, Tuple, Union
+from datetime import date, datetime
+from typing import Dict, Optional, Tuple, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -99,7 +99,7 @@ class LoadForecaster:
         hours = (wall // _NS_PER_HOUR) % 24
         days = wall // (24 * _NS_PER_HOUR)
         offpeak = {d: is_offpeak_day(date.fromordinal(_EPOCH_ORDINAL + int(d))) for d in np.unique(days)}
-        return table[np.array([offpeak[d] for d in days], dtype=int), hours]
+        return np.asarray(table[np.array([offpeak[d] for d in days], dtype=int), hours], dtype=float)
 
 
 class SolarForecaster:
@@ -119,7 +119,7 @@ class SolarForecaster:
         offsets = np.arange(step_minutes) * _NS_PER_MIN
         ns = times.asi8[:, None] + offsets[None, :]
         ghi = self._ghi.at(ns.ravel()).reshape(ns.shape).mean(axis=1)
-        return ghi * self._k * self._factors[times.month]
+        return np.asarray(ghi * self._k * self._factors[times.month], dtype=float)
 
 
 class CalibratedSolarForecaster(SolarForecaster):
@@ -163,7 +163,7 @@ def learn_monthly_ghi_factors(pv: Union[pd.DataFrame, pd.Series], ghi: HourlyGhi
     df = pd.DataFrame({"m": months[day], "a": actual[day], "p": predicted[day]})
     for m, g in df.groupby("m"):
         if g["p"].sum() > 0:
-            factors[int(m)] = float(g["a"].sum() / g["p"].sum())
+            factors[int(cast(int, m))] = float(g["a"].sum() / g["p"].sum())
     return factors
 
 
@@ -177,7 +177,7 @@ class MpcStrategy(BaseEnergyStrategy):
         grid: Grid,
         tariff: PowerTariff,
         load_forecaster: LoadForecaster,
-        solar_forecaster,
+        solar_forecaster: SolarForecaster | PerfectSolarForecaster,
         step_minutes: int = 15,
         resolve_minutes: int = 15,
         horizon_hours: int = 24,
@@ -214,11 +214,11 @@ class MpcStrategy(BaseEnergyStrategy):
     def _should_resolve(self) -> bool:
         if self._cached_plan is None or self._plan_start is None:
             return True
-        elapsed = (pd.Timestamp(self.now) - self._plan_start).total_seconds() / 60.0
+        elapsed = (pd.Timestamp(cast(datetime, self.now)) - self._plan_start).total_seconds() / 60.0
         return elapsed >= self._resolve_minutes or elapsed < 0
 
     def _solve_horizon(self, solar_now: float, load_now: float) -> None:
-        ts = pd.Timestamp(self.now)
+        ts = pd.Timestamp(cast(datetime, self.now))
         n, sm = self._horizon_steps, self._step_minutes
         solar_fc = np.asarray(self._solar_forecaster.forecast_24h(ts, n, sm), dtype=float)
         load_fc = np.asarray(self._load_forecaster.forecast_24h(ts, n, sm), dtype=float)
@@ -246,7 +246,7 @@ class MpcStrategy(BaseEnergyStrategy):
         self._solve_count += 1
 
     def _plan_step(self) -> int:
-        elapsed = (pd.Timestamp(self.now) - self._plan_start).total_seconds() / 60.0
+        elapsed = (pd.Timestamp(cast(datetime, self.now)) - cast(pd.Timestamp, self._plan_start)).total_seconds() / 60.0
         return min(int(elapsed // self._step_minutes), self._horizon_steps - 1)
 
     def _decide(self, solar_kw: float, load_kw: float, dt_h: float) -> Decision:
@@ -300,6 +300,7 @@ def build_mpc(
     variant = MPC_VARIANTS[strategy_id]
     hist = history if history is not None else frame
     load_hist = hist["load_kw"].where(hist["valid"])
+    solar: SolarForecaster | PerfectSolarForecaster
     if variant.solar == "perfect":
         solar = PerfectSolarForecaster(frame["pv_kw"])
     else:
