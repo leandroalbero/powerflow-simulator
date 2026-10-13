@@ -180,7 +180,7 @@ class SweepService:
             with job.lock:
                 case.status = "running"
             try:
-                fut = self._submit_one(job, frame, body, prices, inputs, idx, case)
+                fut = self._submit_resilient(job, frame, body, prices, inputs, idx, case)
             except BrokenProcessPool:
                 logger.exception("worker process crashed")
                 with job.lock:
@@ -196,6 +196,13 @@ class SweepService:
         for idx, fut in futs:
             self._consume(job, idx, fut)
         job.futures.clear()
+
+    def _submit_resilient(self, job, frame, body, prices, inputs, idx: int, case: SweepCase) -> Future:
+        try:
+            return self._submit_one(job, frame, body, prices, inputs, idx, case)
+        except BrokenProcessPool:
+            self.pool.recreate()
+            return self._submit_one(job, frame, body, prices, inputs, idx, case)
 
     def _submit_one(self, job, frame, body, prices, inputs, idx: int, case: SweepCase) -> Future:
         payload = CasePayload(
@@ -225,6 +232,7 @@ class SweepService:
             return
         except BrokenProcessPool:
             logger.exception("worker process crashed")
+            self.pool.recreate()
             with job.lock:
                 job.cases[idx].status = "failed"
                 job.cases[idx].error = "worker process crashed"
