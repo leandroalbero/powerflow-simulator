@@ -249,6 +249,17 @@ def _end_of_tomorrow(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
     return pd.Timestamp(day).tz_localize("Europe/Madrid") - pd.Timedelta(hours=1)
 
 
+class RunStillActive(Exception):
+    def __init__(self) -> None:
+        super().__init__("run still active, cancel first")
+
+
+def _run_active(run: SimulationRun) -> bool:
+    if run.status == "running":
+        return True
+    return any(result.status in ("pending", "running") for result in run.strategies.values())
+
+
 class SimulationService:
     """Manages simulation runs in background threads."""
 
@@ -740,13 +751,18 @@ class SimulationService:
                 return "ok", result.timeseries
             if result.status in ("pending", "running"):
                 return "not_ready", None
-            return "evicted", None
+            if result.status == "completed":
+                return "evicted", None
+            return "missing", None
         row = self.history.get_run(run_id)
         if row is None:
             return "missing", None
-        if strategy_id not in {item["strategy_id"] for item in row["strategies"]}:
+        match = next((item for item in row["strategies"] if item["strategy_id"] == strategy_id), None)
+        if match is None:
             return "missing", None
-        return "evicted", None
+        if match.get("status") == "completed":
+            return "evicted", None
+        return "missing", None
 
     def cancel_run(self, run_id: str) -> Optional[str]:
         run = self.runs.get(run_id)
@@ -766,18 +782,28 @@ class SimulationService:
         return run.status
 
     def delete_run(self, run_id: str) -> bool:
-        removed = self.history.delete_run(run_id)
-        if run_id in self.runs:
-            del self.runs[run_id]
-            self._ts_order.pop(run_id, None)
-            removed = True
-        return removed
+        with self._registry_lock:
+            run = self.runs.get(run_id)
+            if run is not None and _run_active(run):
+                raise RunStillActive()
+            if run is None:
+                row = self.history.get_run(run_id)
+                if row is not None and row["status"] == "running":
+                    raise RunStillActive()
+            removed = self.history.delete_run(run_id)
+            if run_id in self.runs:
+                del self.runs[run_id]
+                self._ts_order.pop(run_id, None)
+                removed = True
+            return removed
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}
         for row in self.history.list_runs(limit):
             merged[row["run_id"]] = _public_run(row)
-        for run in self.runs.values():
+        with self._registry_lock:
+            runs = list(self.runs.values())
+        for run in runs:
             merged[run.run_id] = _public_run_memory(run)
         items = sorted(merged.values(), key=lambda item: item["created_at"], reverse=True)
         return items[:limit]

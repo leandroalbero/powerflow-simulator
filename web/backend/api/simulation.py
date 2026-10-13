@@ -129,8 +129,8 @@ async def ws_run_progress(websocket: WebSocket, run_id: str) -> None:
 
     last_pcts: Dict[str, int] = {}
     sent_done: set[str] = set()
-    await _replay(websocket, run, last_pcts, sent_done)
-    if run.status in ("completed", "failed", "cancelled"):
+    replay_done = await _replay(websocket, run, last_pcts, sent_done)
+    if replay_done:
         await websocket.send_json({"status": "run_complete"})
         await websocket.close()
         return
@@ -160,14 +160,18 @@ async def ws_run_progress(websocket: WebSocket, run_id: str) -> None:
     await websocket.close()
 
 
-async def _replay(websocket: WebSocket, run, last_pcts: Dict[str, int], sent_done: set[str]) -> None:
-    for sid, result in run.strategies.items():
-        if result.status in ("completed", "failed", "cancelled"):
+async def _replay(websocket: WebSocket, run, last_pcts: Dict[str, int], sent_done: set[str]) -> bool:
+    with run.lock:
+        run_done = run.status in ("completed", "failed", "cancelled")
+        snapshot = [(sid, result.status, result.progress, result) for sid, result in run.strategies.items()]
+    for sid, status, progress, result in snapshot:
+        if status in ("completed", "failed", "cancelled"):
             await websocket.send_text(json.dumps(_strategy_message(sid, result)))
             sent_done.add(sid)
-        elif result.status == "running":
-            last_pcts[sid] = result.progress
-            await websocket.send_text(json.dumps({"strategy": sid, "percent": result.progress}))
+        elif status == "running":
+            last_pcts[sid] = progress
+            await websocket.send_text(json.dumps({"strategy": sid, "percent": progress}))
+    return run_done
 
 
 def _strategy_message(sid: str, result) -> Dict[str, Any]:
