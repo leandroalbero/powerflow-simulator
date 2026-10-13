@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from src.data.store import read_entity
+from src.domain.strategy.dqn.environment import BatteryEnv
 
 LOCAL_TZ = pytz.timezone("Europe/Madrid")
 
@@ -30,7 +31,7 @@ def _power_frame(key: str) -> pd.DataFrame:
     return frame.dropna().sort_index()
 
 
-def load_episodes():
+def load_episodes() -> list[dict[str, np.ndarray]]:
     solar_df = _power_frame("pv")
     load_df = _power_frame("load")
 
@@ -45,16 +46,15 @@ def load_episodes():
         if len(idx) < 24:
             continue
         episodes.append({
-            "solar": (s["state"].values / 1000.0).astype(np.float32),
-            "load": (group["state"].values / 1000.0).astype(np.float32),
+            "solar": (np.asarray(s["state"], dtype=float) / 1000.0).astype(np.float32),
+            "load": (np.asarray(group["state"], dtype=float) / 1000.0).astype(np.float32),
             "hours": np.array([t.hour for t in idx], dtype=np.int32),
             "rates": np.array([IMPORT_RATES_BY_HOUR[t.hour] for t in idx], dtype=np.float32),
         })
     return episodes
 
 
-def make_env(ep_data, init_soc=0.1):
-    from src.domain.strategy.dqn.environment import BatteryEnv
+def make_env(ep_data: dict[str, np.ndarray], init_soc: float = 0.1) -> BatteryEnv:
     return BatteryEnv(
         solar=ep_data["solar"], load=ep_data["load"],
         hours=ep_data["hours"], import_rates=ep_data["rates"],
@@ -64,7 +64,9 @@ def make_env(ep_data, init_soc=0.1):
     )
 
 
-def train_variant(name, device, episodes, num_ep, lr, hidden, layers, gamma, reward_scale, train_per_step, output):
+def train_variant(name: str, device: str, episodes: list[dict[str, np.ndarray]], num_ep: int, lr: float,
+                  hidden: int, layers: int, gamma: float, reward_scale: float, train_per_step: int,
+                  output: str) -> float:
     print(f"\n{'='*60}", flush=True)
     print(f"[{name}] device={device} lr={lr} hidden={hidden}x{layers} gamma={gamma} "
           f"reward_scale={reward_scale} episodes={num_ep}", flush=True)
@@ -117,7 +119,7 @@ def train_variant(name, device, episodes, num_ep, lr, hidden, layers, gamma, rew
         recent.append(total_reward)
         if len(recent) > 20:
             recent.pop(0)
-        avg = np.mean(recent)
+        avg = float(np.mean(recent))
 
         if len(recent) >= 20 and avg > best_avg:
             best_avg = avg
@@ -132,7 +134,7 @@ def train_variant(name, device, episodes, num_ep, lr, hidden, layers, gamma, rew
     return best_avg
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()

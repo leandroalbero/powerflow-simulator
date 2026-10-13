@@ -6,6 +6,7 @@ Usage: python3 -u -m src.domain.strategy.dqn.train_vectorized --device cuda:0
 import argparse
 import random
 from collections import deque
+from typing import Optional, cast
 
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ def _power_frame(key: str) -> pd.DataFrame:
     return frame.dropna().sort_index()
 
 
-def load_episodes():
+def load_episodes() -> list[dict[str, np.ndarray]]:
     solar_df = _power_frame("pv")
     load_df = _power_frame("load")
 
@@ -47,8 +48,8 @@ def load_episodes():
         if len(idx) < 24:
             continue
         episodes.append({
-            "solar": (s["state"].values / 1000.0).astype(np.float32),
-            "load": (group["state"].values / 1000.0).astype(np.float32),
+            "solar": (np.asarray(s["state"], dtype=float) / 1000.0).astype(np.float32),
+            "load": (np.asarray(group["state"], dtype=float) / 1000.0).astype(np.float32),
             "hours": np.array([t.hour for t in idx], dtype=np.int32),
             "rates": np.array([IMPORT_RATES_BY_HOUR[t.hour] for t in idx], dtype=np.float32),
         })
@@ -62,8 +63,9 @@ class VectorizedBatteryEnv:
     STATE_DIM = 16
     ACTION_DIM = 9
 
-    def __init__(self, n_envs: int, episodes: list, capacity=15.0,
-                 max_charge=4.8, max_discharge=4.8, eff=0.95, min_soc_frac=0.1):
+    def __init__(self, n_envs: int, episodes: list[dict[str, np.ndarray]], capacity: float = 15.0,
+                 max_charge: float = 4.8, max_discharge: float = 4.8, eff: float = 0.95,
+                 min_soc_frac: float = 0.1) -> None:
         self.n = n_envs
         self.episodes = episodes
         self.cap = capacity
@@ -75,22 +77,22 @@ class VectorizedBatteryEnv:
         # Per-env state
         self.soc = np.zeros(n_envs, dtype=np.float32)
         self.step_idx = np.zeros(n_envs, dtype=np.int32)
-        self.ep_data = [None] * n_envs
+        self.ep_data: list[Optional[dict[str, np.ndarray]]] = [None] * n_envs
         self.ep_len = np.zeros(n_envs, dtype=np.int32)
 
-    def reset_all(self):
+    def reset_all(self) -> np.ndarray:
         for i in range(self.n):
             self._reset_env(i)
         return self._get_states()
 
-    def _reset_env(self, i):
+    def _reset_env(self, i: int) -> None:
         ep = random.choice(self.episodes)
         self.ep_data[i] = ep
         self.ep_len[i] = len(ep["solar"])
         self.soc[i] = random.uniform(0.1, 0.5) * self.cap
         self.step_idx[i] = 0
 
-    def step(self, actions: np.ndarray):
+    def step(self, actions: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Step all envs. actions: (n_envs,) int array of action indices."""
         rewards = np.zeros(self.n, dtype=np.float32)
         dones = np.zeros(self.n, dtype=bool)
@@ -103,6 +105,7 @@ class VectorizedBatteryEnv:
                 continue
 
             ep = self.ep_data[i]
+            assert ep is not None
             action_val = self.ACTIONS[actions[i]]
             solar = ep["solar"][t]
             load = ep["load"][t]
@@ -150,12 +153,13 @@ class VectorizedBatteryEnv:
 
         return states, rewards, dones
 
-    def _get_states(self):
+    def _get_states(self) -> np.ndarray:
         import math
         states = np.zeros((self.n, self.STATE_DIM), dtype=np.float32)
         for i in range(self.n):
             t = min(self.step_idx[i], self.ep_len[i] - 1)
             ep = self.ep_data[i]
+            assert ep is not None
             h = int(ep["hours"][t]) % 24
             states[i, 0] = self.soc[i] / self.cap
             states[i, 1] = math.sin(2 * math.pi * h / 24)
@@ -168,7 +172,7 @@ class VectorizedBatteryEnv:
 
 
 class BigQNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden, layers):
+    def __init__(self, state_dim: int, action_dim: int, hidden: int, layers: int) -> None:
         super().__init__()
         mods = []
         d = state_dim
@@ -178,11 +182,12 @@ class BigQNetwork(nn.Module):
         mods.append(nn.Linear(d, action_dim))
         self.net = nn.Sequential(*mods)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return cast(torch.Tensor, self.net(x))
 
 
-def train(device, episodes, n_envs, total_steps, hidden, layers, lr, batch_size, name, output):
+def train(device: str, episodes: list[dict[str, np.ndarray]], n_envs: int, total_steps: int, hidden: int,
+          layers: int, lr: float, batch_size: int, name: str, output: str) -> float:
     print(f"\n[{name}] {n_envs} parallel envs, {hidden}x{layers} net, "
           f"batch={batch_size}, lr={lr}, device={device}", flush=True)
 
@@ -192,7 +197,7 @@ def train(device, episodes, n_envs, total_steps, hidden, layers, lr, batch_size,
     target.load_state_dict(policy.state_dict())
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
-    buffer = deque(maxlen=2_000_000)
+    buffer: deque[tuple[np.ndarray, int, float, np.ndarray, bool]] = deque(maxlen=2_000_000)
     env = VectorizedBatteryEnv(n_envs, episodes)
     states = env.reset_all()
 
@@ -201,7 +206,7 @@ def train(device, episodes, n_envs, total_steps, hidden, layers, lr, batch_size,
     eps_min = 0.05
     best_avg = -float("inf")
     ep_rewards = np.zeros(n_envs, dtype=np.float32)
-    finished_rewards = deque(maxlen=100)
+    finished_rewards: deque[float] = deque(maxlen=100)
     step = 0
 
     while step < total_steps:
@@ -254,7 +259,7 @@ def train(device, episodes, n_envs, total_steps, hidden, layers, lr, batch_size,
 
         # Log
         if step % (5000 * n_envs) == 0 and len(finished_rewards) > 0:
-            avg = np.mean(list(finished_rewards))
+            avg = float(np.mean(list(finished_rewards)))
             if avg > best_avg:
                 best_avg = avg
                 torch.save(policy.state_dict(), output)
@@ -267,7 +272,7 @@ def train(device, episodes, n_envs, total_steps, hidden, layers, lr, batch_size,
     return best_avg
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()

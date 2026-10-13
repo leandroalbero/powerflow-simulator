@@ -2,7 +2,7 @@
 
 import random
 from collections import deque
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
 import torch
@@ -22,7 +22,7 @@ class QNetwork(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return cast(torch.Tensor, self.net(x))
 
 
 class DqnAgent:
@@ -44,8 +44,8 @@ class DqnAgent:
         self.target_update_freq = target_update_freq
         self.device = torch.device(device)
 
-        self.policy_net = QNetwork(state_dim, action_dim).to(self.device)
-        self.target_net = QNetwork(state_dim, action_dim).to(self.device)
+        self.policy_net: nn.Module = QNetwork(state_dim, action_dim).to(self.device)
+        self.target_net: nn.Module = QNetwork(state_dim, action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -62,7 +62,7 @@ class DqnAgent:
     def get_q_values(self, state: np.ndarray) -> np.ndarray:
         with torch.no_grad():
             t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            return self.policy_net(t).cpu().numpy()[0]
+            return cast(np.ndarray, self.policy_net(t).cpu().numpy()[0])
 
     def store_transition(
         self, state: np.ndarray, action: int, reward: float,

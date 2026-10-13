@@ -52,8 +52,8 @@ def build_monthly_episodes(
         if len(month_idx) < 24:
             continue
         episodes.append({
-            "solar": (solar_month["state"].values / 1000.0).astype(np.float32),
-            "load": (group["state"].values / 1000.0).astype(np.float32),
+            "solar": (np.asarray(solar_month["state"], dtype=float) / 1000.0).astype(np.float32),
+            "load": (np.asarray(group["state"], dtype=float) / 1000.0).astype(np.float32),
             "hours": np.array([ts.hour for ts in month_idx], dtype=np.int32),
             "import_rates": np.array(
                 [IMPORT_RATES_BY_HOUR[ts.hour] for ts in month_idx], dtype=np.float32
@@ -136,7 +136,7 @@ def train(episodes: int = 200, output: str = "output_files/dqn_policy.pt") -> No
         avg_recent = np.mean(recent_rewards)
 
         if len(recent_rewards) >= 10 and avg_recent > best_avg_reward:
-            best_avg_reward = avg_recent
+            best_avg_reward = float(avg_recent)
             agent.save(output)
 
         if (ep + 1) % 20 == 0:

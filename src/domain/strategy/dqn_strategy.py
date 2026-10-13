@@ -2,7 +2,7 @@
 
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -87,7 +87,7 @@ DEFAULT_POLICY = Path("output_files") / "dqn_policy.pt"
 
 
 def load_dqn_strategy(battery: Battery, grid: Grid, tariff: PowerTariff,
-                      policy_path: Optional[Path] = None, **kwargs) -> DqnStrategy:
+                      policy_path: Optional[Path] = None, **kwargs: Any) -> DqnStrategy:
     """DqnStrategy with the trained policy; refuses to run untrained (random) weights."""
     path = Path(policy_path) if policy_path is not None else REPO_ROOT / DEFAULT_POLICY
     if not path.exists():
