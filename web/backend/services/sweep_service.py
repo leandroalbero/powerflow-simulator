@@ -1,6 +1,8 @@
 """Scenario matrix. One frame, process-pool cases, baseline per tariff."""
 
+import logging
 import math
+import sqlite3
 import threading
 import uuid
 from concurrent.futures import CancelledError, Future
@@ -28,6 +30,9 @@ _MAX_CAPACITY_KWH = 200.0
 _MAX_DAYS = 366
 
 _HOURS_YEAR = 8760.0
+_RESULT_POLL_S = 0.5
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -148,55 +153,48 @@ class SweepService:
             for group in groups:
                 self._submit_wait(job, frame, body, prices, inputs, group)
                 if job.cancel.is_set():
-                    self._cancel_pending(job)
+                    with job.lock:
+                        self._cancel_pending(job)
                     break
             self._finish(job)
         except Exception:
             public_error("sweep failed")
-            self._fail_open(job, "sweep failed")
-            job.status = "failed"
-            try:
-                self._persist(job)
-            except Exception:
-                public_error("sweep failed")
-            self._drop(job)
+            job.cancel.set()
+            for fut in list(job.futures):
+                fut.cancel()
+            with job.lock:
+                self._fail_open(job, "sweep failed")
+                job.status = "failed"
+            if self._persist_logged(job):
+                self._drop(job)
 
     def _submit_wait(
-        self, job, frame, body, prices, inputs, indexed: list[tuple[int, SweepCase]], *, allow_retry: bool = True,
+        self, job, frame, body, prices, inputs, indexed: list[tuple[int, SweepCase]],
     ) -> None:
         futs: list[tuple[int, Future]] = []
-        pending_after_break: list[tuple[int, SweepCase]] = []
         for pos, (idx, case) in enumerate(indexed):
             if job.cancel.is_set():
-                case.status = "cancelled"
+                with job.lock:
+                    case.status = "cancelled"
                 continue
-            case.status = "running"
+            with job.lock:
+                case.status = "running"
             try:
                 fut = self._submit_one(job, frame, body, prices, inputs, idx, case)
             except BrokenProcessPool:
-                public_error("worker process crashed")
-                self.pool.recreate()
-                case.status = "failed"
-                case.error = "worker process crashed"
-                pending_after_break = indexed[pos + 1:]
+                logger.exception("worker process crashed")
+                with job.lock:
+                    case.status = "failed"
+                    case.error = "worker process crashed"
+                    for _later_idx, later in indexed[pos + 1:]:
+                        if later.status in ("pending", "running"):
+                            later.status = "failed"
+                            later.error = "worker process crashed"
                 break
             job.futures.append(fut)
             futs.append((idx, fut))
-        broken_at: Optional[int] = None
         for idx, fut in futs:
-            if broken_at is not None:
-                pending_after_break.append((idx, job.cases[idx]))
-                continue
-            try:
-                self._consume(job, idx, fut)
-            except BrokenProcessPool:
-                public_error("worker process crashed")
-                self.pool.recreate()
-                job.cases[idx].status = "failed"
-                job.cases[idx].error = "worker process crashed"
-                broken_at = idx
-        if pending_after_break and not job.cancel.is_set() and allow_retry:
-            self._submit_wait(job, frame, body, prices, inputs, pending_after_break, allow_retry=False)
+            self._consume(job, idx, fut)
         job.futures.clear()
 
     def _submit_one(self, job, frame, body, prices, inputs, idx: int, case: SweepCase) -> Future:
@@ -216,23 +214,56 @@ class SweepService:
 
     def _consume(self, job: SweepJob, idx: int, fut: Future) -> None:
         if fut.cancelled():
-            job.cases[idx].status = "cancelled"
+            with job.lock:
+                job.cases[idx].status = "cancelled"
             return
         try:
-            output = fut.result()
+            output = self._wait_result(job, fut)
         except CancelledError:
-            job.cases[idx].status = "cancelled"
+            with job.lock:
+                job.cases[idx].status = "cancelled"
             return
         except BrokenProcessPool:
-            raise
-        except Exception:
-            job.cases[idx].status = "failed"
-            job.cases[idx].error = public_error("simulation failed")
-            self._persist(job)
+            logger.exception("worker process crashed")
+            with job.lock:
+                job.cases[idx].status = "failed"
+                job.cases[idx].error = "worker process crashed"
+            self._persist_logged(job)
             return
-        job.hours[idx] = _apply(job.cases[idx], output)
-        _savings(job.cases, job.hours)
-        self._persist(job)
+        except Exception:
+            with job.lock:
+                job.cases[idx].status = "failed"
+                job.cases[idx].error = public_error("simulation failed")
+            self._persist_logged(job)
+            return
+        with job.lock:
+            job.hours[idx] = _apply(job.cases[idx], output)
+            _savings(job.cases, job.hours)
+            job.cases[idx].status = output.status
+        self._persist_logged(job)
+
+    def _wait_result(self, job: SweepJob, fut: Future):
+        while True:
+            if job.cancel.is_set():
+                fut.cancel()
+                raise CancelledError()
+            try:
+                return fut.result(timeout=0)
+            except TimeoutError:
+                if _executor_broken(self.pool):
+                    raise BrokenProcessPool("worker process crashed")
+            try:
+                return fut.result(timeout=_RESULT_POLL_S)
+            except TimeoutError:
+                continue
+
+    def _persist_logged(self, job: SweepJob) -> bool:
+        try:
+            self._persist(job)
+        except (sqlite3.Error, OSError):
+            logger.exception("sweep persist failed")
+            return False
+        return True
 
     def _prices(self, frame: pd.DataFrame, body: SweepRequest):
         if not any(_tariff_uses_pvpc(tariff_id) for tariff_id in body.tariffs):
@@ -244,19 +275,20 @@ class SweepService:
         return self.sim.pvpc_service.get_prices(*window, strict=False)
 
     def _finish(self, job: SweepJob) -> None:
-        self._fail_open(job, "sweep failed")
-        statuses = [case.status for case in job.cases]
-        if job.cancel.is_set() or (statuses and all(status == "cancelled" for status in statuses)):
-            job.status = "cancelled"
-        elif any(status == "cancelled" for status in statuses) and not any(status == "completed" for status in statuses):
-            job.status = "cancelled"
-        elif statuses and all(status == "failed" for status in statuses):
-            job.status = "failed"
-        else:
-            job.status = "completed"
+        with job.lock:
+            self._fail_open(job, "sweep failed")
+            statuses = [case.status for case in job.cases]
+            if job.cancel.is_set() or (statuses and all(status == "cancelled" for status in statuses)):
+                job.status = "cancelled"
+            elif any(status == "cancelled" for status in statuses) and not any(status == "completed" for status in statuses):
+                job.status = "cancelled"
+            elif statuses and all(status == "failed" for status in statuses):
+                job.status = "failed"
+            else:
+                job.status = "completed"
         job.futures.clear()
-        self._persist(job)
-        self._drop(job)
+        if self._persist_logged(job):
+            self._drop(job)
 
     def _fail_open(self, job: SweepJob, message: str) -> None:
         for case in job.cases:
@@ -277,19 +309,21 @@ class SweepService:
                 case.status = "cancelled"
 
     def _persist(self, job: SweepJob) -> None:
-        done = sum(case.status not in ("pending", "running") for case in job.cases)
-        self.history.upsert_sweep({
-            "sweep_id": job.sweep_id,
-            "label": job.label,
-            "created_at": job.created_at,
-            "status": job.status,
-            "date_start": job.date_start,
-            "date_end": job.date_end,
-            "done": done,
-            "total": len(job.cases),
-            "cases": [case.model_dump() for case in job.cases],
-            "request": job.request,
-        })
+        with job.lock:
+            cases = [case.model_copy() for case in job.cases]
+            record = {
+                "sweep_id": job.sweep_id,
+                "label": job.label,
+                "created_at": job.created_at,
+                "status": job.status,
+                "date_start": job.date_start,
+                "date_end": job.date_end,
+                "done": sum(case.status not in ("pending", "running") for case in cases),
+                "total": len(cases),
+                "cases": [case.model_dump() for case in cases],
+                "request": job.request,
+            }
+        self.history.upsert_sweep(record)
 
     @staticmethod
     def _validate(body: SweepRequest) -> None:
@@ -346,7 +380,6 @@ def _tariff_uses_pvpc(tariff_id: str) -> bool:
 
 
 def _apply(case: SweepCase, output) -> Optional[float]:
-    case.status = output.status
     case.error = output.error
     metrics = output.metrics or {}
     if output.status != "completed":
@@ -379,17 +412,24 @@ def _savings(cases: list[SweepCase], hours_by_index: dict[int, Optional[float]])
 
 
 def _detail(job: SweepJob) -> SweepDetail:
-    done = sum(case.status not in ("pending", "running") for case in job.cases)
+    with job.lock:
+        cases = [case.model_copy() for case in job.cases]
+        status = job.status
     return SweepDetail(
         sweep_id=job.sweep_id,
         label=job.label,
         created_at=job.created_at,
-        status=job.status,
+        status=status,
         date_range=DateRange(start=job.date_start, end=job.date_end),
-        done=done,
-        total=len(job.cases),
-        cases=job.cases,
+        done=sum(case.status not in ("pending", "running") for case in cases),
+        total=len(cases),
+        cases=cases,
     )
+
+
+def _executor_broken(pool) -> bool:
+    executor = getattr(pool, "executor", None)
+    return bool(getattr(executor, "_broken", False))
 
 
 def _list_item(job: SweepJob) -> SweepListItem:

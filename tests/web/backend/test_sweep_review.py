@@ -31,7 +31,7 @@ class _Future:
     def cancelled(self) -> bool:
         return self._cancelled
 
-    def result(self):
+    def result(self, timeout=None):
         if self._exc is not None:
             raise self._exc
         return self._output
@@ -274,3 +274,188 @@ def test_sweep_limit_route_is_422(tmp_path, monkeypatch):
         })
         assert denied.status_code == 422
         assert "200" in denied.json()["detail"]
+
+
+def test_persist_error_does_not_fail_cases_and_keeps_the_job(data, caplog):
+    import logging
+    import sqlite3
+
+    sweep, _pool = _service(data, lambda _fn, payload: _Future(output=_completed(payload.strategy_id)))
+    calls = {"n": 0}
+    real = sweep.history.upsert_sweep
+
+    def flaky(row):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(row)
+
+    sweep.history.upsert_sweep = flaky
+    body = SweepRequest(
+        date_range={"start": "2026-03-04", "end": "2026-03-05"},
+        strategies=["self_consume"], tariffs=["2_0td"], capacities_kwh=[10],
+    )
+    with caplog.at_level(logging.ERROR):
+        sweep_id, _total = sweep.start(body)
+        detail = _wait(sweep, sweep_id)
+    assert detail.status == "completed"
+    assert all(case.status == "completed" for case in detail.cases)
+    assert sweep_id in sweep.jobs
+    assert sweep.get(sweep_id).status == "completed"
+    assert any(rec.exc_info and "sweep persist failed" in rec.message for rec in caplog.records)
+    again, _total = sweep.start(body)
+    assert again != sweep_id
+
+
+def test_run_error_cancels_futures_and_keeps_job_when_persist_fails(data):
+    import sqlite3
+
+    hung = _Future(output=_completed())
+    sweep, _pool = _service(data, lambda *_a, **_k: hung)
+
+    def explode(job, *_args, **_kwargs):
+        job.futures.append(hung)
+        raise RuntimeError("boom")
+
+    sweep._submit_wait = explode
+    sweep.history.upsert_sweep = lambda _row: (_ for _ in ()).throw(sqlite3.OperationalError("full"))
+    body = SweepRequest(
+        date_range={"start": "2026-03-04", "end": "2026-03-05"},
+        strategies=["self_consume"], tariffs=["2_0td"], capacities_kwh=[10],
+    )
+    sweep_id, _total = sweep.start(body)
+    detail = _wait(sweep, sweep_id)
+    assert detail.status == "failed"
+    assert hung._cancelled
+    assert sweep.jobs[sweep_id].cancel.is_set()
+    assert sweep_id in sweep.jobs
+
+
+def test_detail_is_a_snapshot_and_status_follows_savings(data, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    torn = []
+    import web.backend.services.sweep_service as mod
+
+    real = mod._savings
+
+    def slow(cases, hours):
+        started.set()
+        assert release.wait(3)
+        real(cases, hours)
+
+    monkeypatch.setattr(mod, "_savings", slow)
+    gate = threading.Event()
+
+    def submit(_fn, payload):
+        gate.wait(2)
+        return _Future(output=_completed(payload.strategy_id))
+
+    sweep, _pool = _service(data, submit)
+    body = SweepRequest(
+        date_range={"start": "2026-03-04", "end": "2026-03-05"},
+        strategies=["self_consume"], tariffs=["2_0td"], capacities_kwh=[10],
+    )
+    sweep_id, _total = sweep.start(body)
+    deadline = time.time() + 2
+    while time.time() < deadline and sweep_id not in sweep.jobs:
+        time.sleep(0.01)
+    snap = sweep.get(sweep_id)
+    sweep.jobs[sweep_id].cases[0].status = "tampered"
+    assert snap.cases[0].status != "tampered"
+    sweep.jobs[sweep_id].cases[0].status = "pending"
+    gate.set()
+    assert started.wait(3)
+
+    def reader():
+        while not release.is_set():
+            detail = sweep.get(sweep_id)
+            for case in detail.cases:
+                if case.status == "completed" and case.savings_vs_baseline is None:
+                    torn.append(case.strategy_id)
+        detail = sweep.get(sweep_id)
+        for case in detail.cases:
+            if case.status == "completed" and case.savings_vs_baseline is None:
+                torn.append(case.strategy_id)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    time.sleep(0.05)
+    release.set()
+    thread.join(3)
+    assert not thread.is_alive()
+    assert torn == []
+    detail = _wait(sweep, sweep_id)
+    assert all(
+        case.savings_vs_baseline is not None
+        for case in detail.cases
+        if case.status == "completed"
+    )
+
+
+def test_broken_pool_fails_that_case_and_releases_the_sweep(data):
+    from concurrent.futures.process import BrokenProcessPool
+
+    class _Crash:
+        def __init__(self):
+            self._cancelled = False
+
+        def cancel(self) -> bool:
+            self._cancelled = True
+            return True
+
+        def cancelled(self) -> bool:
+            return self._cancelled
+
+        def result(self, timeout=None):
+            if timeout is None:
+                threading.Event().wait(30)
+                raise AssertionError("result() blocked without a timeout")
+            raise BrokenProcessPool("worker died")
+
+    def submit(_fn, payload):
+        if payload.strategy_id == "self_consume":
+            return _Crash()
+        return _Future(output=_completed(payload.strategy_id))
+
+    sweep, _pool = _service(data, submit)
+    body = SweepRequest(
+        date_range={"start": "2026-03-04", "end": "2026-03-05"},
+        strategies=["self_consume"], tariffs=["2_0td"], capacities_kwh=[10],
+    )
+    sweep_id, _total = sweep.start(body)
+    detail = _wait(sweep, sweep_id)
+    by_id = {case.strategy_id: case for case in detail.cases}
+    assert by_id["self_consume"].status == "failed"
+    assert by_id["self_consume"].error == "worker process crashed"
+    assert by_id["no_battery"].status == "completed"
+    assert detail.status == "completed"
+    assert sweep_id not in sweep.jobs
+    again, _total = sweep.start(body)
+    assert again != sweep_id
+
+
+def test_stuck_future_on_a_broken_pool_still_finishes(data):
+    class _Stuck:
+        def cancel(self) -> bool:
+            return False
+
+        def cancelled(self) -> bool:
+            return False
+
+        def result(self, timeout=None):
+            if timeout is None:
+                threading.Event().wait(30)
+            raise TimeoutError()
+
+    sweep, pool = _service(data, lambda *_a, **_k: _Stuck())
+    pool._broken = True
+    body = SweepRequest(
+        date_range={"start": "2026-03-04", "end": "2026-03-05"},
+        strategies=["self_consume"], tariffs=["2_0td"], capacities_kwh=[10],
+    )
+    sweep_id, _total = sweep.start(body)
+    detail = _wait(sweep, sweep_id)
+    assert detail.status == "failed"
+    assert all(case.error == "worker process crashed" for case in detail.cases)
+    assert sweep_id not in sweep.jobs
