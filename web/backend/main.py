@@ -49,7 +49,16 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     yield
 
     # --- shutdown ---
-    sim_service._executor.shutdown(wait=False)
+    for run in list(sim_service.runs.values()):
+        run.cancel.set()
+        for fut in list(run.futures.values()):
+            fut.cancel()
+    if sweep_service is not None:
+        for job in list(sweep_service.jobs.values()):
+            job.cancel.set()
+            for fut in list(job.futures):
+                fut.cancel()
+    sim_service._executor.shutdown(wait=False, cancel_futures=True)
     if pool is not None:
         try:
             if sim_service._progress_q is not None:

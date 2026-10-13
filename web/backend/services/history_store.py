@@ -58,10 +58,51 @@ class HistoryStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._closed = False
+        self.fail_interrupted()
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
+
+    def fail_interrupted(self) -> None:
+        """A previous process died mid-run. Those rows must not poll forever."""
+        message = "interrupted by restart"
+        with self._lock:
+            if self._closed:
+                return
+            run_rows = self._conn.execute(
+                "SELECT run_id, strategies_json FROM runs WHERE status = 'running'",
+            ).fetchall()
+            for row in run_rows:
+                strategies = json.loads(row["strategies_json"])
+                for item in strategies:
+                    if item.get("status") in ("pending", "running"):
+                        item["status"] = "failed"
+                        item["error"] = message
+                self._conn.execute(
+                    "UPDATE runs SET status = 'failed', strategies_json = ? WHERE run_id = ?",
+                    (json.dumps(strategies), row["run_id"]),
+                )
+            sweep_rows = self._conn.execute(
+                "SELECT sweep_id, cases_json FROM sweeps WHERE status = 'running'",
+            ).fetchall()
+            for row in sweep_rows:
+                cases = json.loads(row["cases_json"])
+                for case in cases:
+                    if case.get("status") in ("pending", "running"):
+                        case["status"] = "failed"
+                        case["error"] = message
+                done = sum(case.get("status") not in ("pending", "running") for case in cases)
+                self._conn.execute(
+                    "UPDATE sweeps SET status = 'failed', done = ?, cases_json = ? WHERE sweep_id = ?",
+                    (done, json.dumps(cases), row["sweep_id"]),
+                )
+            if run_rows or sweep_rows:
+                self._conn.commit()
 
     def upsert_run(
         self,
@@ -75,6 +116,8 @@ class HistoryStore:
         strategies: list[dict[str, Any]],
     ) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._conn.execute(
                 """
                 INSERT INTO runs (run_id, label, created_at, status, date_start, date_end,
@@ -108,12 +151,16 @@ class HistoryStore:
 
     def delete_run(self, run_id: str) -> bool:
         with self._lock:
+            if self._closed:
+                return False
             cur = self._conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
             self._conn.commit()
         return cur.rowcount > 0
 
     def upsert_sweep(self, record: dict[str, Any]) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._conn.execute(
                 """
                 INSERT INTO sweeps (sweep_id, label, created_at, status, date_start, date_end,
