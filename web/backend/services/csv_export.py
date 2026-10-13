@@ -64,17 +64,32 @@ def monthly_csv(strategies: list[dict]) -> Iterator[str]:
     return _rows(header, records)
 
 
+_CHUNK = 2048
+
+
 def timeseries_csv(ts: dict[str, np.ndarray], capacity_kwh: float) -> Iterator[str]:
     ts_ms = np.asarray(ts["ts"], dtype=np.int64)
-    stamps = pd.to_datetime(ts_ms, unit="ms", utc=True).tz_convert("Europe/Madrid")
     header = ["ts", "soc_pct", *[name for name, _ in _TS_COLUMNS]]
     level = np.asarray(ts["battery_level_kwh"], dtype=float)
     soc = level / capacity_kwh * 100.0 if capacity_kwh else np.full(len(level), np.nan)
-    columns = [soc] + [np.asarray(ts[key], dtype=float) for _, key in _TS_COLUMNS]
-    records = []
-    for i, stamp in enumerate(stamps):
-        records.append([stamp.isoformat(), *[_cell(col[i]) for col in columns]])
-    return _rows(header, records)
+    columns = [soc, *[np.asarray(ts[key], dtype=float) for _, key in _TS_COLUMNS]]
+
+    def _chunks() -> Iterator[str]:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(header)
+        yield buf.getvalue()
+        n = len(ts_ms)
+        for start in range(0, n, _CHUNK):
+            end = min(n, start + _CHUNK)
+            stamps = pd.to_datetime(ts_ms[start:end], unit="ms", utc=True).tz_convert("Europe/Madrid")
+            buf.seek(0)
+            buf.truncate()
+            for offset, stamp in enumerate(stamps):
+                writer.writerow([stamp.isoformat(), *[_cell(col[start + offset]) for col in columns]])
+            yield buf.getvalue()
+
+    return _chunks()
 
 
 def sweep_csv(cases: list[dict]) -> Iterator[str]:
