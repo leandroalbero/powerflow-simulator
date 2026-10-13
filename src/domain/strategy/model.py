@@ -8,7 +8,7 @@ into physically consistent flows against the actual solar/load.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, cast
 
 from src.domain.battery.models import Battery
 from src.domain.grid.model import Grid
@@ -200,7 +200,7 @@ class BaseRateAwareStrategy(BaseEnergyStrategy):
         return self.tariff.day_rate_blocks(d or self._local_date())
 
     def _current_index(self, blocks: List[RateBlock]) -> int:
-        hour = local_date_hour(self.now)[1]
+        hour = local_date_hour(cast(datetime, self.now))[1]
         for i, block in enumerate(blocks):
             if block["start"] <= hour < block["end"]:
                 return i
@@ -218,7 +218,7 @@ class BaseRateAwareStrategy(BaseEnergyStrategy):
         return blocks[i]
 
     def _current_rate(self) -> Rate:
-        return self.tariff.rate_at(self.now, EnergyDirection.IMPORT)
+        return self.tariff.rate_at(cast(datetime, self.now), EnergyDirection.IMPORT)
 
     def _is_type(self, rate_type: RateType) -> bool:
         return self._current_rate().rate_type == rate_type
@@ -267,7 +267,7 @@ class ForceChargeAtValleyStrategy(BaseRateAwareStrategy):
             return False
         blocks = self._blocks()
         current = blocks[self._current_index(blocks)]
-        hour = local_date_hour(self.now)[1]
+        hour = local_date_hour(cast(datetime, self.now))[1]
         nxt = self._neighbour_block(1)["rate"]
         return (hour == current["end"] - 1
                 and nxt.rate_type == RateType.PEAK

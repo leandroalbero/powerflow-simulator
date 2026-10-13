@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linprog  # type: ignore[import-untyped]
 from scipy.sparse import csr_matrix, diags, hstack, vstack  # type: ignore[import-untyped]
-from scipy.sparse import eye as speye  # type: ignore[import-untyped]
+from scipy.sparse import eye as speye
 
 from src.domain.battery.models import Battery
 from src.domain.energy_simulator.models import price_arrays
@@ -251,7 +251,7 @@ class OracleStrategy(BaseEnergyStrategy):
     ):
         super().__init__(battery, grid, tariff, min_battery_level, max_charge_power)
         self._on_chunk = on_chunk
-        import_price, export_price = price_arrays(tariff, frame.index)
+        import_price, export_price = price_arrays(tariff, pd.DatetimeIndex(frame.index))
         valid = frame["valid"].to_numpy(dtype=bool)
         mean_import = float(import_price[valid].mean()) if valid.any() else 0.0
         # Same valuation of stored energy as the simulator's adjusted_cost, so the plan neither dumps nor hoards.

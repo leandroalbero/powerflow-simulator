@@ -8,7 +8,7 @@ NaN so charts show the gap.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -55,7 +55,7 @@ def run(frame: pd.DataFrame, strategy: BaseEnergyStrategy, tariff: Any,
         on_progress: Optional[ProgressFn] = None) -> SimResult:
     """Simulate ``strategy`` over ``frame`` (fixed 1-minute grid) and settle costs against ``tariff``."""
     n = len(frame)
-    index = frame.index
+    index = cast(pd.DatetimeIndex, frame.index)
     pv = frame["pv_kw"].to_numpy(dtype=float)
     load = frame["load_kw"].to_numpy(dtype=float)
     valid = frame["valid"].to_numpy(dtype=bool)
@@ -109,8 +109,11 @@ def run(frame: pd.DataFrame, strategy: BaseEnergyStrategy, tariff: Any,
     return SimResult(metrics=metrics, timeseries=timeseries)
 
 
-def _metrics(frame, strategy, valid, pv, load, imp_price, exp_price, imp, exp, ch, dis, gc, curt,
-             unserved, over, direct, step_cost, initial_kwh) -> Dict[str, Any]:
+def _metrics(frame: pd.DataFrame, strategy: BaseEnergyStrategy, valid: np.ndarray, pv: np.ndarray,
+             load: np.ndarray, imp_price: np.ndarray, exp_price: np.ndarray, imp: np.ndarray,
+             exp: np.ndarray, ch: np.ndarray, dis: np.ndarray, gc: np.ndarray, curt: np.ndarray,
+             unserved: np.ndarray, over: np.ndarray, direct: np.ndarray, step_cost: np.ndarray,
+             initial_kwh: float) -> Dict[str, Any]:
     battery = strategy.battery
     s = lambda a: float(np.nansum(a))  # noqa: E731
     solar_kwh = float(pv[valid].sum()) * DT_H
@@ -162,11 +165,14 @@ def _metrics(frame, strategy, valid, pv, load, imp_price, exp_price, imp, exp, c
     }
     if "ev_kw" in frame.columns:
         m["ev_kwh"] = float(frame["ev_kw"].to_numpy(dtype=float)[valid].sum()) * DT_H
-    m["monthly"] = _monthly(frame.index, valid, pv, load, imp, exp, dis, imp_price, exp_price)
+    m["monthly"] = _monthly(cast(pd.DatetimeIndex, frame.index), valid, pv, load, imp, exp, dis,
+                            imp_price, exp_price)
     return {k: (round(v, 6) if isinstance(v, float) else v) for k, v in m.items()}
 
 
-def _monthly(index, valid, pv, load, imp, exp, dis, imp_price, exp_price) -> List[Dict[str, Any]]:
+def _monthly(index: pd.DatetimeIndex, valid: np.ndarray, pv: np.ndarray, load: np.ndarray,
+             imp: np.ndarray, exp: np.ndarray, dis: np.ndarray, imp_price: np.ndarray,
+             exp_price: np.ndarray) -> List[Dict[str, Any]]:
     if len(index) == 0:
         return []
     df = pd.DataFrame({
