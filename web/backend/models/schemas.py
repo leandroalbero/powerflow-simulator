@@ -123,7 +123,7 @@ class SimulationRequest(BaseModel):
     date_range: Optional[DateRange] = None
     config: Optional[SystemConfig] = Field(
         None, description="Configuration for this run; defaults to the server's current config")
-    label: Optional[str] = None
+    label: Optional[str] = Field(None, max_length=120)
 
 
 class SimulationStartResponse(BaseModel):
