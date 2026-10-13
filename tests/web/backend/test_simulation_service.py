@@ -125,7 +125,8 @@ class TestRuns:
             run = _wait(sim, sim.start_run(["dqn_agent", "self_consume"], "2026-03-04", "2026-03-04"))
         assert run.status == "completed"
         assert run.strategies["dqn_agent"].status == "failed"
-        assert "DQN policy not trained" in run.strategies["dqn_agent"].error
+        assert run.strategies["dqn_agent"].error == "simulation failed"
+        assert "DQN policy not trained" in caplog.text
         assert any(r.exc_info for r in caplog.records)
 
     def test_timeseries_api_is_json_safe_and_shows_gap(self, data):
