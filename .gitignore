@@ -60,3 +60,6 @@ web/frontend/vite.config.ts.timestamp-*
 
 # simulation run history (sqlite)
 data/runs.db*
+
+# legacy sensor CSVs (local fallback only; fetch parquet with make fetch-data)
+data/*.csv
