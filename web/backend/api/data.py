@@ -51,10 +51,11 @@ def reload_data(request: Request) -> DataInfo:
 
 
 @router.post("/data/refresh", status_code=202, response_model=RefreshStartResponse)
-def start_refresh(body: RefreshRequest, request: Request) -> JSONResponse:
+def start_refresh(request: Request, body: RefreshRequest | None = None) -> JSONResponse:
     registry = request.app.state.refresh_registry
+    full = False if body is None else body.full
     try:
-        job_id = registry.start(body.full)
+        job_id = registry.start(full)
     except MissingCredentialError:
         raise HTTPException(status_code=503, detail="INFLUX_* not configured") from None
     except RuntimeError as exc:

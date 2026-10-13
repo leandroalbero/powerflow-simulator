@@ -4,7 +4,8 @@ import logging
 import threading
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,6 +43,7 @@ from web.backend.models.schemas import (
     SystemConfig,
 )
 from web.backend.services.cancel import RunCancelled
+from web.backend.services.client_errors import public_error
 from web.backend.services.data_service import DataService
 from web.backend.services.history_store import HistoryStore, config_digest
 from web.backend.services.pvpc_service import PvpcService
@@ -208,6 +210,7 @@ class SimulationRun:
     label: Optional[str] = None
     created_at: str = ""
     cancel: Event = field(default_factory=Event)
+    futures: Dict[str, Any] = field(default_factory=dict)
 
 
 # Progress callback type: (strategy_id, percent 0-100)
@@ -246,6 +249,17 @@ def _end_of_tomorrow(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
     return pd.Timestamp(day).tz_localize("Europe/Madrid") - pd.Timedelta(hours=1)
 
 
+class RunStillActive(Exception):
+    def __init__(self) -> None:
+        super().__init__("run still active, cancel first")
+
+
+def _run_active(run: SimulationRun) -> bool:
+    if run.status == "running":
+        return True
+    return any(result.status in ("pending", "running") for result in run.strategies.values())
+
+
 class SimulationService:
     """Manages simulation runs in background threads."""
 
@@ -258,6 +272,7 @@ class SimulationService:
         self.pvpc_service = pvpc_service or PvpcService()
         self.config = SystemConfig()
         self.runs: Dict[str, SimulationRun] = {}
+        self._registry_lock = Lock()
         self._executor = ThreadPoolExecutor(max_workers=4)
         self.history = HistoryStore()
         self._ts_order: OrderedDict[str, None] = OrderedDict()
@@ -338,7 +353,14 @@ class SimulationService:
         gc = (config or self.config).grid
         return Grid(max_import=gc.max_import, max_export=gc.max_export)
 
-    def _build_strategy(self, strategy_id: str, config: SystemConfig, inputs: RunInputs, tariff: PowerTariff):
+    def _build_strategy(
+        self,
+        strategy_id: str,
+        config: SystemConfig,
+        inputs: RunInputs,
+        tariff: PowerTariff,
+        on_chunk: Optional[Callable[[], None]] = None,
+    ):
         battery = self._build_battery(config)
         grid = self._build_grid(config)
         sc = config.strategy
@@ -350,8 +372,10 @@ class SimulationService:
                 cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh, **common,
             )
         if strategy_id == "oracle":
-            return OracleStrategy(battery, grid, tariff, inputs.frame,
-                                  cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh, **common)
+            return OracleStrategy(
+                battery, grid, tariff, inputs.frame,
+                cycle_cost_eur_kwh=config.battery.cycle_cost_eur_kwh, on_chunk=on_chunk, **common,
+            )
         if strategy_id == "dqn_agent":
             from src.domain.strategy.dqn_strategy import load_dqn_strategy
 
@@ -436,23 +460,14 @@ class SimulationService:
             run.cancel = self.pool.manager.Event()
         for sid in strategy_ids:
             run.strategies[sid] = StrategyRunResult(strategy_id=sid)
-        self.runs[run_id] = run
+        with self._registry_lock:
+            self.runs[run_id] = run
 
-        inputs = RunInputs(frame=frame)
         try:
-            if any(s in MPC_VARIANTS for s in strategy_ids):
-                inputs.history = self._history_frame(frame, config_snapshot.exclude_ev)
-            if "forecast_charge" in strategy_ids:
-                inputs.daily_forecasts = load_daily_forecasts()
-            if any(MPC_VARIANTS[s].solar != "perfect" for s in strategy_ids if s in MPC_VARIANTS):
-                inputs.ghi = HourlyGhi(load_irradiance())
-            if config_snapshot.tariff.use_pvpc:
-                window = self._pvpc_window(frame, config_snapshot)
-                if window is not None:
-                    inputs.pvpc_prices = self.pvpc_service.get_prices(*window, strict=False)
-        except Exception as exc:
-            logger.exception("Preparing run %s failed", run_id)
-            self._fail_run(run, strategy_ids, f"{type(exc).__name__}: {exc}", on_strategy_done, on_run_done)
+            inputs = self.prepare_inputs(frame, strategy_ids, config_snapshot)
+        except Exception:
+            public_error("simulation failed")
+            self._fail_run(run, strategy_ids, "simulation failed", on_strategy_done, on_run_done)
             return run_id
 
         if self.pool is not None:
@@ -460,11 +475,34 @@ class SimulationService:
                 self._submit_pooled(run, sid, inputs, config_snapshot, strategy_ids)
         else:
             for sid in strategy_ids:
-                self._executor.submit(
+                fut = self._executor.submit(
                     self._run_strategy, run, sid, inputs, config_snapshot,
                     on_progress, on_strategy_done, on_run_done, strategy_ids,
                 )
+                run.futures[sid] = fut
         return run_id
+
+    def prepare_inputs(
+        self,
+        frame: pd.DataFrame,
+        strategy_ids: List[str],
+        config: SystemConfig,
+        *,
+        load_pvpc: bool = True,
+    ) -> RunInputs:
+        """History, irradiance and forecasts shared by /simulate, sweep and backtest."""
+        inputs = RunInputs(frame=frame)
+        if any(sid in MPC_VARIANTS for sid in strategy_ids):
+            inputs.history = self._history_frame(frame, config.exclude_ev)
+        if "forecast_charge" in strategy_ids:
+            inputs.daily_forecasts = load_daily_forecasts()
+        if any(MPC_VARIANTS[sid].solar != "perfect" for sid in strategy_ids if sid in MPC_VARIANTS):
+            inputs.ghi = HourlyGhi(load_irradiance())
+        if load_pvpc and config.tariff.use_pvpc:
+            window = self._pvpc_window(frame, config)
+            if window is not None:
+                inputs.pvpc_prices = self.pvpc_service.get_prices(*window, strict=False)
+        return inputs
 
     def attach_pool(self, pool) -> None:
         """Use the process pool created on the main thread. Progress comes back on a manager queue."""
@@ -490,7 +528,14 @@ class SimulationService:
                        config: SystemConfig, all_strategy_ids: List[str]) -> None:
         from web.backend.services.sim_worker import CasePayload, execute_case
 
-        run.strategies[strategy_id].status = "running"
+        result = run.strategies[strategy_id]
+        with run.lock:
+            if run.cancel.is_set() or result.status in _TERMINAL:
+                if result.status not in _TERMINAL:
+                    result.status = "cancelled"
+                self._finish_if_done(run, all_strategy_ids)
+                return
+            result.status = "running"
         payload = CasePayload(
             frame=inputs.frame,
             strategy_id=strategy_id,
@@ -501,24 +546,50 @@ class SimulationService:
             cancel=run.cancel,
             progress=self._progress_q,
             job_id=run.run_id,
+            ghi=inputs.ghi,
         )
-        fut = self.pool.executor.submit(execute_case, payload)
+        try:
+            fut = self.pool.executor.submit(execute_case, payload)
+        except BrokenProcessPool:
+            public_error("worker process crashed")
+            self._recreate_pool()
+            with run.lock:
+                if result.status not in _TERMINAL:
+                    result.status = "failed"
+                    result.error = "worker process crashed"
+                self._finish_if_done(run, all_strategy_ids)
+            return
+        run.futures[strategy_id] = fut
 
         def _done(future) -> None:
             self._apply_output(run, strategy_id, future, all_strategy_ids)
 
         fut.add_done_callback(_done)
 
+    def _recreate_pool(self) -> None:
+        pool = self.pool
+        if pool is not None:
+            pool.recreate()
+
     def _apply_output(self, run: SimulationRun, strategy_id: str, future, all_strategy_ids: List[str]) -> None:
         result = run.strategies[strategy_id]
         try:
             output = future.result()
-        except Exception as exc:  # noqa: BLE001 — pool boundary
-            output_status, error, metrics, timeseries = "failed", str(exc), None, None
+        except CancelledError:
+            output_status, error, metrics, timeseries = "cancelled", None, None, None
+        except BrokenProcessPool:
+            public_error("worker process crashed")
+            self._recreate_pool()
+            output_status, error, metrics, timeseries = "failed", "worker process crashed", None, None
+        except Exception:  # noqa: BLE001 — pool boundary
+            output_status, error, metrics, timeseries = "failed", public_error("simulation failed"), None, None
         else:
             output_status, error = output.status, output.error
             metrics, timeseries = output.metrics, output.timeseries
         with run.lock:
+            if result.status in _TERMINAL:
+                self._finish_if_done(run, all_strategy_ids)
+                return
             result.status = output_status
             result.error = error
             result.metrics = metrics
@@ -568,11 +639,26 @@ class SimulationService:
         all_strategy_ids: List[str],
     ) -> None:
         result = run.strategies[strategy_id]
-        result.status = "running"
+        with run.lock:
+            if result.status in _TERMINAL or run.cancel.is_set():
+                if result.status not in _TERMINAL:
+                    result.status = "cancelled"
+                skipped = True
+            else:
+                result.status = "running"
+                skipped = False
+        if skipped:
+            self._finish_thread(run, all_strategy_ids, on_run_done)
+            return
 
         try:
             tariff = self._build_tariff(config, prices=inputs.pvpc_prices)
-            strategy = self._build_strategy(strategy_id, config, inputs, tariff)
+
+            def on_chunk() -> None:
+                if run.cancel.is_set():
+                    raise RunCancelled()
+
+            strategy = self._build_strategy(strategy_id, config, inputs, tariff, on_chunk=on_chunk)
 
             def progress(pct: int) -> None:
                 if run.cancel.is_set():
@@ -584,12 +670,18 @@ class SimulationService:
             sim = simulate(inputs.frame, strategy, tariff, on_progress=progress)
 
             with run.lock:
-                result.status = "completed"
-                result.metrics = sim.metrics
-                result.timeseries = sim.timeseries
+                if result.status in _TERMINAL or run.cancel.is_set():
+                    if result.status not in _TERMINAL:
+                        result.status = "cancelled"
+                    finished = "cancelled"
+                else:
+                    result.status = "completed"
+                    result.metrics = sim.metrics
+                    result.timeseries = sim.timeseries
+                    finished = "completed"
 
             if on_strategy_done is not None:
-                on_strategy_done(strategy_id, "completed", sim.metrics)
+                on_strategy_done(strategy_id, finished, sim.metrics if finished == "completed" else None)
 
         except RunCancelled:
             with run.lock:
@@ -597,16 +689,26 @@ class SimulationService:
                 result.error = None
             if on_strategy_done is not None:
                 on_strategy_done(strategy_id, "cancelled", None)
-        except Exception as e:
-            logger.exception("Strategy %s failed in run %s", strategy_id, run.run_id)
+        except Exception:
+            failed = False
             with run.lock:
-                result.status = "failed"
-                result.error = str(e) or type(e).__name__
+                if result.status not in _TERMINAL:
+                    result.status = "failed"
+                    result.error = "simulation failed"
+                    failed = True
+            if failed:
+                public_error("simulation failed")
+                if on_strategy_done is not None:
+                    on_strategy_done(strategy_id, "failed", None)
 
-            if on_strategy_done is not None:
-                on_strategy_done(strategy_id, "failed", None)
+        self._finish_thread(run, all_strategy_ids, on_run_done)
 
-        # Check if all strategies finished (only first thread fires callback)
+    def _finish_thread(
+        self,
+        run: SimulationRun,
+        all_strategy_ids: List[str],
+        on_run_done: Optional[RunDoneCallback],
+    ) -> None:
         should_fire_done = False
         with run.lock:
             all_done = all(run.strategies[sid].status in _TERMINAL for sid in all_strategy_ids)
@@ -649,13 +751,18 @@ class SimulationService:
                 return "ok", result.timeseries
             if result.status in ("pending", "running"):
                 return "not_ready", None
-            return "evicted", None
+            if result.status == "completed":
+                return "evicted", None
+            return "missing", None
         row = self.history.get_run(run_id)
         if row is None:
             return "missing", None
-        if strategy_id not in {item["strategy_id"] for item in row["strategies"]}:
+        match = next((item for item in row["strategies"] if item["strategy_id"] == strategy_id), None)
+        if match is None:
             return "missing", None
-        return "evicted", None
+        if match.get("status") == "completed":
+            return "evicted", None
+        return "missing", None
 
     def cancel_run(self, run_id: str) -> Optional[str]:
         run = self.runs.get(run_id)
@@ -663,30 +770,40 @@ class SimulationService:
             row = self.history.get_run(run_id)
             return None if row is None else row["status"]
         run.cancel.set()
+        for fut in list(run.futures.values()):
+            fut.cancel()
         with run.lock:
-            for result in run.strategies.values():
-                if result.status == "pending":
+            for sid, result in run.strategies.items():
+                fut = run.futures.get(sid)
+                queued = fut is None or fut.cancelled()
+                if result.status in ("pending", "running") and queued:
                     result.status = "cancelled"
-            if all(result.status in _TERMINAL for result in run.strategies.values()):
-                run.status = "cancelled" if any(
-                    result.status == "cancelled" for result in run.strategies.values()
-                ) else run.status
-                self._persist_run(run)
+            self._finish_if_done(run, list(run.strategies))
         return run.status
 
     def delete_run(self, run_id: str) -> bool:
-        removed = self.history.delete_run(run_id)
-        if run_id in self.runs:
-            del self.runs[run_id]
-            self._ts_order.pop(run_id, None)
-            removed = True
-        return removed
+        with self._registry_lock:
+            run = self.runs.get(run_id)
+            if run is not None and _run_active(run):
+                raise RunStillActive()
+            if run is None:
+                row = self.history.get_run(run_id)
+                if row is not None and row["status"] == "running":
+                    raise RunStillActive()
+            removed = self.history.delete_run(run_id)
+            if run_id in self.runs:
+                del self.runs[run_id]
+                self._ts_order.pop(run_id, None)
+                removed = True
+            return removed
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}
         for row in self.history.list_runs(limit):
             merged[row["run_id"]] = _public_run(row)
-        for run in self.runs.values():
+        with self._registry_lock:
+            runs = list(self.runs.values())
+        for run in runs:
             merged[run.run_id] = _public_run_memory(run)
         items = sorted(merged.values(), key=lambda item: item["created_at"], reverse=True)
         return items[:limit]

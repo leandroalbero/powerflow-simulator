@@ -7,6 +7,7 @@ import pandas as pd
 
 from web.backend.models.schemas import SystemConfig
 from web.backend.services.cancel import RunCancelled
+from web.backend.services.client_errors import public_error
 
 
 @dataclass
@@ -20,6 +21,8 @@ class CasePayload:
     cancel: Any = None
     progress: Any = None
     job_id: str = ""
+    metrics_only: bool = False
+    ghi: Any = None
 
 
 @dataclass
@@ -34,18 +37,28 @@ class CaseOutput:
 
 def execute_case(payload: CasePayload) -> CaseOutput:
     """Rebuild the strategy inside the worker and run it. Cancel is cooperative."""
+    if payload.cancel is not None and payload.cancel.is_set():
+        return CaseOutput(payload.job_id, payload.strategy_id, "cancelled")
     from web.backend.services.simulation_service import MPC_VARIANTS, RunInputs, SimulationService
 
     svc = SimulationService.__new__(SimulationService)
     inputs = RunInputs(frame=payload.frame, history=payload.history, daily_forecasts=payload.daily_forecasts)
-    if payload.strategy_id in MPC_VARIANTS and MPC_VARIANTS[payload.strategy_id].solar != "perfect":
-        from src.domain.strategy.irradiance import HourlyGhi, load_irradiance
-
-        inputs.ghi = HourlyGhi(load_irradiance())
     try:
+        if payload.strategy_id in MPC_VARIANTS and MPC_VARIANTS[payload.strategy_id].solar != "perfect":
+            if payload.ghi is not None:
+                inputs.ghi = payload.ghi
+            else:
+                from src.domain.strategy.irradiance import HourlyGhi, load_irradiance
+
+                inputs.ghi = HourlyGhi(load_irradiance())
         tariff = SimulationService._build_tariff(svc, payload.config, prices=payload.pvpc_prices)
+
+        def on_chunk() -> None:
+            if payload.cancel is not None and payload.cancel.is_set():
+                raise RunCancelled()
+
         strategy = SimulationService._build_strategy(
-            svc, payload.strategy_id, payload.config, inputs, tariff,
+            svc, payload.strategy_id, payload.config, inputs, tariff, on_chunk=on_chunk,
         )
 
         def progress(pct: int) -> None:
@@ -59,12 +72,14 @@ def execute_case(payload: CasePayload) -> CaseOutput:
         sim = simulate(payload.frame, strategy, tariff, on_progress=progress)
     except RunCancelled:
         return CaseOutput(payload.job_id, payload.strategy_id, "cancelled")
-    except Exception as exc:  # noqa: BLE001 — worker boundary; solvers raise varied errors
-        return CaseOutput(payload.job_id, payload.strategy_id, "failed", error=str(exc) or type(exc).__name__)
+    except Exception:  # noqa: BLE001 — worker boundary; solvers raise varied errors
+        return CaseOutput(
+            payload.job_id, payload.strategy_id, "failed", error=public_error("simulation failed"),
+        )
     return CaseOutput(
         payload.job_id,
         payload.strategy_id,
         "completed",
         metrics=sim.metrics,
-        timeseries=sim.timeseries,
+        timeseries=None if payload.metrics_only else sim.timeseries,
     )

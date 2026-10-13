@@ -7,7 +7,7 @@ like every other strategy's.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -247,8 +247,10 @@ class OracleStrategy(BaseEnergyStrategy):
         cycle_cost_eur_kwh: float = 0.0,
         chunk_days: int = 31,
         overlap_days: int = 3,
+        on_chunk: Optional[Callable[[], None]] = None,
     ):
         super().__init__(battery, grid, tariff, min_battery_level, max_charge_power)
+        self._on_chunk = on_chunk
         import_price, export_price = price_arrays(tariff, frame.index)
         valid = frame["valid"].to_numpy(dtype=bool)
         mean_import = float(import_price[valid].mean()) if valid.any() else 0.0
@@ -268,6 +270,8 @@ class OracleStrategy(BaseEnergyStrategy):
         cost = 0.0
         a = 0
         while a < n:
+            if self._on_chunk is not None:
+                self._on_chunk()
             end = min(n, a + chunk)
             stop = n if n - end < per_day else min(n, end + overlap)
             if stop == n:

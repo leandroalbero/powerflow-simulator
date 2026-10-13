@@ -5,6 +5,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from web.backend.models.feature_schemas import RunListItem
 from web.backend.services.csv_export import monthly_csv, summary_csv, timeseries_csv
+from web.backend.services.simulation_service import RunStillActive
 
 router = APIRouter(prefix="/api", tags=["runs"])
 
@@ -20,7 +21,11 @@ def list_runs(request: Request, limit: int = Query(50, ge=1, le=500)) -> list[Ru
 @router.delete("/runs/{run_id}", status_code=204)
 def delete_run(run_id: str, request: Request) -> Response:
     sim = request.app.state.sim_service
-    if not sim.delete_run(run_id):
+    try:
+        removed = sim.delete_run(run_id)
+    except RunStillActive as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not removed:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return Response(status_code=204)
 

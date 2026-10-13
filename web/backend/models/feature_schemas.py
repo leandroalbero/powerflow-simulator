@@ -84,7 +84,7 @@ class SweepRequest(BaseModel):
     capacities_kwh: List[float] = Field(min_length=1)
     hardware: str = "current"
     exclude_ev: bool = False
-    label: Optional[str] = None
+    label: Optional[str] = Field(None, max_length=120)
 
 
 class SweepStartResponse(BaseModel):
