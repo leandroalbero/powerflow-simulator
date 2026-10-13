@@ -11,6 +11,7 @@ from tests.synthetic import synthetic_frame
 from tests.web.backend.test_features import _csv
 from web.backend.api.backtest import post_backtest
 from web.backend.models.schemas import SystemConfig
+from web.backend.services import backtest_service as backtest_mod
 from web.backend.services.backtest_service import run_backtest
 from web.backend.services.data_service import DataService
 from web.backend.services.simulation_service import RunInputs, SimulationService
@@ -112,3 +113,33 @@ def test_backtest_uses_pvpc_when_config_does(tmp_path, monkeypatch):
     sim.pvpc_service.get_prices = prices
     run_backtest(sim, "2026-03-04", "2026-03-04", "self_consume", "current")
     assert seen.get("called") is True
+
+
+def test_prepare_inputs_includes_ev_even_when_server_config_excludes_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("POWERFLOW_DATA_DIR", str(tmp_path))
+    frame = synthetic_frame(days=1, outage=False, spike=False)
+    frame["grid_kw"] = 0.0
+    frame["soc_pct"] = 50.0
+    data = DataService()
+    monkeypatch.setattr(data, "get_frame", lambda *_args, **_kwargs: frame)
+    sim = SimulationService(data)
+    sim.config = sim.config.model_copy(update={"exclude_ev": True})
+    seen = {}
+    real_prepare = sim.prepare_inputs
+
+    def prepare(frame, strategy_ids, config, load_pvpc=True):
+        seen["prepare"] = config.exclude_ev
+        return real_prepare(frame, strategy_ids, config, load_pvpc=load_pvpc)
+
+    sim.prepare_inputs = prepare
+    real_segment = backtest_mod._run_segment
+
+    def run_segment(sim_obj, sl, strategy_id, cfg, shared):
+        seen["segment"] = cfg.exclude_ev
+        return real_segment(sim_obj, sl, strategy_id, cfg, shared)
+
+    monkeypatch.setattr(backtest_mod, "_run_segment", run_segment)
+    run_backtest(sim, "2026-03-04", "2026-03-04", "self_consume", "current")
+    assert seen["prepare"] is False
+    assert seen["segment"] is False
+    assert sim.config.exclude_ev is True
