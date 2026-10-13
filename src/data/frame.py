@@ -37,7 +37,7 @@ EntityReader = Callable[[str, Optional[pd.Timestamp], Optional[pd.Timestamp]], O
 
 def store_reader(key: str, start: Optional[pd.Timestamp], end: Optional[pd.Timestamp]) -> Optional[pd.DataFrame]:
     # Imported lazily: the parquet store is owned by the data layer and may be absent.
-    from src.data.store import read_entity  # type: ignore[import-not-found]
+    from src.data.store import read_entity
 
     try:
         return read_entity(key, start=start, end=end)

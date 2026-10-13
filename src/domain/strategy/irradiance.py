@@ -12,7 +12,7 @@ and CEST months (hourly correlation 0.914, vs 0.892 for the naive local +1 h).
 
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, cast
 
 import numpy as np
 import pandas as pd
@@ -71,7 +71,8 @@ class HourlyGhi:
             return
         clim = series.groupby([series.index.month, series.index.hour]).mean()
         self._clim = np.zeros((13, 24))
-        for (m, h), v in clim.items():
+        for key, v in clim.items():
+            m, h = cast(tuple[int, int], key)
             self._clim[m, h] = v
         hours = series.index.asi8 // 3_600_000_000_000
         self._base = int(hours[0])

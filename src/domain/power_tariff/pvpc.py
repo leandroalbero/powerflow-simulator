@@ -77,13 +77,12 @@ class PvpcTariff:
         self._export_pvpc_discount = max(0.0, float(export_pvpc_discount))
         self._days: Dict[date, _Day] = {}
         self._current_datetime: Optional[datetime] = None
+        self._seed_day: Optional[date] = None
         self.rate_schedule = {}
         if self._prices:
             first_day = local_date_hour(min(self._prices))[0]
             self._seed_day = first_day
             self.rate_schedule = self._schedule_for(first_day)
-        else:
-            self._seed_day = None
 
     # -- pure lookups ------------------------------------------------------------
 
