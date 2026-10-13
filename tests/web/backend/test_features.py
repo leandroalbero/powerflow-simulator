@@ -14,6 +14,7 @@ from src.data.config import MissingCredentialError
 from tests.synthetic import synthetic_frame
 from web.backend.models.feature_schemas import SweepDetail
 from web.backend.models.schemas import SystemConfig
+from web.backend.services import simulation_service
 from web.backend.services.data_service import DataService
 from web.backend.services.envelope import envelope_downsample
 from web.backend.services.refresh_jobs import RefreshRegistry
@@ -85,7 +86,8 @@ class TestEnvelope:
 
 
 class TestStrategiesAndPresets:
-    def test_dqn_unavailable_and_presets(self, client: TestClient):
+    def test_dqn_unavailable_and_presets(self, client: TestClient, tmp_path, monkeypatch):
+        monkeypatch.setattr(simulation_service, "_DQN_POLICY", tmp_path / "missing.pt")
         listed = client.get("/api/strategies").json()
         dqn = next(item for item in listed if item["id"] == "dqn_agent")
         assert dqn["available"] is False
