@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 
 from web.backend.models.feature_schemas import SweepDetail, SweepListItem, SweepRequest, SweepStartResponse
 from web.backend.services.csv_export import sweep_csv
+from web.backend.services.sweep_service import SweepBusy
 
 router = APIRouter(prefix="/api", tags=["sweep"])
 
@@ -17,6 +18,8 @@ def start_sweep(body: SweepRequest, request: Request) -> SweepStartResponse:
         raise HTTPException(status_code=503, detail="process pool unavailable")
     try:
         sweep_id, total = sweep.start(body)
+    except SweepBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return SweepStartResponse(sweep_id=sweep_id, total_cases=total)

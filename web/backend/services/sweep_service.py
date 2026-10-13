@@ -1,8 +1,10 @@
 """Scenario matrix. One frame, process-pool cases, baseline per tariff."""
 
+import math
 import threading
 import uuid
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -12,11 +14,18 @@ import pandas as pd
 
 from web.backend.models.feature_schemas import SweepCase, SweepDetail, SweepListItem, SweepRequest
 from web.backend.models.schemas import DateRange, SystemConfig
+from web.backend.services.client_errors import public_error
 from web.backend.services.history_store import HistoryStore
 from web.backend.services.pool import SimPool
 from web.backend.services.presets import hardware_by_id, scale_battery, tariff_by_id
 from web.backend.services.sim_worker import CasePayload, execute_case
 from web.backend.services.simulation_service import STRATEGY_MAP, SimulationService
+from web.backend.services.span import inclusive_day_count
+
+_MAX_CASES = 200
+_MAX_CAPACITIES = 12
+_MAX_CAPACITY_KWH = 200.0
+_MAX_DAYS = 366
 
 _HOURS_YEAR = 8760.0
 
@@ -37,12 +46,18 @@ class SweepJob:
     hours: dict[int, Optional[float]] = field(default_factory=dict)
 
 
+class SweepBusy(Exception):
+    def __init__(self) -> None:
+        super().__init__("a sweep is already running")
+
+
 class SweepService:
     def __init__(self, sim: SimulationService, pool: SimPool, history: HistoryStore) -> None:
         self.sim = sim
         self.pool = pool
         self.history = history
         self.jobs: dict[str, SweepJob] = {}
+        self._lock = threading.Lock()
 
     def start(self, body: SweepRequest) -> tuple[str, int]:
         self._validate(body)
@@ -62,7 +77,10 @@ class SweepService:
             request=body.model_dump(mode="json"),
             cancel=self.pool.manager.Event(),
         )
-        self.jobs[job.sweep_id] = job
+        with self._lock:
+            if any(existing.status == "running" for existing in self.jobs.values()):
+                raise SweepBusy()
+            self.jobs[job.sweep_id] = job
         threading.Thread(target=self._run, args=(job, frame, body), daemon=True).start()
         return job.sweep_id, len(cases)
 
@@ -87,7 +105,9 @@ class SweepService:
     def list_sweeps(self, limit: int) -> list[SweepListItem]:
         seen: set[str] = set()
         items: list[SweepListItem] = []
-        for job in sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True):
+        with self._lock:
+            jobs = list(self.jobs.values())
+        for job in sorted(jobs, key=lambda j: j.created_at, reverse=True):
             seen.add(job.sweep_id)
             items.append(_list_item(job))
         for row in self.history.list_sweeps(limit):
@@ -116,48 +136,103 @@ class SweepService:
 
     def _run(self, job: SweepJob, frame: pd.DataFrame, body: SweepRequest) -> None:
         try:
+            inputs = self.sim.prepare_inputs(
+                frame, body.strategies, SystemConfig(exclude_ev=body.exclude_ev), load_pvpc=False,
+            )
             prices = self._prices(frame, body)
-            history = frame
-            groups = (job.cases[:len(body.tariffs)], job.cases[len(body.tariffs):])
+            baseline_n = len(body.tariffs)
+            groups = (
+                list(enumerate(job.cases[:baseline_n])),
+                list(enumerate(job.cases[baseline_n:], baseline_n)),
+            )
             for group in groups:
-                self._submit_wait(job, frame, body, prices, history, group)
+                self._submit_wait(job, frame, body, prices, inputs, group)
                 if job.cancel.is_set():
                     self._cancel_pending(job)
                     break
             self._finish(job)
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        except Exception:
+            public_error("sweep failed")
+            self._fail_open(job, "sweep failed")
             job.status = "failed"
-            job.cases[0].error = str(exc)
-            self._persist(job)
+            try:
+                self._persist(job)
+            except Exception:
+                public_error("sweep failed")
+            self._drop(job)
 
-    def _submit_wait(self, job, frame, body, prices, history, cases: list[SweepCase]) -> None:
+    def _submit_wait(
+        self, job, frame, body, prices, inputs, indexed: list[tuple[int, SweepCase]], *, allow_retry: bool = True,
+    ) -> None:
         futs: list[tuple[int, Future]] = []
-        for case in cases:
-            idx = job.cases.index(case)
+        pending_after_break: list[tuple[int, SweepCase]] = []
+        for pos, (idx, case) in enumerate(indexed):
             if job.cancel.is_set():
                 case.status = "cancelled"
                 continue
             case.status = "running"
-            payload = CasePayload(
-                frame=frame,
-                strategy_id=case.strategy_id,
-                config=_case_config(body, case),
-                pvpc_prices=prices if _tariff_uses_pvpc(case.tariff) else None,
-                history=history,
-                cancel=job.cancel,
-                job_id=f"{job.sweep_id}:{idx}",
-            )
-            fut = self.pool.executor.submit(execute_case, payload)
+            try:
+                fut = self._submit_one(job, frame, body, prices, inputs, idx, case)
+            except BrokenProcessPool:
+                public_error("worker process crashed")
+                self.pool.recreate()
+                case.status = "failed"
+                case.error = "worker process crashed"
+                pending_after_break = indexed[pos + 1:]
+                break
             job.futures.append(fut)
             futs.append((idx, fut))
+        broken_at: Optional[int] = None
         for idx, fut in futs:
-            if fut.cancelled():
-                job.cases[idx].status = "cancelled"
+            if broken_at is not None:
+                pending_after_break.append((idx, job.cases[idx]))
                 continue
+            try:
+                self._consume(job, idx, fut)
+            except BrokenProcessPool:
+                public_error("worker process crashed")
+                self.pool.recreate()
+                job.cases[idx].status = "failed"
+                job.cases[idx].error = "worker process crashed"
+                broken_at = idx
+        if pending_after_break and not job.cancel.is_set() and allow_retry:
+            self._submit_wait(job, frame, body, prices, inputs, pending_after_break, allow_retry=False)
+        job.futures.clear()
+
+    def _submit_one(self, job, frame, body, prices, inputs, idx: int, case: SweepCase) -> Future:
+        payload = CasePayload(
+            frame=frame,
+            strategy_id=case.strategy_id,
+            config=_case_config(body, case),
+            pvpc_prices=prices if _tariff_uses_pvpc(case.tariff) else None,
+            history=inputs.history,
+            daily_forecasts=inputs.daily_forecasts,
+            ghi=inputs.ghi,
+            cancel=job.cancel,
+            job_id=f"{job.sweep_id}:{idx}",
+            metrics_only=True,
+        )
+        return self.pool.executor.submit(execute_case, payload)
+
+    def _consume(self, job: SweepJob, idx: int, fut: Future) -> None:
+        if fut.cancelled():
+            job.cases[idx].status = "cancelled"
+            return
+        try:
             output = fut.result()
-            job.hours[idx] = _apply(job.cases[idx], output)
-            _savings(job.cases, job.hours)
+        except CancelledError:
+            job.cases[idx].status = "cancelled"
+            return
+        except BrokenProcessPool:
+            raise
+        except Exception:
+            job.cases[idx].status = "failed"
+            job.cases[idx].error = public_error("simulation failed")
             self._persist(job)
+            return
+        job.hours[idx] = _apply(job.cases[idx], output)
+        _savings(job.cases, job.hours)
+        self._persist(job)
 
     def _prices(self, frame: pd.DataFrame, body: SweepRequest):
         if not any(_tariff_uses_pvpc(tariff_id) for tariff_id in body.tariffs):
@@ -169,14 +244,31 @@ class SweepService:
         return self.sim.pvpc_service.get_prices(*window, strict=False)
 
     def _finish(self, job: SweepJob) -> None:
+        self._fail_open(job, "sweep failed")
         statuses = [case.status for case in job.cases]
-        if job.cancel.is_set() or any(status == "cancelled" for status in statuses):
+        if job.cancel.is_set() or (statuses and all(status == "cancelled" for status in statuses)):
             job.status = "cancelled"
-        elif any(status == "failed" for status in statuses):
+        elif any(status == "cancelled" for status in statuses) and not any(status == "completed" for status in statuses):
+            job.status = "cancelled"
+        elif statuses and all(status == "failed" for status in statuses):
             job.status = "failed"
         else:
             job.status = "completed"
+        job.futures.clear()
         self._persist(job)
+        self._drop(job)
+
+    def _fail_open(self, job: SweepJob, message: str) -> None:
+        for case in job.cases:
+            if case.status in ("pending", "running"):
+                case.status = "cancelled" if job.cancel.is_set() else "failed"
+                if case.status == "failed":
+                    case.error = message
+
+    def _drop(self, job: SweepJob) -> None:
+        job.futures.clear()
+        with self._lock:
+            self.jobs.pop(job.sweep_id, None)
 
     @staticmethod
     def _cancel_pending(job: SweepJob) -> None:
@@ -210,8 +302,18 @@ class SweepService:
                 tariff_by_id(tariff_id)
         except KeyError as exc:
             raise ValueError(f"Unknown preset: {exc.args[0]}") from exc
-        if any(cap <= 0 for cap in body.capacities_kwh):
-            raise ValueError("capacities_kwh must be positive")
+        if len(body.capacities_kwh) > _MAX_CAPACITIES:
+            raise ValueError(f"at most {_MAX_CAPACITIES} capacities")
+        if any(
+            not math.isfinite(cap) or cap <= 0 or cap > _MAX_CAPACITY_KWH
+            for cap in body.capacities_kwh
+        ):
+            raise ValueError(f"each capacity must be finite and in (0, {_MAX_CAPACITY_KWH:g}] kWh")
+        if inclusive_day_count(body.date_range.start, body.date_range.end) > _MAX_DAYS:
+            raise ValueError(f"date range exceeds {_MAX_DAYS} inclusive days")
+        n_cases = len(body.tariffs) * (1 + len(body.capacities_kwh) * len(body.strategies))
+        if n_cases > _MAX_CASES:
+            raise ValueError(f"sweep would run {n_cases} cases; the limit is {_MAX_CASES}")
 
 
 def _case_list(body: SweepRequest) -> list[SweepCase]:
