@@ -5,6 +5,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from src.data.influx import InfluxHttpError
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -18,12 +20,11 @@ def client(tmp_path, monkeypatch):
 
 def test_influx_error_fails_the_job_and_hides_the_url(client: TestClient, monkeypatch):
     monkeypatch.setattr("src.data.config.load_influx_config", lambda env_path=None: object())
-    secret = "http://user:token@10.1.2.3:8086/query"
 
-    def raise_leak(**_kwargs):
-        raise RuntimeError(secret)
+    def raise_influx(**_kwargs):
+        raise InfluxHttpError(401)
 
-    monkeypatch.setattr("src.data.refresh.refresh", raise_leak)
+    monkeypatch.setattr("src.data.refresh.refresh", raise_influx)
     started = client.post("/api/data/refresh")
     assert started.status_code == 202
     job_id = started.json()["job_id"]
@@ -36,7 +37,7 @@ def test_influx_error_fails_the_job_and_hides_the_url(client: TestClient, monkey
         time.sleep(0.05)
     assert body["status"] == "failed"
     assert body["error"] == "refresh failed"
-    assert "token" not in (body["error"] or "")
-    assert "10.1.2.3" not in (body["error"] or "")
+    assert "influx" not in (body["error"] or "")
+    assert "401" not in (body["error"] or "")
     again = client.post("/api/data/refresh", json={})
     assert again.status_code == 202
