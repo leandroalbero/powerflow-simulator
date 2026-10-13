@@ -6,6 +6,7 @@
   import Button from '../../ui/Button.svelte';
   import { dayCount, fmtAgo, fmtRange } from '../../ui/format';
   import type { SweepListItem } from '../../types';
+  import { hashParams, hrefWith } from '../../stores/route';
   import { loadSweep, sweep } from './state';
 
   /** The API has no paging; its maximum page size keeps every saved comparison reachable. */
@@ -22,6 +23,11 @@
     shown += PAGE * 2;
     await tick();
     listEl?.querySelectorAll<HTMLElement>('button.item')[from]?.focus();
+  }
+  // A history entry per opened comparison, like History's Open links, so Back returns to the previous one.
+  function open(id: string) {
+    if (hashParams().get('sweep') === id) loadSweep(id);
+    else location.hash = hrefWith('compare', 'sweep', id);
   }
   let state: 'loading' | 'ready' | 'error' | 'unavailable' = 'loading';
   let error = '';
@@ -74,7 +80,7 @@
         {@const st = STATUS[it.status]}
         {@const days = dayCount(it.date_range.start, it.date_range.end)}
         <li>
-          <button type="button" class="item" class:current={$sweep?.id === it.sweep_id} aria-current={$sweep?.id === it.sweep_id || undefined} on:click={() => loadSweep(it.sweep_id)}>
+          <button type="button" class="item" class:current={$sweep?.id === it.sweep_id} aria-current={$sweep?.id === it.sweep_id || undefined} on:click={() => open(it.sweep_id)}>
             <span class="main">
               <span class="title">{it.label || fmtRange(it.date_range.start, it.date_range.end)}</span>
               <span class="meta num">

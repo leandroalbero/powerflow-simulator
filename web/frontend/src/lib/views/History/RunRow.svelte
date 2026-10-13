@@ -130,7 +130,7 @@
     <span class="k">Best strategy</span>
     {#if d.bestId}
       <span class="v best-name"><StrategyDot id={d.bestId} size={9} />{$strategyById.get(d.bestId)?.name ?? strategyName(d.bestId)}</span>
-      <span class="s num">{eur(d.bestCost)} net cost</span>
+      <span class="s num">{eur(d.bestCost)} net cost{item.status === 'running' ? ', so far' : ''}</span>
     {:else}
       <span class="v muted">—</span>
     {/if}
@@ -139,7 +139,7 @@
   <div class="cell savings">
     <span class="k">Savings</span>
     <span class="v num money" class:pos={d.outcome === 'win'} class:neg={d.outcome === 'loss'}>{eurSigned(d.savings)}</span>
-    <span class="s">{d.savings == null ? '' : 'vs no battery'}</span>
+    <span class="s">{d.savings == null ? '' : item.status === 'running' ? 'so far, vs no battery' : 'vs no battery'}</span>
   </div>
 
   <div class="cell config">
