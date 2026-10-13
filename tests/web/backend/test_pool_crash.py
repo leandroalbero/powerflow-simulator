@@ -107,3 +107,31 @@ def test_persist_after_delete_is_a_no_op(data):  # noqa: F811
     assert svc.delete_run(run_id)
     svc._persist_run(run)
     assert svc.history.get_run(run_id) is None
+
+
+def test_sweep_survives_a_worker_crash_and_the_next_sweep_runs(data, pool, monkeypatch):  # noqa: F811
+    from web.backend.models.feature_schemas import SweepRequest
+    from web.backend.models.schemas import DateRange
+    from web.backend.services import sweep_service
+    from web.backend.services.sweep_service import SweepService
+
+    svc = SimulationService(data)
+    svc.attach_pool(pool)
+    sweeps = SweepService(svc, pool, svc.history)
+    body = SweepRequest(
+        date_range=DateRange(start="2026-03-04", end="2026-03-04"),
+        strategies=["self_consume"], tariffs=["2_0td"], capacities_kwh=[10],
+    )
+
+    monkeypatch.setattr(sweep_service, "execute_case", crash_cases.crash_or_run)
+    first = sweeps.start(body)
+    sweep_id, _ = first
+    assert _wait(lambda: sweeps.get(sweep_id).status != "running", 30)
+    statuses = {case.strategy_id: case.status for case in sweeps.get(sweep_id).cases}
+    assert statuses["no_battery"] == "failed"
+
+    monkeypatch.setattr(sweep_service, "execute_case", crash_cases.quick)
+    second = sweeps.start(body)
+    second_id, _ = second
+    assert _wait(lambda: sweeps.get(second_id).status != "running", 30)
+    assert all(case.status == "completed" for case in sweeps.get(second_id).cases)

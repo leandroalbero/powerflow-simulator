@@ -45,8 +45,9 @@ def run_backtest(
     frame = sim.data_service.get_frame(start, end, include_measured=True)
     if len(frame) == 0 or "grid_kw" not in frame.columns or not np.isfinite(frame["grid_kw"].to_numpy()).any():
         raise ValueError("no measured data in range")
+    measured = sim.config.model_copy(update={"exclude_ev": False})
     try:
-        shared = sim.prepare_inputs(frame, [strategy_id], sim.config)
+        shared = sim.prepare_inputs(frame, [strategy_id], measured)
     except ValueError:
         raise
     except Exception:
@@ -61,7 +62,7 @@ def run_backtest(
         sl = frame[(frame.index >= segment.start) & (frame.index < segment.end)]
         if len(sl) == 0:
             continue
-        cfg = _segment_config(sim.config, segment.preset_id, soc)
+        cfg = _segment_config(measured, segment.preset_id, soc)
         result = _run_segment(sim, sl, strategy_id, cfg, shared)
         pieces.append((sl, result.timeseries))
         used.append(HardwareSegment(
