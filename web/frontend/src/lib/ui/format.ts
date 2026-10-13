@@ -46,6 +46,13 @@ export function num(v: number | null | undefined, decimals = 1): string {
   return v < 0 && Number(Math.abs(v).toFixed(decimals)) !== 0 ? `−${s}` : s;
 }
 
+/** Up to `maxDecimals`, without trailing zeros: 7.5, 15.36, 20. */
+export function numTrim(v: number | null | undefined, maxDecimals = 2): string {
+  if (!isNum(v)) return DASH;
+  const s = Math.abs(v).toLocaleString(LOCALE, { minimumFractionDigits: 0, maximumFractionDigits: maxDecimals });
+  return v < 0 && Number(Math.abs(v).toFixed(maxDecimals)) !== 0 ? `−${s}` : s;
+}
+
 export function kwh(v: number | null | undefined, decimals = 1): string {
   return isNum(v) ? `${num(v, decimals)} kWh` : DASH;
 }

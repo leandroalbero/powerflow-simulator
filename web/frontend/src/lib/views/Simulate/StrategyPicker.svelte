@@ -179,7 +179,7 @@
     color: var(--text-3);
     line-height: 1.4;
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .more {
       height: 40px;
     }

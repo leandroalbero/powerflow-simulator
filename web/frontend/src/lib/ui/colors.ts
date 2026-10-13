@@ -68,14 +68,20 @@ export function strategyDash(id: string): number[] | undefined {
   return styleFor(id).hollow ? [7, 4] : undefined;
 }
 
-/** Power-flow series colours (power chart). */
+/**
+ * Power-flow series colours (power chart). Kept off the strategy hues they sit next to in the
+ * strategy switcher: import takes the red no strategy uses, export a cyan, and the battery one
+ * plum for both directions (charge is drawn dashed). Validated as a set with the dataviz
+ * palette checker (all pairs, both modes); load stays neutral ink.
+ */
 export const FLOW = {
-  solar: { light: '#d99400', dark: '#e0a419' },
+  solar: { light: '#d99400', dark: '#c98500' },
   load: { light: '#3b4552', dark: '#c9d0da' },
-  gridImport: { light: '#eb6834', dark: '#e86d3c' },
-  gridExport: { light: '#1baf7a', dark: '#22b583' },
-  batteryCharge: { light: '#6250d6', dark: '#9085e9' },
-  batteryDischarge: { light: '#d55181', dark: '#e87ba4' },
+  gridImport: { light: '#e34948', dark: '#d84a5a' },
+  gridExport: { light: '#0096b4', dark: '#1a9cb8' },
+  batteryCharge: { light: '#7a3fa0', dark: '#9d5bd8' },
+  batteryDischarge: { light: '#7a3fa0', dark: '#9d5bd8' },
+  price: { light: '#66707e', dark: '#8e98a6' },
 } as const;
 
 export type FlowKey = keyof typeof FLOW;

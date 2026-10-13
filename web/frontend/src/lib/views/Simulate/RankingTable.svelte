@@ -265,6 +265,8 @@
     .bar {
       width: 64px;
     }
+  }
+  @media (max-width: 720px), (pointer: coarse) {
     .sort {
       min-height: 40px;
     }

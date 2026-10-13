@@ -19,9 +19,15 @@
   export let keepFocus = false;
 
   $: off = disabled || loading;
+
+  let el: HTMLButtonElement;
+  export function focus(): void {
+    el?.focus();
+  }
 </script>
 
 <button
+  bind:this={el}
   {type}
   class="btn {variant} {size}"
   class:icon-only={iconOnly}
@@ -79,7 +85,7 @@
   .icon-only.sm {
     width: 30px;
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .sm {
       height: 40px;
     }

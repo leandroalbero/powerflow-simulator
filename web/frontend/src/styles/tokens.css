@@ -135,6 +135,13 @@
   --chart-axis: #8e98a6;
 }
 
+/* Touch tablets keep the desktop layout but need finger-sized controls. */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 40px;
+  }
+}
+
 @media (max-width: 720px) {
   :root {
     --gutter: 16px;

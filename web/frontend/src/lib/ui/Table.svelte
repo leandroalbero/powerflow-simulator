@@ -96,6 +96,13 @@
   .scroller :global(td:last-child) {
     padding-right: var(--s-5);
   }
+  /* Sort buttons grow to finger size on touch; the cell's own padding would stack on top. */
+  @media (pointer: coarse) {
+    .scroller :global(th:has(> button)) {
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+  }
   @media (max-width: 720px) {
     .scroller :global(th) {
       padding-top: 0;

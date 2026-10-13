@@ -1,5 +1,7 @@
-import { derived, writable } from 'svelte/store';
-import { dataBounds } from '../../stores/app';
+import { derived, get, writable } from 'svelte/store';
+import { dataBounds, lastFullDay } from '../../stores/app';
+import { BASELINE_ID, run } from '../../stores/run';
+import type { DateRange } from '../../types';
 import { loadJson, saveJson } from '../../stores/storage';
 import { addDays, isoDate, parseIsoDate } from '../../ui/format';
 
@@ -41,9 +43,18 @@ export function toggleStrategy(id: string): void {
   selected.update((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
 }
 
-/** Inclusive date range for a preset, ending at the last day with data and clamped to the dataset. */
-export function rangeFor(p: PeriodPreset, bounds: { min: string; max: string }, custom: { start: string; end: string } | null) {
-  const end = parseIsoDate(bounds.max);
+/**
+ * Inclusive date range for a preset, clamped to the dataset. Presets end on the last complete day,
+ * the same as on Backtest, so "Last 30 days" is one window on every tab; a custom range can still
+ * include a partial newest day.
+ */
+export function rangeFor(
+  p: PeriodPreset,
+  bounds: { min: string; max: string; until?: string | null },
+  custom: { start: string; end: string } | null,
+) {
+  const lastFull = lastFullDay(bounds);
+  const end = parseIsoDate(lastFull);
   let start: Date;
   switch (p) {
     case 'last7':
@@ -61,17 +72,50 @@ export function rangeFor(p: PeriodPreset, bounds: { min: string; max: string }, 
       break;
     case 'custom': {
       const s = custom?.start ?? isoDate(addDays(end, -6));
-      const e = custom?.end ?? bounds.max;
+      const e = custom?.end ?? lastFull;
       const cs = s < bounds.min ? bounds.min : s > bounds.max ? bounds.max : s;
       const ce = e > bounds.max ? bounds.max : e < cs ? cs : e;
       return { start: cs, end: ce };
     }
   }
   const s = isoDate(start);
-  return { start: s < bounds.min ? bounds.min : s, end: bounds.max };
+  return { start: s < bounds.min ? bounds.min : s, end: lastFull };
 }
 
 export const activeRange = derived([period, customRange, dataBounds], ([p, c, b]) => (b ? rangeFor(p, b, c) : null));
+
+/** The preset that gives this range today, or 'custom'. */
+export function presetFor(r: DateRange, bounds: { min: string; max: string; until?: string | null } | null): PeriodPreset {
+  if (!bounds) return 'custom';
+  for (const o of PERIOD_OPTIONS) {
+    if (o.value === 'custom') continue;
+    const x = rangeFor(o.value, bounds, null);
+    if (x.start === r.start && x.end === r.end) return o.value;
+  }
+  return 'custom';
+}
+
+/*
+ * A run reopened or re-run from History (or opened from a link) takes over the controls once, so
+ * "Run simulation" means the run on screen rather than whatever the controls held before. Later
+ * edits are left alone. A re-run has no id until the server answers, so the key is its start time.
+ */
+let syncedRun: string | null = null;
+run.subscribe((r) => {
+  if (!r?.adoptControls) return;
+  const key = `${r.startedAt}|${r.range.start}|${r.range.end}|${r.strategyIds.join()}`;
+  if (key === syncedRun) return;
+  syncedRun = key;
+  const ids = r.strategyIds.filter((id) => id !== BASELINE_ID);
+  if (ids.length) selected.set(ids);
+  const p = presetFor(r.range, get(dataBounds));
+  if (p === 'custom') customRange.set({ start: r.range.start, end: r.range.end });
+  period.set(p);
+});
+
+/** Optional label for the next run; cleared once that run starts. Not persisted. */
+export const runLabel = writable('');
+export const LABEL_MAX = 80;
 
 /** Strategy shown in the power chart. Follows the best result until the user picks one. */
 export const focusStrategy = writable<string | null>(null);

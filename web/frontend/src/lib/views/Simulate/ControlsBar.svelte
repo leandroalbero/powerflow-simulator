@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { tick } from 'svelte';
+  import type { HardwarePreset } from '../../types';
   import { capabilities, dataBounds, presets } from '../../stores/app';
-  import { applyHardwarePreset, applyTariffPreset, draft, draftModified, draftValid, hardwarePresetId, tariffPresetId } from '../../stores/draft';
+  import { applyHardwarePreset, applyTariffPreset, draft, draftModified, draftValid, hardwarePresetId, hardwareSummary, tariffPresetId } from '../../stores/draft';
   import { cancelCurrentRun, run, runBusy, runProgress } from '../../stores/run';
   import { settingsOpen } from '../../stores/ui';
   import Segmented from '../../ui/Segmented.svelte';
@@ -10,7 +12,8 @@
   import Icon from '../../ui/Icon.svelte';
   import { dayCount, fmtRange } from '../../ui/format';
   import StrategyPicker from './StrategyPicker.svelte';
-  import { activeRange, customRange, period, PERIOD_OPTIONS, selected, type PeriodPreset } from './state';
+  import { activeRange, customRange, LABEL_MAX, period, PERIOD_OPTIONS, runLabel, selected, type PeriodPreset } from './state';
+  import { fmtDate } from '../../ui/format';
   import { strategies } from '../../stores/app';
 
   export let onRun: () => void;
@@ -84,7 +87,34 @@
     if (canRun) onRun();
   }
 
-  $: hwDescription = presetsReady && $presets ? $presets.hardware.find((h) => h.id === hwValue)?.description ?? null : null;
+  // Cancel disappears when the run stops; hand keyboard focus to the Run button instead of <body>.
+  let runBtn: Button;
+  let cancelPressed = false;
+  function cancelClick() {
+    cancelPressed = true;
+    void cancelCurrentRun();
+  }
+  $: if (!busy && cancelPressed) {
+    cancelPressed = false;
+    void tick().then(() => {
+      if (!document.activeElement || document.activeElement === document.body) runBtn?.focus();
+    });
+  }
+
+  $: hwDescription = hwPreset ? hardwareSummary(hwPreset) : null;
+
+  // Hardware presets carry the dates they were in service. Flag a period they don't cover, and
+  // offer the preset that was installed at the period's start.
+  $: hwPreset = presetsReady && $presets ? $presets.hardware.find((h) => h.id === hwValue) ?? null : null;
+  $: dated = (h: HardwarePreset) => h.valid_from != null || h.valid_until != null;
+  $: inService = (h: HardwarePreset, day: string) =>
+    dated(h) && (h.valid_from == null || day >= h.valid_from) && (h.valid_until == null || day <= h.valid_until);
+  $: spanDay =
+    hwPreset && dated(hwPreset) && range && $presets
+      ? $presets.hardware.map((h) => h.valid_from).find((d) => d != null && d > range.start && d <= range.end) ?? null
+      : null;
+  $: hwMismatch = !!hwPreset && !!range && !spanDay && dated(hwPreset) && !inService(hwPreset, range.start);
+  $: hwSuggest = hwMismatch && range && $presets ? $presets.hardware.find((h) => h.id !== hwValue && inService(h, range.start)) ?? null : null;
 </script>
 
 <section class="controls" aria-label="Simulation setup">
@@ -129,6 +159,21 @@
       />
       {#if presetsMissing}
         <p class="hint span">Presets need a backend update. Battery and tariff come from Settings.</p>
+      {:else if spanDay}
+        <p class="hint span warn-hint">
+          <Icon name="alert" size={13} />
+          <span>This period spans the battery upgrade on {fmtDate(spanDay)}. {hwPreset?.name ?? 'The selected hardware'} applies to all of it.</span>
+        </p>
+      {:else if hwMismatch && hwPreset}
+        <p class="hint span warn-hint">
+          <Icon name="alert" size={13} />
+          <span>
+            {hwPreset.name} wasn't installed in this period.
+            {#if hwSuggest && !busy}
+              <button type="button" class="linkish" on:click={() => hwSuggest && applyHardwarePreset(hwSuggest)}>Use {hwSuggest.name}</button>
+            {/if}
+          </span>
+        </p>
       {:else if hwDescription}
         <p class="hint span">{hwDescription}</p>
       {/if}
@@ -161,11 +206,24 @@
         {$run?.status === 'starting' ? 'Starting…' : `Running · ${Math.round($runProgress)}%`}
       </span>
       {#if $capabilities.cancel === 'available'}
-        <Button variant="secondary" icon="stop" loading={$run?.cancelling} on:click={cancelCurrentRun}>Cancel</Button>
+        <Button variant="secondary" icon="stop" loading={$run?.cancelling} keepFocus on:click={cancelClick}>Cancel</Button>
       {/if}
     {/if}
     <span class="sr-only" role="status" aria-live="polite">{announcement}</span>
-    <Button variant="primary" size="lg" icon="play" loading={busy} disabled={!canRun} keepFocus on:click={runClick}>
+    <label class="run-label">
+      <span class="sr-only">Run label (optional)</span>
+      <input
+        type="text"
+        bind:value={$runLabel}
+        maxlength={LABEL_MAX}
+        placeholder="Label (optional)"
+        disabled={busy}
+        autocomplete="off"
+        spellcheck="false"
+        on:keydown={(e) => e.key === 'Enter' && runClick()}
+      />
+    </label>
+    <Button bind:this={runBtn} variant="primary" size="lg" icon="play" loading={busy} disabled={!canRun} keepFocus on:click={runClick}>
       {busy ? 'Simulating' : 'Run simulation'}
     </Button>
   </div>
@@ -271,6 +329,44 @@
   .spacer {
     flex: 1;
   }
+  .run-label input {
+    width: 190px;
+    height: 40px;
+    padding: 0 var(--s-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-md);
+    background: var(--surface);
+    font-size: var(--fs-sm);
+  }
+  .run-label input::placeholder {
+    color: var(--text-3);
+  }
+  .run-label input:hover:not(:disabled) {
+    border-color: var(--text-3);
+  }
+  .run-label input:disabled {
+    opacity: 0.55;
+  }
+  .warn-hint {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    color: var(--warning);
+  }
+  .warn-hint :global(svg) {
+    flex: none;
+    margin-top: 2px;
+  }
+  .linkish {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
   .status {
     font-size: var(--fs-sm);
     color: var(--text-2);
@@ -321,6 +417,13 @@
     .actions :global(.btn.primary) {
       flex: 1 1 100%;
       order: 10;
+    }
+    .run-label {
+      flex: 1 1 100%;
+      order: 9;
+    }
+    .run-label input {
+      width: 100%;
     }
     .spacer {
       display: none;

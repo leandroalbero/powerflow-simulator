@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createEventDispatcher, onDestroy, tick } from 'svelte';
+  import { createEventDispatcher, onDestroy, onMount, tick } from 'svelte';
 
   export let open = false;
   export let align: 'start' | 'end' = 'end';
@@ -88,11 +88,29 @@
     });
   }
 
+  /*
+   * Opened from the keyboard, focus moves into the dialog so a screen reader lands in it. Not on a
+   * pointer open: on a phone, focusing a search field would pop the keyboard over the panel.
+   */
+  let viaPointer = false;
+  const onAnyKey = () => (viaPointer = false);
+  onMount(() => {
+    document.addEventListener('keydown', onAnyKey, true);
+    return () => document.removeEventListener('keydown', onAnyKey, true);
+  });
+  function focusFirst() {
+    if (viaPointer || !panel || !root.contains(document.activeElement) || panel.contains(document.activeElement)) return;
+    panel.querySelector<HTMLElement>('button:not(:disabled), input:not(:disabled), select, a[href], [tabindex]:not([tabindex="-1"])')?.focus();
+  }
+
   // A function call, so the reactive statement depends on `open` only, not on `raf`.
   function sync(isOpen: boolean) {
     cancelAnimationFrame(raf);
     if (!isOpen) return;
-    void fit().then(reveal);
+    void fit().then(() => {
+      focusFirst();
+      reveal();
+    });
     lastLeft = root ? root.getBoundingClientRect().left : NaN;
     lastVw = document.documentElement.clientWidth;
     watch();
@@ -105,6 +123,12 @@
     if (open && root && !root.contains(e.target as Node)) dispatch('close');
   }
 
+  /** Tabbing out of the panel closes it, so it never sits open over controls that now have focus. */
+  function onFocusOut(e: FocusEvent) {
+    const to = e.relatedTarget as Node | null;
+    if (open && to && root && !root.contains(to)) dispatch('close');
+  }
+
   function onKey(e: KeyboardEvent) {
     if (open && e.key === 'Escape') {
       dispatch('close');
@@ -113,9 +137,9 @@
   }
 </script>
 
-<svelte:document on:click={onDocClick} on:keydown={onKey} />
+<svelte:document on:click={onDocClick} on:keydown={onKey} on:pointerdown|capture={() => (viaPointer = true)} />
 
-<div class="pop" bind:this={root}>
+<div class="pop" bind:this={root} on:focusout={onFocusOut}>
   <slot name="trigger" />
   {#if open}
     <div class="panel {align}" role="dialog" aria-label={label} style="--w: {width}px; translate: {dx}px 0" bind:this={panel}>

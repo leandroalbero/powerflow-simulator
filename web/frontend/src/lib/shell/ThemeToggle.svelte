@@ -25,7 +25,7 @@
     background: var(--surface-3);
     color: var(--text);
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .toggle {
       width: 40px;
       height: 40px;

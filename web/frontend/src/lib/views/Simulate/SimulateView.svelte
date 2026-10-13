@@ -1,8 +1,8 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { strategies } from '../../stores/app';
+  import { hasEv, strategies } from '../../stores/app';
   import { draft, draftValid } from '../../stores/draft';
-  import { ranked, run, runBusy, startRun } from '../../stores/run';
+  import { openingRun, ranked, run, runBusy, startRun } from '../../stores/run';
   import { dayCount, fmtRange, fmtTime, num } from '../../ui/format';
   import Card from '../../ui/Card.svelte';
   import ControlsBar from './ControlsBar.svelte';
@@ -12,7 +12,8 @@
   import FlowCharts from './FlowCharts.svelte';
   import MonthlyChart from './MonthlyChart.svelte';
   import ExportMenu from './ExportMenu.svelte';
-  import { activeRange, focusStrategy, period, resetFocus, selected } from './state';
+  import { activeRange, focusStrategy, LABEL_MAX, period, resetFocus, runLabel, selected } from './state';
+  import ReopenedNotice from '../History/ReopenedNotice.svelte';
 
   function go() {
     const range = get(activeRange);
@@ -20,7 +21,12 @@
     if (!range || !cfg) return;
     const usable = new Set(get(strategies).filter((s) => s.available !== false).map((s) => s.id));
     resetFocus();
-    void startRun({ range, strategies: get(selected).filter((s) => usable.has(s)), config: structuredClone(cfg) });
+    const config = structuredClone(cfg);
+    // The switch is hidden without EV data, so a stored "on" must not silently change the load.
+    if (!get(hasEv)) config.exclude_ev = false;
+    const label = get(runLabel).trim().slice(0, LABEL_MAX) || undefined;
+    runLabel.set('');
+    void startRun({ range, strategies: get(selected).filter((s) => usable.has(s)), config, label });
   }
 
   function quickRun() {
@@ -29,10 +35,13 @@
   }
 
   $: r = $run;
+  $: shownLabel = r?.label?.trim() || null;
   $: days = r ? dayCount(r.range.start, r.range.end) : 0;
   $: hasMonthly = $ranked.some((x) => (x.metrics?.monthly?.length ?? 0) >= 2);
   $: anyDone = $ranked.some((x) => x.status === 'completed');
   $: failedStart = r?.status === 'failed' && !r.runId;
+  // While a link opens another run, the run still on screen must not start fetching its charts.
+  $: openingOther = $openingRun != null && $openingRun !== r?.runId;
   // Rates (per year, per day) divide by the hours with data, which can be fewer than the calendar
   // hours; say so, or the figures can't be reproduced from what is on screen.
   $: validHours = $ranked.find((x) => x.isBaseline)?.validHours ?? $ranked.find((x) => x.validHours != null)?.validHours ?? null;
@@ -41,9 +50,10 @@
 
 <div class="view">
   <ControlsBar onRun={go} />
+  <ReopenedNotice part="banner" />
 
   {#if !r}
-    <EmptyState onQuickRun={quickRun} disabled={$runBusy || !$draftValid} />
+    {#if !$openingRun}<EmptyState onQuickRun={quickRun} disabled={$runBusy || !$draftValid} />{/if}
   {:else if failedStart}
     <div class="start-error" role="alert">
       <h2>The simulation didn't start</h2>
@@ -53,7 +63,7 @@
     <section class="results" aria-labelledby="results-title" aria-busy={$runBusy}>
       <header class="results-head">
         <div>
-          <h1 id="results-title">Results</h1>
+          <h1 id="results-title">Results{#if shownLabel}<span class="label-sep" aria-hidden="true">{' · '}</span><span class="run-label">{shownLabel}</span>{/if}</h1>
           <p class="meta num">
             {fmtRange(r.range.start, r.range.end)} · {days} {days === 1 ? 'day' : 'days'}{#if dataDays != null}{' '}<span
                 title="Per-year and per-day figures use the hours with data. Hours with missing measurements are left out."
@@ -70,7 +80,9 @@
         <RankingTable rows={$ranked} hours={days * 24} />
       </Card>
 
-      {#if r.runId && anyDone}
+      {#if r.timeseriesExpired}
+        <ReopenedNotice part="charts" />
+      {:else if r.runId && anyDone && !openingOther}
         <FlowCharts runId={r.runId} rows={$ranked} capacityKwh={r.config.battery.capacity} />
       {/if}
 
@@ -101,6 +113,15 @@
     font-size: var(--fs-xl);
     font-weight: 700;
     letter-spacing: -0.02em;
+  }
+  .label-sep {
+    color: var(--text-3);
+    font-weight: 500;
+  }
+  .run-label {
+    font-weight: 600;
+    color: var(--text-2);
+    overflow-wrap: anywhere;
   }
   .meta {
     margin-top: 2px;

@@ -2,6 +2,19 @@
   import { activity } from '../stores/toasts';
   import { fmtTime } from '../ui/format';
   import { MOCK_MODE } from '../api/client';
+  import { route } from '../stores/route';
+  import { run } from '../stores/run';
+
+  // Only Simulate sends the Settings drawer's config. A sweep request has no config field: it
+  // takes its tariffs and hardware from presets and the rest from server defaults; Backtest uses
+  // the server's tariff; History shows runs with the settings each one was run with.
+  const SOURCE = {
+    simulate: 'Energy costs in € from the tariff in Settings',
+    compare: 'Energy costs in € from the tariff presets picked above; Settings don’t apply to comparisons',
+    backtest: 'Energy costs in € from the server’s default tariff',
+    history: 'Energy costs in € from the settings each run was saved with',
+  } as const;
+  $: source = $route === 'simulate' && $run?.reopened ? 'Energy costs in € from the settings this run was saved with' : SOURCE[$route];
 </script>
 
 <footer class="foot">
@@ -19,7 +32,7 @@
       {/if}
     </details>
     <p class="hint">
-      Energy costs in € from the tariff in Settings{MOCK_MODE ? '. Mock mode: new endpoints are simulated in the browser' : ''}.
+      {source}{MOCK_MODE ? '. Mock mode: new endpoints are simulated in the browser' : ''}.
     </p>
   </div>
 </footer>
@@ -79,7 +92,7 @@
   .foot > .inner > .hint {
     flex: 0 1 auto;
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     summary {
       padding: 11px 0;
     }

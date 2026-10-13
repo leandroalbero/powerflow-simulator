@@ -2,6 +2,7 @@ import { derived, get, writable } from 'svelte/store';
 import type { HardwarePreset, SystemConfig, TariffConfig, TariffPreset, TariffRate } from '../types';
 import { defaults, presets } from './app';
 import { loadJson, saveJson } from './storage';
+import { fmtDate, num, numTrim } from '../ui/format';
 
 const KEY = 'pf.configDraft.v1';
 
@@ -47,7 +48,14 @@ draft.subscribe((d) => {
 });
 
 function sameJson(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  return stableKey(a) === stableKey(b);
+}
+
+/** JSON with sorted object keys, so equal configs compare equal whatever order the server sent them in. */
+function stableKey(v: unknown): string {
+  return JSON.stringify(v, (_k, x: unknown) =>
+    isObj(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x,
+  );
 }
 
 export const draftModified = derived([draft, defaults], ([$d, $def]) => Boolean($d && $def && !sameJson($d, $def)));
@@ -59,9 +67,19 @@ export function resetDraft(): void {
 
 // ---- Presets ----
 
+/** Built from the preset's numbers rather than its description, so dates read like the rest of the UI. */
+export function hardwareSummary(h: HardwarePreset): string {
+  const b = h.battery;
+  const base = `${numTrim(b.capacity)} kWh, ${num(b.max_charge_rate, 1)} kW charge, ${num(b.max_discharge_rate, 1)} kW discharge`;
+  if (h.valid_from && h.valid_until) return `${base}, in service ${fmtDate(h.valid_from)} – ${fmtDate(h.valid_until)}`;
+  if (h.valid_from) return `${base}, in service from ${fmtDate(h.valid_from)}`;
+  if (h.valid_until) return `${base}, in service until ${fmtDate(h.valid_until)}`;
+  return base;
+}
+
 function tariffKey(t: TariffConfig): string {
   const { mpc_horizon_hours: _h, ...rest } = t;
-  return JSON.stringify(rest);
+  return stableKey(rest);
 }
 
 export const hardwarePresetId = derived([draft, presets], ([$d, $p]) => {

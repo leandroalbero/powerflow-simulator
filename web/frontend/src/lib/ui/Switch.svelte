@@ -77,7 +77,7 @@
   input:disabled {
     cursor: not-allowed;
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .row {
       min-height: 40px;
     }

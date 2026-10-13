@@ -21,6 +21,12 @@
   $: savingsTone = v.outcome === 'win' ? 'positive' : v.outcome === 'loss' ? 'negative' : 'default';
   $: periodWord = days === 1 ? 'this day' : `these ${days} days`;
   $: soFar = provisional && best ? ' so far' : '';
+  $: settled = rows.length > 0 && done === rows.length;
+  $: idle = !settled
+    ? 'Waiting for results'
+    : rows.some((r) => !r.isBaseline && r.status === 'cancelled')
+      ? 'Cancelled before a battery strategy finished'
+      : 'No battery strategy finished';
 </script>
 
 {#if provisional}
@@ -36,7 +42,7 @@
     {:else if best && best.savings != null}
       <span class="num">No strategy beat it. {bestName} costs {eur(-best.savings)} more</span>
     {:else}
-      <span>Waiting for results</span>
+      <span>{idle}</span>
     {/if}
   </KPI>
 
@@ -60,7 +66,7 @@
     {:else if baseline}
       <span class="num">No battery costs {eur(baseline.cost)}</span>
     {:else}
-      <span>Waiting for results</span>
+      <span>{idle}</span>
     {/if}
   </KPI>
 

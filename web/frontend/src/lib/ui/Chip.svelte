@@ -65,7 +65,7 @@
   .chip:disabled {
     opacity: 0.5;
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .chip {
       height: 40px;
       padding: 0 14px;

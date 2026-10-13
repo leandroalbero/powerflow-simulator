@@ -208,7 +208,8 @@
                 <div role="cell"><NumberField compact hideLabel label="Export {i + 1} start hour" unit="h" min={0} max={23} step={1} bind:value={$draft.tariff.rates[i].start_hour} error={e[`tariff.rates.${i}.start_hour`]} /></div>
                 <div role="cell"><NumberField compact hideLabel label="Export {i + 1} end hour" unit="h" min={1} max={24} step={1} bind:value={$draft.tariff.rates[i].end_hour} error={e[`tariff.rates.${i}.end_hour`]} /></div>
                 <div role="cell"><NumberField compact hideLabel label="Export {i + 1} price" unit="€/kWh" min={0} step={0.001} bind:value={$draft.tariff.rates[i].price} error={e[`tariff.rates.${i}.price`]} /></div>
-                <div role="cell"><button type="button" class="rm" aria-label="Remove export rate {i + 1}" title="Remove" on:click={() => removeRate(i)}><Icon name="trash" size={15} /></button></div>
+                <!-- An export rate is required, so the only one can't be removed; the empty cell keeps the columns aligned. -->
+                <div role="cell">{#if exportRows.length > 1}<button type="button" class="rm" aria-label="Remove export rate {i + 1}" title="Remove" on:click={() => removeRate(i)}><Icon name="trash" size={15} /></button>{/if}</div>
               </div>
             {/each}
           </div>

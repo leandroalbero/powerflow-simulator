@@ -222,7 +222,7 @@
       display: inline;
     }
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .badge {
       height: 40px;
     }

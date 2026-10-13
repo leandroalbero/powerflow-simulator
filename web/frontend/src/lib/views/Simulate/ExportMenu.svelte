@@ -124,7 +124,7 @@
     font-size: var(--fs-xs);
     color: var(--text-3);
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     .trigger {
       height: 40px;
     }

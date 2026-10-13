@@ -12,6 +12,7 @@ import {
   type Capability,
 } from '../api/client';
 import type { DataInfo, PresetsResponse, StrategyInfo, SystemConfig } from '../types';
+import { addDays, isoDate, parseIsoDate } from '../ui/format';
 import { toast } from './toasts';
 
 export type LoadState = 'loading' | 'ready' | 'error';
@@ -53,6 +54,25 @@ export const dataBounds = derived(dataInfo, ($d) => {
   return { min: localDay(from), max: localDay(until), until };
 });
 
+/**
+ * The newest day when it has only a few hours of data (e.g. to 01:24), else null. Such a stub still
+ * counts as a whole day in totals and per-day averages, and its few hours can be dominated by a
+ * strategy's night charging that the real system hadn't done yet.
+ */
+export function partialLastDay(bounds: { max: string; until?: string | null } | null): { day: string; until: string } | null {
+  if (!bounds?.until) return null;
+  const u = new Date(bounds.until);
+  if (!Number.isFinite(u.getTime())) return null;
+  const minutes = u.getHours() * 60 + u.getMinutes();
+  return minutes < 23 * 60 ? { day: bounds.max, until: bounds.until } : null;
+}
+
+/** The newest day with data, or the day before it when that one is only a stub. Every tab's presets end here. */
+export function lastFullDay(bounds: { min: string; max: string; until?: string | null }): string {
+  if (!partialLastDay(bounds) || bounds.max <= bounds.min) return bounds.max;
+  return isoDate(addDays(parseIsoDate(bounds.max), -1));
+}
+
 function localDay(iso: string): string {
   const d = new Date(iso);
   const p = (n: number) => String(n).padStart(2, '0');
@@ -60,7 +80,9 @@ function localDay(iso: string): string {
 }
 
 /** EV-related setting only makes sense when the data has an EV channel. */
-export const hasEv = derived(dataInfo, ($d) => Boolean($d?.has_ev || $d?.entities?.some((e) => /(^|_)ev($|_)/i.test(e))));
+export const hasEv = derived(dataInfo, ($d) =>
+  typeof $d?.has_ev === 'boolean' ? $d.has_ev : Boolean($d?.entities?.some((e) => /(^|_)ev($|_)/i.test(e))),
+);
 
 export async function refreshDataInfo(): Promise<void> {
   try {

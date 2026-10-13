@@ -9,6 +9,15 @@
     show?: boolean;
     /** Marker shown in the legend instead of a line swatch. */
     legendDotId?: string;
+    /**
+     * Makes this series the lower edge of a min–max band whose upper edge is the series with this
+     * label. It has no legend entry or line of its own and is shown and hidden with its partner.
+     */
+    lowerOf?: string;
+    /** Fill alpha of the band between this series and its lower edge (default 0.16, 0 = no band). */
+    bandFill?: number;
+    /** Draw as steps (value holds until the next point), e.g. for hourly prices. */
+    step?: boolean;
   }
   export type XRange = { min: number; max: number } | null;
 </script>
@@ -36,6 +45,12 @@
   /** Optional background shading by price (same x as data). */
   export let band: { values: (number | null)[]; label: string } | null = null;
   export let ariaLabel: string;
+  /** Cursor time label; defaults to date and time of the hovered point. */
+  export let xLabel: ((x: number) => string) | null = null;
+  /** Fixed decimals for the y axis labels (default: whole numbers, one decimal below 10). */
+  export let axisDecimals: number | null = null;
+  /** Secondary strip under another synced chart: the legend keeps the unit instead of repeating the time. */
+  export let compact = false;
 
   const dispatch = createEventDispatcher<{ zoom: XRange }>();
 
@@ -45,7 +60,8 @@
   let cursorIdx: number | null = null;
   /** Per-series data index under the cursor, from uPlot's scanner (skips join fillers). */
   let cursorIdxs: (number | null)[] = [];
-  let hidden = new Set<number>();
+  /** Hidden series by label, so the choice survives a rebuild (theme, raw ↔ range view). */
+  let hidden = new Set<string>();
   let width = 600;
 
   function cssVar(name: string): string {
@@ -53,10 +69,14 @@
   }
 
   const pad = (n: number) => String(n).padStart(2, '0');
+  const stepped = uPlot.paths.stepped?.({ align: 1 });
+  /** Half the width of the widest x label ("28 Sep", "23:45") at 12px. */
+  const X_LABEL_HALF = 22;
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-  function xTicks(_u: uPlot, splits: number[], _ax: number, _space: number, incr: number): string[] {
+  function xTicks(_u: uPlot, splits: (number | null)[], _ax: number, _space: number, incr: number): string[] {
     return splits.map((s) => {
+      if (s == null) return '';
       const d = new Date(s * 1000);
       const midnight = d.getHours() === 0 && d.getMinutes() === 0;
       if (incr >= 86400 || midnight) return `${d.getDate()} ${MONTHS[d.getMonth()]}`;
@@ -136,10 +156,14 @@
           font,
           grid: { stroke: gridColor, width: 1 },
           ticks: { show: false },
-          values: xTicks,
+          values: compact ? () => [] : xTicks,
+          // uPlot centres labels on their tick and clips them at the canvas edge ("13 Oc"); drop
+          // a label that would not fit in the right padding. The grid line stays.
+          filter: (u: uPlot, splits: number[]) =>
+            splits.map((v) => (u.valToPos(v, 'x') > u.bbox.width / uPlot.pxRatio + 12 - X_LABEL_HALF ? null : v)) as number[],
           space: 64,
           gap: 6,
-          size: 30,
+          size: compact ? 6 : 30,
         },
         {
           stroke: axisColor,
@@ -148,21 +172,29 @@
           ticks: { show: false },
           size: 48,
           gap: 6,
-          values: (_u, splits) => splits.map((v) => `${num(v, Math.abs(v) < 10 && v % 1 !== 0 ? 1 : 0)}`),
+          values: (_u, splits) =>
+            splits.map((v) => num(v, axisDecimals ?? (Math.abs(v) < 10 && v % 1 !== 0 ? 1 : 0))),
         },
       ],
       series: [
         {},
-        ...series.map((s, i) => ({
+        ...series.map((s) => ({
           label: s.label,
-          stroke: s.color,
-          width: s.width ?? 1.75,
+          stroke: s.lowerOf ? 'rgba(0, 0, 0, 0)' : s.color,
+          width: s.lowerOf ? 0 : s.width ?? 1.75,
           dash: s.dash,
           fill: s.fill ? alpha(s.color, s.fill) : undefined,
-          show: !hidden.has(i + 1) && s.show !== false,
+          show: !hidden.has(s.lowerOf ?? s.label) && s.show !== false,
           points: { show: false },
+          paths: s.step ? stepped : undefined,
         })),
       ],
+      bands: series.flatMap((s, i) => {
+        if (!s.lowerOf) return [];
+        const up = series.findIndex((u) => u.label === s.lowerOf);
+        if (up < 0 || series[up].bandFill === 0) return [];
+        return [{ series: [up + 1, i + 1] as [number, number], fill: alpha(series[up].color, series[up].bandFill ?? 0.16) }];
+      }),
       hooks: {
         setCursor: [
           (u) => {
@@ -196,25 +228,35 @@
     plot.setScale('x', { min, max });
   }
 
-  function toggle(i: number) {
+  function toggle(label: string) {
     const next = new Set(hidden);
-    if (next.has(i)) next.delete(i);
-    else next.add(i);
+    if (next.has(label)) next.delete(label);
+    else next.add(label);
     hidden = next;
-    plot?.setSeries(i, { show: !next.has(i) });
+    series.forEach((s, i) => {
+      if (s.label === label || s.lowerOf === label) plot?.setSeries(i + 1, { show: !next.has(label) });
+    });
   }
 
   // Rebuild when the series definition or theme changes; otherwise just swap data.
-  $: seriesKey = JSON.stringify(series.map((s) => [s.label, s.color, s.dash, s.fill, s.width])) + $theme + (band ? 'b' : '') + height;
+  $: seriesKey =
+    JSON.stringify(series.map((s) => [s.label, s.color, s.dash, s.fill, s.width, s.lowerOf, s.bandFill, s.step])) +
+    $theme +
+    (band ? 'b' : '') +
+    height +
+    axisDecimals +
+    compact;
   let builtKey = '';
   $: if (host && seriesKey !== builtKey) {
     builtKey = seriesKey;
-    hidden = new Set();
     build();
   }
   let lastData: uPlot.AlignedData | null = null;
   $: if (plot && data !== lastData) {
     lastData = data;
+    // Indices from the previous data would read the wrong (or no) points until the pointer moves.
+    cursorIdx = null;
+    cursorIdxs = [];
     plot.setData(data, false);
     applyRange();
   }
@@ -300,29 +342,39 @@
     plot?.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
   }
 
-  function valueAt(d: uPlot.AlignedData, idx: number | null, idxs: (number | null)[], si: number): string {
-    if (idx == null) return '';
+  function valueAt(d: uPlot.AlignedData, idx: number | null, idxs: (number | null)[], si: number): number | null | undefined {
+    if (idx == null) return undefined;
     const j = idxs[si] ?? idx;
-    const v = d[si]?.[j];
-    return v == null ? '–' : num(v, decimals);
+    return d[si]?.[j];
   }
 
-  $: legendValues = series.map((_, i) => valueAt(data, cursorIdx, cursorIdxs, i + 1));
+  function legendValue(d: uPlot.AlignedData, idx: number | null, idxs: (number | null)[], i: number): string {
+    if (idx == null) return '';
+    const hi = valueAt(d, idx, idxs, i + 1);
+    if (hi == null) return '–';
+    const lowIdx = series.findIndex((s) => s.lowerOf === series[i].label);
+    const lo = lowIdx >= 0 ? valueAt(d, idx, idxs, lowIdx + 1) : null;
+    return lo != null && num(lo, decimals) !== num(hi, decimals) ? `${num(lo, decimals)}–${num(hi, decimals)}` : num(hi, decimals);
+  }
 
-  $: cursorTime = cursorIdx != null && data[0][cursorIdx] != null ? fmtDateTime(new Date(data[0][cursorIdx] * 1000)) : null;
+  $: legendItems = series.map((s, i) => ({ s, i })).filter(({ s }) => !s.lowerOf);
+  $: legendValues = series.map((_, i) => legendValue(data, cursorIdx, cursorIdxs, i));
+
+  $: cursorX = cursorIdx != null ? data[0][cursorIdx] : null;
+  $: cursorTime = cursorX != null ? (xLabel ? xLabel(cursorX) : fmtDateTime(new Date(cursorX * 1000))) : null;
 </script>
 
-<div class="chart">
+<div class="chart" class:compact>
   <div class="legend" role="group" aria-label="Series">
-    <span class="when num" aria-live="off">{cursorTime ?? unit}</span>
-    {#each series as s, i (s.label)}
+    <span class="when num" aria-live="off">{compact ? unit : cursorTime ?? unit}</span>
+    {#each legendItems as { s, i } (s.label)}
       <button
         type="button"
         class="item"
-        class:off={hidden.has(i + 1)}
-        aria-pressed={!hidden.has(i + 1)}
-        title={hidden.has(i + 1) ? `Show ${s.label}` : `Hide ${s.label}`}
-        on:click={() => toggle(i + 1)}
+        class:off={hidden.has(s.label)}
+        aria-pressed={!hidden.has(s.label)}
+        title={hidden.has(s.label) ? `Show ${s.label}` : `Hide ${s.label}`}
+        on:click={() => toggle(s.label)}
       >
         {#if s.legendDotId}
           <StrategyDot id={s.legendDotId} size={9} />
@@ -338,7 +390,7 @@
     {/if}
   </div>
   <div class="plot-wrap">
-    {#if cursorTime}<span class="when-over num" aria-hidden="true">{cursorTime}</span>{/if}
+    {#if cursorTime && !compact}<span class="when-over num" aria-hidden="true">{cursorTime}</span>{/if}
     <div
       class="plot"
       bind:this={host}
@@ -412,6 +464,11 @@
   }
   .plot-wrap {
     position: relative;
+  }
+  @media (pointer: coarse) {
+    .item {
+      height: 40px;
+    }
   }
   .when-over {
     display: none;
@@ -505,6 +562,17 @@
     .band-key {
       grid-column: 1 / -1;
       height: 28px;
+    }
+    .compact .legend {
+      display: flex;
+    }
+    .compact .when {
+      display: block;
+      flex: 1 0 100%;
+      min-width: 0;
+    }
+    .compact .item {
+      min-height: 40px;
     }
   }
 </style>

@@ -96,7 +96,7 @@
       display: inline;
     }
   }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (pointer: coarse) {
     button {
       height: 40px;
     }

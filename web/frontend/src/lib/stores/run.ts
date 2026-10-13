@@ -1,5 +1,5 @@
 import { derived, get, writable } from 'svelte/store';
-import { ApiError, cancelRun, errorMessage, getRunSummary, isUnavailable, startSimulation } from '../api/client';
+import { ApiError, cancelRun, errorMessage, getRunSummary, getTimeseries, isUnavailable, startSimulation } from '../api/client';
 import { RunSocket } from '../api/ws';
 import type {
   DateRange,
@@ -10,9 +10,11 @@ import type {
   StrategyStatus,
   SystemConfig,
 } from '../types';
-import { setCapability, strategyName } from './app';
+import { defaults, setCapability, strategyById, strategyName } from './app';
+import { draft } from './draft';
 import { logActivity, toast } from './toasts';
 import { fmtRange } from '../ui/format';
+import { hashParams, hrefFor, isRouteHash, replaceHashParam } from './route';
 
 export const BASELINE_ID = 'no_battery';
 /** Below three days an annual figure is mostly noise. */
@@ -30,6 +32,16 @@ export interface RunState {
   finishedAt: number | null;
   error: string | null;
   cancelling: boolean;
+  /** Loaded from history (History tab or a #/simulate?run= link) rather than started in this tab. */
+  reopened?: boolean;
+  createdAt?: string | null;
+  label?: string | null;
+  /** The server still has the results but has dropped the per-minute data (it keeps only recent runs). */
+  timeseriesExpired?: boolean;
+  /** False when the server didn't return the run's settings and `config` is a stand-in. */
+  configFromRun?: boolean;
+  /** Shown because of a History or link action, so Simulate's period and strategy controls follow it once. */
+  adoptControls?: boolean;
 }
 
 export const run = writable<RunState | null>(null);
@@ -100,9 +112,18 @@ async function pollOnce(runId: string, gen: number): Promise<void> {
   }
 }
 
-export async function startRun(opts: { range: DateRange; strategies: string[]; config: SystemConfig; label?: string }): Promise<void> {
+export async function startRun(opts: {
+  range: DateRange;
+  strategies: string[];
+  config: SystemConfig;
+  label?: string;
+  adoptControls?: boolean;
+}): Promise<void> {
   stopWatching();
   remember(null);
+  setRunParam(null);
+  loadingId = null;
+  openingRun.set(null);
   const gen = ++generation;
   const ids = [BASELINE_ID, ...opts.strategies.filter((s) => s !== BASELINE_ID)];
   const results: Record<string, StrategyResult> = {};
@@ -118,6 +139,8 @@ export async function startRun(opts: { range: DateRange; strategies: string[]; c
     finishedAt: null,
     error: null,
     cancelling: false,
+    label: opts.label?.trim() || null,
+    adoptControls: opts.adoptControls,
   });
   logActivity(`Simulating ${ids.length} strategies, ${fmtRange(opts.range.start, opts.range.end)}`);
 
@@ -133,6 +156,7 @@ export async function startRun(opts: { range: DateRange; strategies: string[]; c
   }
   if (gen !== generation) return;
   run.update((r) => (r ? { ...r, runId, status: 'running' } : r));
+  if (isSimulateHash()) setRunParam(runId);
   remember({ runId, range: opts.range, strategyIds: ids, config: opts.config, startedAt: get(run)?.startedAt ?? Date.now() });
   watch(runId, gen);
 }
@@ -163,6 +187,7 @@ interface LastRun {
   strategyIds: string[];
   config: SystemConfig;
   startedAt: number;
+  reopened?: boolean;
 }
 
 function remember(v: LastRun | null): void {
@@ -198,12 +223,23 @@ function recall(): LastRun | null {
 
 /** Show this tab's last run again after a reload, and keep following it if it is still running. */
 export async function resumeLastRun(): Promise<void> {
+  listenForRunParam();
+  const linked = isSimulateHash() ? hashParams().get(RUN_PARAM) : null;
+  // A link names the run explicitly, so it wins over whatever this tab showed last.
+  if (linked) {
+    // A reload of a run started in this tab shouldn't present it as reopened from history.
+    const own = recall();
+    await loadRun(linked, { reopened: !(own?.runId === linked && !own.reopened) });
+    return;
+  }
   const last = recall();
   if (!last || get(run)) return;
   const gen = ++generation;
   let s: RunSummary;
+  let expired = false;
   try {
     s = await getRunSummary(last.runId);
+    if (s.status !== 'running') expired = await timeseriesExpired(last.runId, s);
   } catch (err) {
     if (err instanceof ApiError && err.status === 404) remember(null);
     return;
@@ -226,7 +262,13 @@ export async function resumeLastRun(): Promise<void> {
     finishedAt: running ? null : last.startedAt,
     error: null,
     cancelling: false,
+    reopened: last.reopened ?? false,
+    createdAt: s.created_at ?? null,
+    label: s.label ?? null,
+    timeseriesExpired: expired,
+    configFromRun: s.config != null,
   });
+  setRunParam(last.runId);
   if (running) {
     logActivity('Reattached to the running simulation');
     watch(last.runId, gen);
@@ -235,7 +277,7 @@ export async function resumeLastRun(): Promise<void> {
 
 export async function cancelCurrentRun(): Promise<void> {
   const r = get(run);
-  if (!r?.runId || r.finishedAt) return;
+  if (!r?.runId || r.finishedAt || r.cancelling) return;
   run.set({ ...r, cancelling: true });
   try {
     await cancelRun(r.runId);
@@ -340,3 +382,170 @@ export const runProgress = derived(run, ($r) => {
   });
   return vals.reduce((a, b) => a + b, 0) / Math.max(1, vals.length);
 });
+
+// ---- Reopen a past run (History tab, #/simulate?run=<id> links) ----
+
+/** Hash query parameter naming the run shown on Simulate: `#/simulate?run=<id>`. */
+export const RUN_PARAM = 'run';
+
+/** Id of the run being fetched for reopening, or null. */
+export const openingRun = writable<string | null>(null);
+let loadingId: string | null = null;
+
+const isSimulateHash = () => isRouteHash('simulate');
+
+/** Records the run on screen in the URL, but only while the Simulate tab is the one showing. */
+function setRunParam(id: string | null): void {
+  if (isSimulateHash()) replaceHashParam(RUN_PARAM, id);
+}
+
+function onHashChange(): void {
+  if (!isSimulateHash()) return;
+  const id = hashParams().get(RUN_PARAM);
+  const shown = get(run)?.runId ?? null;
+  // A bare #/simulate (tab link) shows whatever is on screen, so name it for sharing and reloads.
+  if (!id) {
+    if (shown && loadingId == null) setRunParam(shown);
+    return;
+  }
+  if (id === loadingId || shown === id) return;
+  void loadRun(id);
+}
+
+let listening = false;
+function listenForRunParam(): void {
+  if (listening) return;
+  listening = true;
+  window.addEventListener('hashchange', onHashChange);
+}
+// Registered at import, ahead of the route store's listener: Svelte re-renders between listeners,
+// so Simulate must already see the run being opened when it mounts, or it fetches the old run's charts.
+if (typeof window !== 'undefined') listenForRunParam();
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => window.removeEventListener('hashchange', onHashChange));
+}
+
+/** One cheap request tells whether the server still has this run's per-minute data. */
+async function timeseriesExpired(runId: string, s: RunSummary): Promise<boolean> {
+  const done = s.strategies.filter((x) => x.status === 'completed');
+  const probe = done.find((x) => x.strategy_id !== BASELINE_ID) ?? done[0];
+  if (!probe) return false;
+  try {
+    await getTimeseries(runId, probe.strategy_id, { maxPoints: 10 });
+    return false;
+  } catch (err) {
+    return err instanceof ApiError && err.status === 410;
+  }
+}
+
+/** Show a stored run on Simulate (without navigating). Resolves to false when it can't be opened. */
+export async function loadRun(runId: string, opts: { reopened?: boolean } = {}): Promise<boolean> {
+  const reopened = opts.reopened ?? true;
+  const prev = get(run);
+  if (prev?.runId === runId) return true;
+  stopWatching();
+  const gen = ++generation;
+  loadingId = runId;
+  openingRun.set(runId);
+  try {
+    const s = await getRunSummary(runId);
+    const running = s.status === 'running';
+    const expired = running ? false : await timeseriesExpired(runId, s);
+    if (gen !== generation) return false;
+    const config = s.config ?? get(draft) ?? get(defaults);
+    if (!s.date_range || !config) throw new Error('The server did not return this run’s date range or settings.');
+    const ids = [BASELINE_ID, ...s.strategies.map((x) => x.strategy_id).filter((id) => id !== BASELINE_ID)];
+    const results: Record<string, StrategyResult> = {};
+    for (const sr of s.strategies) {
+      results[sr.strategy_id] = { ...sr, progress: sr.progress ?? (isFinal(sr.status) ? 100 : 0) };
+    }
+    const created = s.created_at ? Date.parse(s.created_at) : NaN;
+    const startedAt = Number.isFinite(created) ? created : Date.now();
+    run.set({
+      runId,
+      status: s.status,
+      range: s.date_range,
+      strategyIds: ids,
+      config,
+      results,
+      startedAt,
+      finishedAt: running ? null : startedAt,
+      error: null,
+      cancelling: false,
+      reopened,
+      createdAt: s.created_at ?? null,
+      label: s.label ?? null,
+      timeseriesExpired: expired,
+      configFromRun: s.config != null,
+      adoptControls: reopened,
+    });
+    remember({ runId, range: s.date_range, strategyIds: ids, config, startedAt, reopened });
+    if (running) watch(runId, gen);
+    return true;
+  } catch (err) {
+    if (gen !== generation) return false;
+    // The link keeps naming the run that stays on screen, so it can still be copied and shared.
+    if (hashParams().get(RUN_PARAM) === runId) setRunParam(get(run)?.runId ?? null);
+    // Keep following the run that stays on screen.
+    if (prev?.runId && !prev.finishedAt) watch(prev.runId, gen);
+    toast('error', `Couldn't open run ${runId}`, errorMessage(err));
+    return false;
+  } finally {
+    if (gen === generation) {
+      loadingId = null;
+      openingRun.set(null);
+    }
+  }
+}
+
+/**
+ * Run a stored run again with its own date range, strategies and settings, and show it on
+ * Simulate. The baseline is added back by startRun; strategies that are no longer available
+ * are dropped.
+ */
+export async function rerun(runId: string): Promise<void> {
+  let s: RunSummary;
+  try {
+    s = await getRunSummary(runId);
+  } catch (err) {
+    toast('error', 'Could not re-run', errorMessage(err));
+    return;
+  }
+  const range = s.date_range;
+  if (!range) {
+    toast('error', 'Could not re-run', 'The server did not return this run’s date range.');
+    return;
+  }
+  const known = get(strategyById);
+  const ids = s.strategies.map((x) => x.strategy_id).filter((id) => id !== BASELINE_ID);
+  const usable = ids.filter((id) => known.get(id)?.available !== false);
+  if (usable.length < ids.length) {
+    toast('warning', 'Some strategies were left out', `${ids.filter((id) => !usable.includes(id)).map(strategyName).join(', ')} not available any more`);
+  }
+  let config = s.config ?? null;
+  if (!config) {
+    config = get(draft);
+    if (!config) {
+      toast('error', 'Could not re-run', 'Settings have not loaded yet.');
+      return;
+    }
+    toast('warning', 'Original settings unavailable', 'Re-running with the current settings instead.');
+  }
+  location.hash = hrefFor('simulate');
+  await startRun({ range, strategies: usable, config: structuredClone(config), label: s.label ?? undefined, adoptControls: true });
+}
+
+/** After a run was deleted on the server: stop showing it and stop restoring it on reload. */
+export function forgetRun(runId: string): void {
+  const r = get(run);
+  if (r?.runId === runId) {
+    if (r.finishedAt) {
+      stopWatching();
+      ++generation;
+      run.set(null);
+    }
+    remember(null);
+  }
+  if (hashParams().get(RUN_PARAM) === runId) setRunParam(null);
+}
