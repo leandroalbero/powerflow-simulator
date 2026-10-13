@@ -71,7 +71,7 @@ def fetch_month_data(start_date: str, end_date: str) -> pd.DataFrame:
 
     for attempt in range(MAX_RETRIES):
         try:
-            with urllib.request.urlopen(url) as resp:
+            with urllib.request.urlopen(url, timeout=60) as resp:
                 data = json.loads(resp.read())
             break
         except urllib.error.HTTPError as e:

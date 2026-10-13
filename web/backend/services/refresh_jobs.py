@@ -7,6 +7,7 @@ from typing import Callable, Optional
 
 from src.data.config import MissingCredentialError
 from web.backend.models.feature_schemas import EntityRefreshSummary, RefreshJobResponse, RefreshSummaryBody
+from web.backend.services.client_errors import public_error
 
 
 @dataclass
@@ -76,15 +77,13 @@ class RefreshRegistry:
         try:
             summary = refresh_mod.refresh(full=full, progress=progress, with_irradiance=True)
             self._reload()
+            job.summary = _summary(summary)
+            job.progress_pct = 100.0
+            job.status = "completed"
         except MissingCredentialError as exc:
             self._fail(job, f"INFLUX_* not configured ({exc.name})")
-            return
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            self._fail(job, str(exc) or type(exc).__name__)
-            return
-        job.summary = _summary(summary)
-        job.progress_pct = 100.0
-        job.status = "completed"
+        except Exception:
+            self._fail(job, public_error("refresh failed"))
 
     @staticmethod
     def _fail(job: RefreshJob, message: str) -> None:
