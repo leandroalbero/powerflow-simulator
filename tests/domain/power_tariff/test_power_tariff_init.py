@@ -1,7 +1,8 @@
-import pytest
 from datetime import datetime
 
-from src.domain.power_tariff.model import Rate, EnergyDirection, RateType, PowerTariff
+import pytest
+
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateType
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def test_rate_type_assignment():
         (0, 12): Rate(price=0.05, energy_direction=EnergyDirection.EXPORT),
         (12, 24): Rate(price=0.08, energy_direction=EnergyDirection.EXPORT),
     }
-    tariff = PowerTariff(schedule)
+    PowerTariff(schedule)
 
     assert schedule[(0, 8)].rate_type == RateType.VALLEY
     assert schedule[(8, 16)].rate_type == RateType.PLAIN
@@ -64,15 +65,6 @@ def test_incomplete_schedule():
         })
 
 
-@pytest.mark.skip(reason="This test is not implemented yet.")
-def test_negative_rate():
-    with pytest.raises(ValueError, match="Negative rate in schedule"):
-        PowerTariff({
-            (0, 24): Rate(price=-0.1, energy_direction=EnergyDirection.IMPORT),
-            (0, 24): Rate(price=0.05, energy_direction=EnergyDirection.EXPORT),
-        })
-
-
 def test_get_rate(basic_schedule):
     tariff = PowerTariff(basic_schedule)
 
@@ -94,17 +86,6 @@ def test_weekend_rate(basic_schedule, weekend_rate):
     # Test weekend
     tariff.update_datetime(datetime(2024, 1, 6))  # Saturday
     assert tariff.get_import_rate(12) == 0.15
-
-
-@pytest.mark.skip(reason="This test is not implemented yet.")
-def test_invalid_hour():
-    tariff = PowerTariff(rate_schedule={
-        (0, 23): Rate(price=0.1, energy_direction=EnergyDirection.IMPORT),
-        (0, 23): Rate(price=0.05, energy_direction=EnergyDirection.EXPORT),
-    })
-
-    with pytest.raises(ValueError, match="Hour must be between 0 and 23"):
-        tariff.get_import_rate(24)
 
 
 def test_rate_type_property():

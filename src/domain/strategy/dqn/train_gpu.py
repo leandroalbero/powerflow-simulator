@@ -5,7 +5,6 @@ Usage: python3 -u -m src.domain.strategy.dqn.train_gpu [--device cuda:0]
 
 import argparse
 import random
-import sys
 
 import numpy as np
 import pandas as pd
@@ -32,7 +31,6 @@ def _power_frame(key: str) -> pd.DataFrame:
 
 
 def load_episodes():
-    from src.domain.strategy.dqn.environment import BatteryEnv
     solar_df = _power_frame("pv")
     load_df = _power_frame("load")
 

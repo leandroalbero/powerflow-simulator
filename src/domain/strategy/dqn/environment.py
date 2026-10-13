@@ -4,7 +4,6 @@ import math
 
 import numpy as np
 
-
 # 9 discrete actions: -1.0, -0.75, ..., 0, ..., 0.75, 1.0
 ACTIONS = np.linspace(-1.0, 1.0, 9, dtype=np.float32)
 
@@ -85,7 +84,6 @@ class BatteryEnv:
     def step(self, action_idx: int) -> tuple[np.ndarray, float, bool, dict]:
         t = self._step_idx
         action_val = ACTIONS[action_idx]
-        hour = int(self._hours[t]) % 24
         solar_kw = float(self._solar[t])
         load_kw = float(self._load[t])
         rate = float(self._import_rates[t])

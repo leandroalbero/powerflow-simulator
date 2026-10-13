@@ -1,6 +1,5 @@
 import numpy as np
 import pytest
-import torch
 
 from src.domain.strategy.dqn.agent import DqnAgent
 

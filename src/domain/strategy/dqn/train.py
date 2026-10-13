@@ -4,7 +4,6 @@ Usage: python -m src.domain.strategy.dqn.train [--episodes 200] [--output output
 """
 
 import argparse
-import sys
 
 import numpy as np
 import pandas as pd

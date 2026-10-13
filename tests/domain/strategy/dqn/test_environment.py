@@ -7,7 +7,6 @@ from src.domain.strategy.dqn.environment import BatteryEnv
 class TestBatteryEnv:
     @pytest.fixture
     def env(self):
-        n = 24
         solar = np.array([0,0,0,0,0,0, 0.1,0.5,1.5,3.0, 4.0,4.5,4.5,4.0, 3.0,1.5,0.5,0.1, 0,0,0,0,0,0], dtype=np.float32)
         load = np.array([0.3,0.3,0.3,0.3,0.3,0.5, 0.8,1.2,1.5,1.0, 0.8,0.8,1.0,0.8, 0.8,1.0,1.5,2.0, 2.5,2.0,1.5,1.0,0.5,0.3], dtype=np.float32)
         hours = np.arange(24, dtype=np.int32)
