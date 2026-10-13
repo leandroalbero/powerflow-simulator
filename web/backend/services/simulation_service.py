@@ -211,6 +211,7 @@ class SimulationRun:
     created_at: str = ""
     cancel: Event = field(default_factory=Event)
     futures: Dict[str, Any] = field(default_factory=dict)
+    deleted: bool = False
 
 
 # Progress callback type: (strategy_id, percent 0-100)
@@ -616,13 +617,17 @@ class SimulationService:
     def _fail_run(self, run: SimulationRun, strategy_ids: List[str], error: str,
                   on_strategy_done: Optional[StrategyDoneCallback], on_run_done: Optional[RunDoneCallback]) -> None:
         with run.lock:
-            for sid in strategy_ids:
+            # A cancel (and maybe a delete) can land while prepare_inputs runs.
+            if run.deleted or run.status in _TERMINAL:
+                return
+            failed = [sid for sid in strategy_ids if run.strategies[sid].status not in _TERMINAL]
+            for sid in failed:
                 run.strategies[sid].status = "failed"
                 run.strategies[sid].error = error
             run.status = "failed"
-        self._persist_run(run)
+            self._persist_run(run)
         if on_strategy_done is not None:
-            for sid in strategy_ids:
+            for sid in failed:
                 on_strategy_done(sid, "failed", None)
         if on_run_done is not None:
             on_run_done()
@@ -721,9 +726,9 @@ class SimulationService:
                 else:
                     run.status = "completed"
                 should_fire_done = True
+                self._persist_run(run)
 
         if should_fire_done:
-            self._persist_run(run)
             self._retain_timeseries(run.run_id)
             if on_run_done is not None:
                 on_run_done()
@@ -784,9 +789,14 @@ class SimulationService:
     def delete_run(self, run_id: str) -> bool:
         with self._registry_lock:
             run = self.runs.get(run_id)
-            if run is not None and _run_active(run):
-                raise RunStillActive()
-            if run is None:
+            if run is not None:
+                # Status changes and their persist happen under run.lock, so checking and
+                # flagging here closes the window where a finishing run is re-inserted.
+                with run.lock:
+                    if _run_active(run):
+                        raise RunStillActive()
+                    run.deleted = True
+            else:
                 row = self.history.get_run(run_id)
                 if row is not None and row["status"] == "running":
                     raise RunStillActive()
@@ -809,7 +819,7 @@ class SimulationService:
         return items[:limit]
 
     def _persist_run(self, run: SimulationRun) -> None:
-        if run.config is None:
+        if run.config is None or run.deleted:
             return
         self.history.upsert_run(
             run_id=run.run_id,
