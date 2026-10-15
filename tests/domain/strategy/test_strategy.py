@@ -1,205 +1,360 @@
-import pytest
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
-from src.domain.strategy.model import SelfConsumeStrategy, ForceChargeValleyAndPrePeakStrategy, EnergyFlow, \
-    ForceChargeAtNightStrategy, BaseEnergyStrategy
+import numpy as np
+import pytest
+
 from src.domain.battery.models import Battery
-from src.domain.grid.model import Grid
-from src.domain.power_tariff.model import PowerTariff, Rate, EnergyDirection, RateType
+from src.domain.power_tariff.model import EnergyDirection, PowerTariff, Rate, RateType
+from src.domain.power_tariff.pvpc import PvpcTariff
+from src.domain.strategy.model import (
+    EnergyFlow,
+    ForceChargeAtNightStrategy,
+    ForceChargeAtValleyStrategy,
+    ForceChargeValleyAndPrePeakStrategy,
+    ForecastChargeStrategy,
+    NoBatteryStrategy,
+    SelfConsumeStrategy,
+    SmartDischargeStrategy,
+    ValleyChargePeakDischargeStrategy,
+)
+from tests.domain.strategy.conftest import SATURDAY, WEEKDAY, at
+
+DT = 1 / 60
+HEURISTICS = [SelfConsumeStrategy, ForceChargeAtNightStrategy, ForceChargeAtValleyStrategy,
+              ForceChargeValleyAndPrePeakStrategy, ValleyChargePeakDischargeStrategy, SmartDischargeStrategy,
+              NoBatteryStrategy]
+_RATE_HEURISTICS = [ForceChargeAtNightStrategy, ForceChargeAtValleyStrategy,
+                    ForceChargeValleyAndPrePeakStrategy, ValleyChargePeakDischargeStrategy,
+                    SmartDischargeStrategy, ForecastChargeStrategy]
+_MAD = ZoneInfo("Europe/Madrid")
+_FLOW_FIELDS = (
+    "direct_solar", "battery_charge", "battery_discharge", "grid_import", "grid_export",
+    "unserved", "curtailed", "battery_charge_from_grid", "over_limit",
+)
 
 
-@pytest.fixture
-def battery():
-    battery = Mock(spec=Battery)
-    battery.capacity = 10.0
-    battery.current_charge = 5.0
-    battery.max_discharge_rate = 2.0
-    battery.max_charge_rate = 2.0
-    battery.charge_level = 0.5
-    return battery
+def _madrid_prices(day: date, hourly: list[float]) -> dict[datetime, float]:
+    start = datetime(day.year, day.month, day.day, tzinfo=_MAD).astimezone(timezone.utc)
+    return {start + timedelta(hours=h): price for h, price in enumerate(hourly)}
 
 
-@pytest.fixture
-def grid():
-    grid = Mock(spec=Grid)
-    grid.import_power.return_value = 1.0
-    grid.export_power.return_value = 1.0
-    return grid
+def _pvpc_around(day: date, hourly: list[float]) -> PvpcTariff:
+    """Tariff whose seed day has distinct prices, so strategy construction still sees 3 rates."""
+    seed = date.fromordinal(day.toordinal() - 1)
+    nxt = date.fromordinal(day.toordinal() + 1)
+    prices = _madrid_prices(seed, [0.05 + 0.01 * h for h in range(24)])
+    prices.update(_madrid_prices(day, hourly))
+    prices.update(_madrid_prices(nxt, hourly))
+    return PvpcTariff(prices, export_price=0.04)
 
 
-@pytest.fixture
-def rates():
-    return {
-        0: Rate(price=0.1, energy_direction=EnergyDirection.IMPORT),
-        8: Rate(price=0.2, energy_direction=EnergyDirection.IMPORT),
-        16: Rate(price=0.3, energy_direction=EnergyDirection.IMPORT),
-    }
+def _fresh(grid, tariff, cls, soc: float = 5.0):
+    battery = Battery(capacity=10.0, max_charge_rate=2.0, max_discharge_rate=2.0,
+                      efficiency=0.81, initial_soc=0.5)
+    battery.current_charge = soc
+    kwargs = {"daily_forecasts": {}} if cls is ForecastChargeStrategy else {}
+    return cls(battery, grid, tariff, **kwargs)
 
 
-@pytest.fixture
-def tariff(rates):
-    tariff = Mock(spec=PowerTariff)
-    tariff.rate_schedule = rates
-    tariff.get_rate.side_effect = lambda hour, direction: rates.get(hour - (hour % 8), rates[0])
-    return tariff
+def _assert_same_flows(got, ref, where) -> None:
+    for name in _FLOW_FIELDS:
+        assert getattr(got, name) == pytest.approx(getattr(ref, name), abs=1e-9), (where, name)
 
 
-class TestBaseEnergyStrategy:
-    def test_calculate_initial_flows(self, battery, grid, tariff):
-        class TestStrategy(BaseEnergyStrategy):
-            def calculate_energy_flows(self, solar_power, load_power, hour, duration):
-                return super()._calculate_initial_flows(solar_power, load_power)
-
-        strategy = TestStrategy(battery, grid, tariff)
-        flows = strategy._calculate_initial_flows(10.0, 5.0)
-
-        assert isinstance(flows, EnergyFlow)
-        assert flows.direct_solar == 5.0
-        assert flows.remaining_solar == 5.0
-        assert flows.remaining_load == 0.0
-
-    def test_handle_remaining_solar(self, battery, grid, tariff):
-        class TestStrategy(BaseEnergyStrategy):
-            def calculate_energy_flows(self, solar_power, load_power, hour, duration):
-                pass
-
-        strategy = TestStrategy(battery, grid, tariff)
-        flows = EnergyFlow(remaining_solar=3.0)
-        battery.charge.return_value = 1.0
-        grid.export_power.return_value = 1.0
-
-        strategy._handle_remaining_solar(flows, 1.0)
-
-        assert flows.battery_charge == 1.0
-        assert flows.grid_export == 1.0
-        assert flows.remaining_solar == 1.0
-
-    def test_error_handling_discharge_battery(self, battery, grid, tariff):
-        class TestStrategy(BaseEnergyStrategy):
-            def calculate_energy_flows(self, solar_power, load_power, hour, duration):
-                pass
-
-        strategy = TestStrategy(battery, grid, tariff)
-        battery.discharge.side_effect = ValueError("Battery error")
-
-        with pytest.raises(ValueError, match="Battery error"):
-            strategy._discharge_battery(5.0, 1.0)
+def local_hour(ts: datetime) -> int:
+    return ts.astimezone(_MAD).hour if ts.tzinfo else ts.hour
 
 
-class TestSelfConsumeStrategy:
-    def test_calculate_energy_flows(self, battery, grid, tariff):
-        battery.charge.return_value = 2.0
-        grid.export_power.return_value = 1.0
-
-        strategy = SelfConsumeStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(10.0, 5.0, 0, 1.0)
-
-        assert flows.direct_solar == 5.0
-        assert flows.battery_charge == 2.0
-        battery.charge.assert_called()
-        grid.export_power.assert_called()
-
-    def test_no_solar_high_load(self, battery, grid, tariff):
-        battery.discharge.return_value = 2.0
-        grid.import_power.return_value = 8.0
-
-        strategy = SelfConsumeStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(0.0, 10.0, 0, 1.0)
-
-        assert flows.direct_solar == 0.0
-        assert flows.battery_discharge == 2.0
-        battery.discharge.assert_called()
-        grid.import_power.assert_called()
+def step(strategy, ts, solar, load, dt=DT) -> EnergyFlow:
+    strategy.now = ts
+    return strategy.calculate_energy_flows(solar, load, ts.hour, dt)
 
 
-class TestForceChargeAtNightStrategy:
-    @pytest.mark.skip("Test not implemented")
-    def test_valley_period_charging(self, battery, grid, tariff):
-        battery.charge.return_value = 2.0
-        grid.import_power.return_value = 1.0
-
-        strategy = ForceChargeAtNightStrategy(battery, grid, tariff)
-        battery.current_charge = 2.0
-        flows = strategy.calculate_energy_flows(5.0, 2.0, 0, 1.0)
-
-        assert flows.direct_solar == 2.0
-        battery.charge.assert_called()
-        grid.import_power.assert_called()
-
-    def test_peak_period_discharging(self, battery, grid, tariff):
-        battery.discharge.return_value = 4.0
-        grid.import_power.return_value = 2.0
-
-        strategy = ForceChargeAtNightStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(2.0, 8.0, 16, 1.0)
-
-        assert flows.direct_solar == 2.0
-        assert flows.battery_discharge == 4.0
-        battery.discharge.assert_called()
-
-    def test_error_invalid_rate_schedule(self, battery, grid):
-        invalid_tariff = Mock(spec=PowerTariff)
-        invalid_tariff.rate_schedule = {0: Rate(price=0.1,
-                                                energy_direction=EnergyDirection.IMPORT,
-                                                )}
-
-        with pytest.raises(ValueError, match="Tariff must have at least 3 different rates"):
-            ForceChargeAtNightStrategy(battery, grid, invalid_tariff)
+def assert_balanced(f: EnergyFlow, solar, load, dt, level_before, battery):
+    lhs = solar * dt + f.grid_import + f.battery_discharge
+    rhs = (load * dt - f.unserved) + f.grid_export + f.battery_charge + f.curtailed
+    assert lhs == pytest.approx(rhs, abs=1e-9)
+    delta = battery.current_charge - level_before
+    expected = f.battery_charge * battery.charge_efficiency - f.battery_discharge / battery.discharge_efficiency
+    assert delta == pytest.approx(expected, abs=1e-9)
 
 
-class TestForceChargeValleyAndPrePeakStrategy:
-    def test_valley_charging(self, battery, grid, tariff):
-        battery.charge.return_value = 1.0
-        grid.import_power.return_value = 1.0
+class TestSettle:
+    def test_discharge_limited_to_load_deficit(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(0.0, 0.5, -2.0, 1.0, allow_grid_charge=False)
+        assert f.battery_discharge == pytest.approx(0.5)
+        assert f.grid_export == 0.0
 
-        strategy = ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff)
-        battery.current_charge = 2.0
-        flows = strategy.calculate_energy_flows(3.0, 1.0, 0, 1.0)
+    def test_export_discharge_only_when_allowed(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(0.0, 0.5, -2.0, 1.0, allow_grid_charge=False, allow_export_discharge=True)
+        assert f.battery_discharge == pytest.approx(2.0)
+        assert f.grid_export == pytest.approx(1.5)
 
-        assert flows.direct_solar == 1.0
-        assert flows.battery_charge == 1.0
-        battery.charge.assert_called()
+    def test_grid_part_of_charge_capped_by_grid_charge_power(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20, max_charge_power=0.5)
+        f = s._settle(1.5, 1.0, 2.0, 1.0, allow_grid_charge=True)
+        assert f.battery_charge_from_grid == pytest.approx(0.5)
+        assert f.battery_charge == pytest.approx(1.0)
 
-    def test_peak_discharge(self, battery, grid, tariff):
-        battery.discharge.return_value = 2.0
-        grid.import_power.return_value = 2.0
+    def test_min_soc_floor_never_violated(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20, min_battery_level=0.3)
+        for _ in range(500):
+            s._settle(0.0, 3.0, -3.0, DT, allow_grid_charge=False)
+            assert battery.current_charge >= 0.3 * battery.capacity - 1e-12
+        assert battery.current_charge == pytest.approx(3.0)
 
-        strategy = ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(1.0, 5.0, 16, 1.0)
+    def test_floor_accounts_for_discharge_efficiency(self, battery, grid, td20):
+        battery.current_charge = 1.5
+        s = SelfConsumeStrategy(battery, grid, td20, min_battery_level=0.1)
+        f = s._settle(0.0, 5.0, -2.0, 1.0, allow_grid_charge=False)
+        assert f.battery_discharge == pytest.approx(0.5 * 0.9)
+        assert battery.current_charge == pytest.approx(1.0)
 
-        assert flows.direct_solar == 1.0
-        assert flows.battery_discharge == 2.0
-        battery.discharge.assert_called()
+    def test_solar_charges_first_then_grid(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(1.5, 1.0, 2.0, 1.0, allow_grid_charge=True)
+        assert f.battery_charge == pytest.approx(2.0)
+        assert f.battery_charge_from_grid == pytest.approx(1.5)
+        assert f.grid_import == pytest.approx(1.5)
+        assert f.grid_export == 0.0
 
-    def test_after_valley_behavior(self, battery, grid, tariff):
-        strategy = ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(2.0, 3.0, 8, 1.0)
+    def test_no_grid_charge_unless_allowed(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(1.5, 1.0, 2.0, 1.0, allow_grid_charge=False)
+        assert f.battery_charge == pytest.approx(0.5)
+        assert f.grid_import == 0.0
 
-        assert flows.direct_solar == 2.0
-        assert strategy._is_after_valley_block(8)
+    def test_grid_charge_reduced_to_respect_import_cap(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(0.0, 4.5, 2.0, 1.0, allow_grid_charge=True)
+        assert f.battery_charge_from_grid == pytest.approx(1.0)
+        assert f.grid_import == pytest.approx(5.5)
+        assert f.over_limit == 0.0
 
+    def test_load_above_cap_is_served_and_reported(self, battery, grid, td20):
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(0.0, 7.0, 2.0, 1.0, allow_grid_charge=True)
+        assert f.battery_charge == 0.0
+        assert f.grid_import == pytest.approx(7.0)
+        assert f.unserved == 0.0
+        assert f.over_limit == pytest.approx(1.5)
 
-class TestBoundaryConditions:
-    @pytest.mark.parametrize("hour", [-1, 24, 25])
-    def test_invalid_hours(self, battery, grid, tariff, hour):
-        battery.charge.return_value = 1.0
-        grid.import_power.return_value = 1.0
+    def test_export_capped_and_excess_curtailed(self, battery, grid, td20):
+        battery.current_charge = battery.capacity
+        s = SelfConsumeStrategy(battery, grid, td20)
+        f = s._settle(8.0, 0.5, 7.5, 1.0, allow_grid_charge=False)
+        assert f.grid_export == pytest.approx(5.5)
+        assert f.curtailed == pytest.approx(2.0)
 
-        strategy = ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(1.0, 1.0, hour, 1.0)
+    def test_balance_invariant_random(self, battery, grid, td20):
+        rng = np.random.default_rng(0)
+        s = SelfConsumeStrategy(battery, grid, td20)
+        for _ in range(2000):
+            solar, load = rng.uniform(0, 8), rng.uniform(0, 9)
+            cmd = rng.uniform(-5, 5)
+            before = battery.current_charge
+            f = s._settle(solar, load, cmd, DT, bool(rng.integers(2)), bool(rng.integers(2)))
+            assert_balanced(f, solar, load, DT, before, battery)
+            assert f.grid_import - f.over_limit <= grid.max_import * DT + 1e-12
+            assert f.grid_export <= grid.max_export * DT + 1e-12
+            assert battery.current_charge >= 0.1 * battery.capacity - 1e-12
 
-        assert isinstance(flows, EnergyFlow)
-        assert flows.battery_charge == 1.0
-
-    def test_zero_duration(self, battery, grid, tariff):
-        strategy = SelfConsumeStrategy(battery, grid, tariff)
+    def test_zero_duration_raises(self, battery, grid, td20):
         with pytest.raises(ZeroDivisionError):
-            strategy.calculate_energy_flows(1.0, 1.0, 0, 0.0)
+            SelfConsumeStrategy(battery, grid, td20).calculate_energy_flows(1.0, 1.0, 0, 0.0)
 
-    def test_negative_power_values(self, battery, grid, tariff):
-        strategy = SelfConsumeStrategy(battery, grid, tariff)
-        flows = strategy.calculate_energy_flows(-1.0, -1.0, 0, 1.0)
+    def test_negative_powers_are_clamped(self, battery, grid, td20):
+        f = step(SelfConsumeStrategy(battery, grid, td20), at(WEEKDAY, 3), -1.0, -1.0)
+        assert f == EnergyFlow()
 
-        assert flows.direct_solar == 0.0
-        assert flows.remaining_solar == 0.0
-        assert flows.remaining_load == 0.0
+
+class TestStrategies:
+    def test_no_battery_never_moves(self, battery, grid, td20):
+        s = NoBatteryStrategy(battery, grid, td20)
+        before = battery.current_charge
+        f1 = step(s, at(WEEKDAY, 12), 4.0, 1.0)
+        f2 = step(s, at(WEEKDAY, 20), 0.0, 3.0)
+        assert battery.current_charge == before
+        assert f1.grid_export == pytest.approx(3.0 * DT)
+        assert f2.grid_import == pytest.approx(3.0 * DT)
+
+    def test_charge_night_grid_charges_in_weekday_valley_only(self, battery, grid, td20):
+        s = ForceChargeAtNightStrategy(battery, grid, td20)
+        f = step(s, at(WEEKDAY, 3), 0.0, 0.5)
+        assert f.battery_charge_from_grid == pytest.approx(2.0 * DT)
+        assert f.battery_discharge == 0.0
+        f = step(s, at(WEEKDAY, 19), 0.0, 1.0)
+        assert f.battery_discharge == pytest.approx(1.0 * DT)
+
+    def test_single_rate_day_behaves_like_self_consume(self, battery, grid, td20):
+        for cls in HEURISTICS[1:-1]:
+            s = cls(battery, grid, td20)
+            for hour in (3, 9, 12, 15, 19, 23):
+                f = step(s, at(SATURDAY, hour), 0.0, 1.0)
+                assert f.battery_charge_from_grid == 0.0, (cls.__name__, hour)
+                assert f.battery_discharge == pytest.approx(1.0 * DT), (cls.__name__, hour)
+            f = step(s, at(SATURDAY, 13), 3.0, 1.0)
+            assert f.battery_charge == pytest.approx(2.0 * DT), cls.__name__
+
+    def test_sunday_night_does_not_grid_charge_but_monday_does(self, battery, grid, td20):
+        s = ForceChargeAtNightStrategy(battery, grid, td20)
+        assert step(s, at("2026-03-08", 23), 0.0, 0.5).battery_charge_from_grid == 0.0
+        assert step(s, at("2026-03-09", 1), 0.0, 0.5).battery_charge_from_grid > 0.0
+
+    def test_valley_charge_stops_at_target(self, battery, grid, td20):
+        s = ForceChargeAtNightStrategy(battery, grid, td20, valley_charge_target=0.6)
+        for m in range(240):
+            step(s, at(WEEKDAY, 2 + m // 60, m % 60), 0.0, 0.2)
+        assert battery.current_charge == pytest.approx(6.0, abs=1e-6)
+
+    def test_grid_charge_power_defaults_to_battery_rate_and_is_clipped(self, battery, grid, td20):
+        assert ForceChargeAtNightStrategy(battery, grid, td20).grid_charge_power == 2.0
+        assert ForceChargeAtNightStrategy(battery, grid, td20, max_charge_power=4.5).grid_charge_power == 2.0
+        assert ForceChargeAtNightStrategy(battery, grid, td20, max_charge_power=1.0).grid_charge_power == 1.0
+
+    def test_force_valleys_windows(self, battery, grid, td20):
+        s = ForceChargeAtValleyStrategy(battery, grid, td20)
+        assert step(s, at(WEEKDAY, 9, 30), 0.0, 0.5).battery_charge_from_grid > 0
+        assert step(s, at(WEEKDAY, 8, 30), 0.0, 0.5).battery_charge_from_grid == 0.0
+        held = step(s, at(WEEKDAY, 15), 0.0, 1.0)
+        assert held.battery_discharge == 0.0 and held.battery_charge_from_grid == 0.0
+        assert step(s, at(WEEKDAY, 17, 10), 0.0, 0.5).battery_charge_from_grid > 0
+        assert step(s, at(WEEKDAY, 12), 0.0, 1.0).battery_discharge == pytest.approx(DT)
+
+    def test_force_valleys_pre_peak_windows(self, battery, grid, td20):
+        s = ForceChargeValleyAndPrePeakStrategy(battery, grid, td20)
+        assert step(s, at(WEEKDAY, 3), 0.0, 0.5).battery_charge_from_grid > 0
+        after_valley = step(s, at(WEEKDAY, 8, 30), 0.0, 1.0)
+        assert after_valley.battery_charge_from_grid == 0.0 and after_valley.battery_discharge == 0.0
+        assert step(s, at(WEEKDAY, 15), 0.0, 0.5).battery_charge_from_grid > 0
+        assert step(s, at(WEEKDAY, 19), 0.0, 1.0).battery_discharge == pytest.approx(DT)
+        assert step(s, at(WEEKDAY, 23), 0.0, 1.0).battery_discharge == 0.0
+
+    @pytest.mark.parametrize("day", ["2026-10-05", "2026-10-13"], ids=["monday", "after_holiday"])
+    def test_force_valleys_pre_peak_charges_in_valley_after_offpeak_day(self, battery, grid, td20, day):
+        s = ForceChargeValleyAndPrePeakStrategy(battery, grid, td20)
+        assert step(s, at(day, 3), 0.0, 0.5).battery_charge_from_grid > 0
+        after_valley = step(s, at(day, 8, 30), 0.0, 1.0)
+        assert after_valley.battery_charge_from_grid == 0.0 and after_valley.battery_discharge == 0.0
+
+    def test_valley_charge_peak_discharge(self, battery, grid, td20):
+        s = ValleyChargePeakDischargeStrategy(battery, grid, td20)
+        assert step(s, at(WEEKDAY, 3), 0.0, 0.5).battery_charge_from_grid > 0
+        assert step(s, at(WEEKDAY, 9), 0.0, 1.0).battery_discharge == 0.0
+        assert step(s, at(WEEKDAY, 19), 0.0, 1.0).battery_discharge == pytest.approx(DT)
+
+    def test_smart_discharge_holds_between_peaks(self, battery, grid, td20):
+        s = SmartDischargeStrategy(battery, grid, td20)
+        assert step(s, at(WEEKDAY, 15), 0.0, 1.0).battery_discharge == 0.0
+        assert step(s, at(WEEKDAY, 9), 0.0, 1.0).battery_discharge == pytest.approx(DT)
+        assert step(s, at(WEEKDAY, 23), 0.0, 1.0).battery_discharge == pytest.approx(DT)
+
+    def test_forecast_charge_target_follows_forecast(self, battery, grid, td20):
+        battery.current_charge = 1.0
+        sunny = {date(2026, 3, 4): 5000.0}
+        s = ForecastChargeStrategy(battery, grid, td20, daily_forecasts=sunny)
+        s.now = at(WEEKDAY, 3)
+        expected = max(0.1, 1.0 - 5000.0 * 4.592 / 1000 / battery.capacity)
+        assert s._get_charge_target() == pytest.approx(expected)
+        s.now = at("2026-03-05", 3)
+        assert s._get_charge_target() == 1.0
+
+    def test_rate_aware_requires_three_rates(self, battery, grid):
+        tariff = Mock(spec=PowerTariff)
+        tariff.rate_schedule = {0: Rate(price=0.1, energy_direction=EnergyDirection.IMPORT)}
+        with pytest.raises(ValueError, match="Tariff must have at least 3 different rates"):
+            ForceChargeAtNightStrategy(battery, grid, tariff)
+
+    def test_blocks_follow_the_current_pvpc_day(self, battery, grid):
+        from datetime import datetime, timedelta, timezone
+        from zoneinfo import ZoneInfo
+
+        from src.domain.power_tariff.pvpc import PvpcTariff
+
+        mad = ZoneInfo("Europe/Madrid")
+        prices = {}
+        for d, f in ((date(2026, 3, 4), lambda h: 0.05 + 0.01 * h), (date(2026, 3, 5), lambda h: 0.30 - 0.01 * h)):
+            start = datetime(d.year, d.month, d.day, tzinfo=mad).astimezone(timezone.utc)
+            prices.update({start + timedelta(hours=h): f(h) for h in range(24)})
+        s = ForceChargeAtNightStrategy(battery, grid, PvpcTariff(prices, export_price=0.05))
+        assert step(s, at("2026-03-04", 2), 0.0, 0.5).battery_charge_from_grid > 0
+        peak_now = step(s, at("2026-03-05", 2), 0.0, 1.0)
+        assert peak_now.battery_charge_from_grid == 0.0 and peak_now.battery_discharge > 0
+        assert step(s, at("2026-03-05", 18), 0.0, 0.5).battery_charge_from_grid > 0
+
+    def test_flat_pvpc_day_matches_self_consume(self, grid):
+        tariff = _pvpc_around(date(2026, 10, 13), [0.12] * 24)
+        for hour in range(24):
+            ts = at("2026-10-13", hour)
+            ref = step(_fresh(grid, tariff, SelfConsumeStrategy), ts, 0.0, 1.0)
+            for cls in _RATE_HEURISTICS:
+                got = step(_fresh(grid, tariff, cls), ts, 0.0, 1.0)
+                _assert_same_flows(got, ref, (cls.__name__, hour))
+
+    def test_partial_price_tie_does_not_grid_charge_into_equal_block(self, grid):
+        hourly = [0.05] * 8 + [0.20] * 16
+        tariff = _pvpc_around(date(2026, 10, 13), hourly)
+        for cls in (ForceChargeAtValleyStrategy, ForceChargeValleyAndPrePeakStrategy):
+            flow = step(_fresh(grid, tariff, cls), at("2026-10-13", 15), 0.0, 0.5)
+            assert flow.battery_charge_from_grid == 0.0, cls.__name__
+
+    def test_labelled_peak_at_the_same_price_is_not_a_pre_peak_charge(self, battery, grid):
+        valley = Rate(price=0.10, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.VALLEY)
+        morning_peak = Rate(price=0.30, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PEAK)
+        plain = Rate(price=0.20, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PLAIN)
+        equal_peak = Rate(price=0.20, energy_direction=EnergyDirection.IMPORT, _rate_type=RateType.PEAK)
+        export = Rate(price=0.04, energy_direction=EnergyDirection.EXPORT, _rate_type=RateType.PLAIN)
+        blocks = [
+            {"start": 0, "end": 8, "rate": valley},
+            {"start": 8, "end": 14, "rate": morning_peak},
+            {"start": 14, "end": 18, "rate": plain},
+            {"start": 18, "end": 24, "rate": equal_peak},
+        ]
+
+        class _Tariff:
+            rate_schedule = {
+                (0, 8): valley,
+                (8, 14): morning_peak,
+                (14, 18): plain,
+                (18, 24): equal_peak,
+                (0, 24): export,
+            }
+
+            def rate_at(self, ts, direction):
+                if direction == EnergyDirection.EXPORT:
+                    return export
+                hour = local_hour(ts)
+                for block in blocks:
+                    if block["start"] <= hour < block["end"]:
+                        return block["rate"]
+                raise AssertionError(hour)
+
+            def day_rate_blocks(self, _day):
+                return blocks
+
+        tariff = _Tariff()
+        battery.current_charge = 5.0
+        assert step(ForceChargeAtValleyStrategy(battery, grid, tariff), at(WEEKDAY, 17), 0.0, 0.5).battery_charge_from_grid == 0.0
+        battery.current_charge = 5.0
+        assert step(
+            ForceChargeValleyAndPrePeakStrategy(battery, grid, tariff), at(WEEKDAY, 15), 0.0, 0.5
+        ).battery_charge_from_grid == 0.0
+
+    @pytest.mark.parametrize("cls", HEURISTICS + [ForecastChargeStrategy])
+    def test_energy_balance_every_step(self, cls, battery, grid, td20):
+        kwargs = {"daily_forecasts": {}} if cls is ForecastChargeStrategy else {}
+        s = cls(battery, grid, td20, **kwargs)
+        rng = np.random.default_rng(1)
+        for i in range(3 * 1440):
+            ts = at("2026-03-06", 0) + timedelta(minutes=i)
+            solar = max(0.0, 5 * np.sin((ts.hour - 7) / 12 * np.pi)) * rng.uniform(0.3, 1)
+            load = rng.uniform(0.2, 3.0) + (5.0 if i % 997 == 0 else 0.0)
+            before = battery.current_charge
+            f = step(s, ts, solar, load)
+            assert_balanced(f, solar, load, DT, before, battery)
+            assert battery.current_charge >= s.min_battery_level * battery.capacity - 1e-9
+            assert f.unserved == 0.0

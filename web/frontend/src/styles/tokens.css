@@ -1,0 +1,151 @@
+/* Design tokens. Light is the default; dark applies via the OS setting unless the viewer
+   picked a theme (data-theme on <html>), which wins both ways. */
+:root {
+  color-scheme: light;
+
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --surface-2: #f6f7f9;
+  --surface-3: #eceff3;
+  --border: #e1e5ea;
+  --border-strong: #c9d0d9;
+  --text: #121820;
+  --text-2: #4a5462;
+  --text-3: #66707e;
+  --text-on-accent: #ffffff;
+
+  --accent: #1f56c7;
+  --accent-hover: #1946a6;
+  --accent-soft: #e7eefc;
+  --accent-ring: rgba(31, 86, 199, 0.45);
+
+  --positive: #11734f;
+  --positive-soft: #e3f4ec;
+  --negative: #b4342a;
+  --negative-soft: #fbeae8;
+  --warning: #8a5300;
+  --warning-soft: #fdf1dc;
+  --warning-border: #f0cf94;
+
+  --overlay: rgba(16, 24, 32, 0.36);
+  --shadow-1: 0 1px 2px rgba(18, 24, 32, 0.06), 0 0 0 1px rgba(18, 24, 32, 0.02);
+  --shadow-2: 0 8px 24px rgba(18, 24, 32, 0.12), 0 2px 6px rgba(18, 24, 32, 0.06);
+  --shadow-3: 0 24px 64px rgba(18, 24, 32, 0.22);
+
+  --chart-grid: #e8ebef;
+  --chart-axis: #66707e;
+
+  /* Spacing scale */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --fs-3xl: 34px;
+
+  --control-h: 36px;
+  --topbar-h: 56px;
+  /* Full sticky header height including its bottom border; two rows on mobile. */
+  --header-h: 57px;
+  --content-max: 1320px;
+  --gutter: 24px;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur: 160ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #0e1116;
+    --surface: #161a21;
+    --surface-2: #1b2028;
+    --surface-3: #232933;
+    --border: #2a313c;
+    --border-strong: #3a4352;
+    --text: #e9edf2;
+    --text-2: #b4bcc8;
+    --text-3: #8e98a6;
+    --text-on-accent: #0b1220;
+    --accent: #7ea2ff;
+    --accent-hover: #9bb7ff;
+    --accent-soft: rgba(126, 162, 255, 0.14);
+    --accent-ring: rgba(126, 162, 255, 0.55);
+    --positive: #4fc58f;
+    --positive-soft: rgba(79, 197, 143, 0.13);
+    --negative: #f2786c;
+    --negative-soft: rgba(242, 120, 108, 0.13);
+    --warning: #f0b450;
+    --warning-soft: rgba(240, 180, 80, 0.12);
+    --warning-border: rgba(240, 180, 80, 0.4);
+    --overlay: rgba(0, 0, 0, 0.55);
+    --shadow-1: 0 0 0 1px rgba(255, 255, 255, 0.02);
+    --shadow-2: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+    --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.6);
+    --chart-grid: #232933;
+    --chart-axis: #8e98a6;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --surface: #161a21;
+  --surface-2: #1b2028;
+  --surface-3: #232933;
+  --border: #2a313c;
+  --border-strong: #3a4352;
+  --text: #e9edf2;
+  --text-2: #b4bcc8;
+  --text-3: #8e98a6;
+  --text-on-accent: #0b1220;
+  --accent: #7ea2ff;
+  --accent-hover: #9bb7ff;
+  --accent-soft: rgba(126, 162, 255, 0.14);
+  --accent-ring: rgba(126, 162, 255, 0.55);
+  --positive: #4fc58f;
+  --positive-soft: rgba(79, 197, 143, 0.13);
+  --negative: #f2786c;
+  --negative-soft: rgba(242, 120, 108, 0.13);
+  --warning: #f0b450;
+  --warning-soft: rgba(240, 180, 80, 0.12);
+  --warning-border: rgba(240, 180, 80, 0.4);
+  --overlay: rgba(0, 0, 0, 0.55);
+  --shadow-1: 0 0 0 1px rgba(255, 255, 255, 0.02);
+  --shadow-2: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --shadow-3: 0 24px 64px rgba(0, 0, 0, 0.6);
+  --chart-grid: #232933;
+  --chart-axis: #8e98a6;
+}
+
+/* Touch tablets keep the desktop layout but need finger-sized controls. */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 40px;
+  }
+}
+
+@media (max-width: 720px) {
+  :root {
+    --gutter: 16px;
+    --control-h: 40px;
+    --header-h: 97px;
+  }
+}

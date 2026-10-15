@@ -1,5 +1,5 @@
-import pytest
 import pandas as pd
+import pytest
 
 from src.domain.energy_load.model import EnergyLoad
 

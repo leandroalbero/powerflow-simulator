@@ -15,3 +15,5 @@ scripts
 .python-version
 *.pkl
 *.pt
+data
+.env

@@ -8,9 +8,14 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: process.env.API_TARGET ?? 'http://localhost:8000',
         changeOrigin: true,
         ws: true,
+      },
+      // Capability detection reads the backend's route list.
+      '/openapi.json': {
+        target: process.env.API_TARGET ?? 'http://localhost:8000',
+        changeOrigin: true,
       },
     },
   },

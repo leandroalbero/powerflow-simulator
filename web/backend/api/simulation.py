@@ -1,6 +1,5 @@
 import asyncio
 import json
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -13,8 +12,8 @@ from web.backend.models.schemas import (
     StrategyResult,
     TimeseriesResponse,
 )
-from web.backend.services.downsampler import downsample_timeseries
 from web.backend.services.simulation_service import SimulationService
+from web.backend.services.timeseries import present_timeseries
 
 router = APIRouter(prefix="/api", tags=["simulation"])
 
@@ -26,20 +25,19 @@ router = APIRouter(prefix="/api", tags=["simulation"])
 def start_simulation(body: SimulationRequest, request: Request) -> SimulationStartResponse:
     sim_service: SimulationService = request.app.state.sim_service
 
-    # Validate strategy ids
-    known = {s.id for s in sim_service.list_strategies()}
-    unknown = set(body.strategies) - known
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"Unknown strategies: {sorted(unknown)}")
-
     start = body.date_range.start if body.date_range else None
     end = body.date_range.end if body.date_range else None
 
-    run_id = sim_service.start_run(
-        strategy_ids=body.strategies,
-        start=start,
-        end=end,
-    )
+    try:
+        run_id = sim_service.start_run(
+            strategy_ids=body.strategies,
+            start=start,
+            end=end,
+            config=body.config,
+            label=body.label,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     return SimulationStartResponse(run_id=run_id, status="running")
 
@@ -61,12 +59,25 @@ def get_run_summary(run_id: str, request: Request) -> RunSummary:
             StrategyResult(
                 strategy_id=sid,
                 status=result.status,
+                progress=result.progress,
                 metrics=metrics,
                 error=result.error,
             )
         )
 
-    return RunSummary(run_id=run.run_id, status=run.status, strategies=strategies)
+    date_range = None
+    if run.start and run.end:
+        from web.backend.models.schemas import DateRange
+        date_range = DateRange(start=run.start, end=run.end)
+    return RunSummary(
+        run_id=run.run_id,
+        status=run.status,
+        strategies=strategies,
+        label=run.label,
+        created_at=run.created_at or None,
+        date_range=date_range,
+        config=run.config,
+    )
 
 
 @router.get("/runs/{run_id}/timeseries", response_model=TimeseriesResponse)
@@ -79,51 +90,26 @@ def get_timeseries(
     max_points: int = Query(2000, ge=10, le=50000),
 ) -> TimeseriesResponse:
     sim_service: SimulationService = request.app.state.sim_service
-    ts_data = sim_service.get_run_timeseries(run_id, strategy)
-
+    status, ts_data = sim_service.fetch_timeseries(run_id, strategy)
+    if status == "evicted":
+        raise HTTPException(status_code=410, detail="timeseries expired, re-run")
     if ts_data is None:
         raise HTTPException(
             status_code=404,
             detail=f"No timeseries for run={run_id}, strategy={strategy}",
         )
-
-    timestamps = ts_data["timestamps"]
-    columns = {
-        "battery_level": ts_data["battery_level"],
-        "grid_import": ts_data["grid_import"],
-        "grid_export": ts_data["grid_export"],
-        "solar_power": ts_data["solar_power"],
-        "house_consumption": ts_data["house_consumption"],
-    }
-
-    # Optional time-range filter (compare as datetimes to handle DST offsets)
-    if start or end:
-        start_dt = datetime.fromisoformat(start) if start else None
-        end_dt = datetime.fromisoformat(end) if end else None
-        filtered_indices = []
-        for i, ts_str in enumerate(timestamps):
-            ts_dt = datetime.fromisoformat(ts_str)
-            if start_dt and ts_dt < start_dt:
-                continue
-            if end_dt and ts_dt > end_dt:
-                continue
-            filtered_indices.append(i)
-
-        timestamps = [timestamps[i] for i in filtered_indices]
-        columns = {
-            k: [v[i] for i in filtered_indices] for k, v in columns.items()
-        }
-
-    # Skip downsampling for single-day windows (~1440 points at 1-min resolution)
-    is_single_day = len(timestamps) <= 1500
-    if not is_single_day:
-        timestamps, columns = downsample_timeseries(timestamps, columns, max_points)
-
-    return TimeseriesResponse(
-        timestamps=timestamps,
-        point_count=len(timestamps),
-        **columns,
-    )
+    run = sim_service.get_run(run_id)
+    capacity = 0.0
+    if run is not None:
+        metrics = run.strategies.get(strategy)
+        if metrics is not None and metrics.metrics is not None:
+            capacity = float(metrics.metrics.get("battery_capacity") or 0.0)
+        elif run.config is not None:
+            capacity = run.config.battery.capacity
+    try:
+        return present_timeseries(ts_data, capacity, start, end, max_points)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid time filter: {exc}") from exc
 
 
 # --- WebSocket for live progress ---
@@ -141,72 +127,57 @@ async def ws_run_progress(websocket: WebSocket, run_id: str) -> None:
         await websocket.close()
         return
 
-    # If the run is already done, send final state immediately
-    if run.status in ("completed", "failed"):
-        await _send_final_state(websocket, run)
+    last_pcts: Dict[str, int] = {}
+    sent_done: set[str] = set()
+    replay_done = await _replay(websocket, run, last_pcts, sent_done)
+    if replay_done:
+        await websocket.send_json({"status": "run_complete"})
         await websocket.close()
         return
 
-    # Poll for progress updates.
-    # In a production system you would use an asyncio.Queue fed by callbacks,
-    # but polling is simpler and sufficient for this use case.
-    last_pcts: Dict[str, int] = {}
-    sent_done: set = set()
-
     try:
         while True:
-            changed = False
-
-            for sid, result in run.strategies.items():
-                # Nothing to do yet
-                if result.status == "pending":
-                    continue
-
-                # Stream progress percentage
-                if result.status == "running":
-                    prev = last_pcts.get(sid, -1)
-                    if result.progress != prev:
-                        last_pcts[sid] = result.progress
-                        await websocket.send_text(json.dumps({
-                            "strategy": sid, "percent": result.progress,
-                        }))
-                        changed = True
-
-                # Strategy finished
-                if result.status in ("completed", "failed") and sid not in sent_done:
-                    msg: Dict[str, Any] = {"strategy": sid, "status": result.status}
-                    if result.metrics is not None:
-                        msg["metrics"] = result.metrics
-                    if result.error is not None:
-                        msg["error"] = result.error
-                    await websocket.send_text(json.dumps(msg))
+            # One snapshot under the run lock: the service finalises run.status under the same
+            # lock after the last strategy, so a finished run here implies every strategy's
+            # done message goes out in this pass, before run_complete.
+            with run.lock:
+                run_done = run.status in ("completed", "failed", "cancelled")
+                snapshot = [(sid, r.status, r.progress) for sid, r in run.strategies.items()]
+                results = dict(run.strategies)
+            for sid, status, progress in snapshot:
+                if status == "running" and progress != last_pcts.get(sid, -1):
+                    last_pcts[sid] = progress
+                    await websocket.send_text(json.dumps({"strategy": sid, "percent": progress}))
+                elif status in ("completed", "failed", "cancelled") and sid not in sent_done:
+                    await websocket.send_text(json.dumps(_strategy_message(sid, results[sid])))
                     sent_done.add(sid)
-                    changed = True
-
-            # Check if entire run is done
-            if run.status in ("completed", "failed"):
+            if run_done:
                 await websocket.send_json({"status": "run_complete"})
                 break
-
-            if not changed:
-                await asyncio.sleep(0.3)
-
+            await asyncio.sleep(0.3)
     except WebSocketDisconnect:
-        pass
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        return
+    await websocket.close()
 
 
-async def _send_final_state(websocket: WebSocket, run) -> None:  # type: ignore[no-untyped-def]
-    for sid, result in run.strategies.items():
-        msg: Dict[str, Any] = {"strategy": sid, "status": result.status}
-        if result.metrics is not None:
-            msg["metrics"] = result.metrics
-        if result.error is not None:
-            msg["error"] = result.error
-        await websocket.send_text(json.dumps(msg))
+async def _replay(websocket: WebSocket, run, last_pcts: Dict[str, int], sent_done: set[str]) -> bool:
+    with run.lock:
+        run_done = run.status in ("completed", "failed", "cancelled")
+        snapshot = [(sid, result.status, result.progress, result) for sid, result in run.strategies.items()]
+    for sid, status, progress, result in snapshot:
+        if status in ("completed", "failed", "cancelled"):
+            await websocket.send_text(json.dumps(_strategy_message(sid, result)))
+            sent_done.add(sid)
+        elif status == "running":
+            last_pcts[sid] = progress
+            await websocket.send_text(json.dumps({"strategy": sid, "percent": progress}))
+    return run_done
 
-    await websocket.send_json({"status": "run_complete"})
+
+def _strategy_message(sid: str, result) -> Dict[str, Any]:
+    msg: Dict[str, Any] = {"strategy": sid, "status": result.status}
+    if result.metrics is not None:
+        msg["metrics"] = result.metrics
+    if result.error is not None:
+        msg["error"] = result.error
+    return msg

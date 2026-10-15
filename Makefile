@@ -24,3 +24,7 @@ web-dev:
 .PHONY: web-build
 web-build:
 	cd web/frontend && npm run build
+
+.PHONY: fetch-data
+fetch-data:
+	python -m src.data.refresh

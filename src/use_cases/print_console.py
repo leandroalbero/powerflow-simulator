@@ -1,5 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict
+
+import pandas as pd
 from colorama import Fore, Style
 
 
@@ -29,7 +31,7 @@ class ConsoleFormatter:
                          f"{start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}",
                          format_spec="s")
 
-    def print_data_summary(self, solar_data, load_data) -> None:
+    def print_data_summary(self, solar_data: pd.DataFrame, load_data: pd.DataFrame) -> None:
         self.print_header("Data Summary")
         self.print_metric("Solar data points", str(len(solar_data)), format_spec="d")
         self.print_metric("Load data points", str(len(load_data)), format_spec="d")

@@ -2,6 +2,8 @@ ruff
 mypy
 matplotlib
 pandas
+scipy
+pyarrow
 colorama
 numpy
 types-colorama
@@ -14,3 +16,4 @@ ipdb
 fastapi
 uvicorn[standard]
 python-multipart
+httpx2
