@@ -19,9 +19,10 @@ the real system did? The simulator replays per-minute solar and house load throu
 minute with the chosen tariff.
 
 ## Case study
-[Panels, a bigger battery, PVPC or a smarter controller?](https://albero.dev/blog/more-solar-panels) uses this
-simulator to price every upgrade for the house it was built around, over a full year of minute data: switching to
-PVPC, a better controller, a second battery pack, and 3 or 4 more panels with the inverter's limits included.
+This project is what made [Panels, a bigger battery, PVPC or a smarter controller?](https://albero.dev/blog/more-solar-panels)
+possible. The write-up replays a full year of the house's minute data through the simulator to price every upgrade on
+the same footing: switching to PVPC, a better controller, a second battery pack, and 3 or 4 more panels with the
+inverter's limits included.
 
 The [interactive explorer](https://albero.dev/attachments/panel-upgrades/index.html) compares 12 panel and battery
 setups side by side, from yearly bills under each strategy and tariff down to single minutes.
@@ -56,7 +57,8 @@ variants sit under "More". The DQN agent is experimental and only available when
 - Per-year figures scale the run's own hours with data (`× 8760 / valid_hours`), and only appear for runs of at least
   72 hours.
 - "Import above grid limit" is informational. The real house regularly imports above 5.5 kW (mostly EV charging at
-  night), and optimising strategies legitimately buy cheap valley power for the car.
+  night, driven by [ha-ev-charge-optimizer](https://github.com/leandroalbero/ha-ev-charge-optimizer)), and optimising
+  strategies legitimately buy cheap valley power for the car.
 - Date ranges are inclusive local days (Europe/Madrid).
 
 ## Quick Start (Docker)
@@ -134,8 +136,16 @@ result = run(frame, strategy, tariff)
 print(result.metrics["adjusted_cost"], result.metrics["self_consumption_rate"])
 ```
 
+## Related projects
+- [ha-battery-mpc](https://github.com/leandroalbero/ha-battery-mpc): Home Assistant (HACS) integration that runs this
+  simulator's Model Predictive Control strategy on the real battery, with Open-Meteo solar forecasts. The Backtest
+  page compares it against the simulated strategies.
+- [ha-ev-charge-optimizer](https://github.com/leandroalbero/ha-ev-charge-optimizer): Home Assistant (HACS)
+  integration that sets the EV charger's power from solar surplus, off-peak rates and grid headroom.
+
 ## Future Plans
-1. Home Assistant integration that executes the chosen strategy
+1. ~~Home Assistant integration that executes the chosen strategy~~ Done:
+   [ha-battery-mpc](https://github.com/leandroalbero/ha-battery-mpc) runs the MPC strategy in production.
 2. Weather-aware and price-aware strategies trained on the backtest results
 3. Better battery model (temperature, ageing, inverter losses)
 
