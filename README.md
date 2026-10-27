@@ -18,6 +18,14 @@ Which battery strategy, tariff and battery size actually saves the most money, a
 the real system did? The simulator replays per-minute solar and house load through a battery model and prices every
 minute with the chosen tariff.
 
+## Case study
+[Panels, a bigger battery, PVPC or a smarter controller?](https://albero.dev/blog/more-solar-panels) uses this
+simulator to price every upgrade for the house it was built around, over a full year of minute data: switching to
+PVPC, a better controller, a second battery pack, and 3 or 4 more panels with the inverter's limits included.
+
+The [interactive explorer](https://albero.dev/attachments/panel-upgrades/index.html) compares 12 panel and battery
+setups side by side, from yearly bills under each strategy and tariff down to single minutes.
+
 ## Web UI
 `make web-dev`, then open http://localhost:5173. Light and dark themes, works on a phone.
 
